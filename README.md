@@ -1,6 +1,6 @@
 # TRIDENT
 
-A compact Python implementation of the TRIDENT v2.1 specification. The code offers
+A compact Python implementation of the TRIDENT specification. The code offers
 risk-controlled Safe-Cover and Pareto-Knapsack selection modes with simple lexical
 scoring so that experiments can run end-to-end on multi-hop QA benchmarks.
 
