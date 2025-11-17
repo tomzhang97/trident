@@ -229,30 +229,6 @@ experiments/
 4. **Pareto Optimality**: (1-1/e) approximation for monotone submodular
 5. **BwK Regret**: Sublinear under bounded rewards
 
-## Example Results
-
-```
-TRIDENT EVALUATION REPORT
-===========================================================
-DATASET STATISTICS:
-  Total queries: 1000
-  Valid predictions: 920
-  Abstained: 80
-
-PERFORMANCE METRICS:
-  Exact Match: 0.673
-  F1 Score: 0.782
-  Abstention Rate: 0.080
-
-EFFICIENCY METRICS:
-  Avg Tokens Used: 1847.3
-  Avg Latency (ms): 342.1
-
-SAFE-COVER METRICS:
-  Avg Coverage Rate: 0.924
-  Queries with Certificates: 920
-```
-
 ## Troubleshooting
 
 **CUDA out of memory:**
@@ -269,22 +245,6 @@ SAFE-COVER METRICS:
 - Tune `per_facet_alpha` (lower = stricter)
 - Increase `budget_tokens`
 - Enable VQC in Pareto mode
-
-## Citation
-
-If you use TRIDENT in your research:
-
-```bibtex
-@article{trident2025,
-  title={TRIDENT v1: Risk-Controlled, Budget-Aware RAG Framework},
-  author={Your Team},
-  year={2025}
-}
-```
-
-## License
-
-MIT License - See LICENSE file for details
 
 ## Acknowledgments
 
