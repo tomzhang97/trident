@@ -13,12 +13,25 @@ def create_shards(args):
     """Create data shards for parallel processing."""
     
     print(f"Loading {args.dataset} dataset...")
-    examples = DatasetLoader.load_dataset(
-        args.dataset,
-        split=args.split,
-        limit=args.limit,
-        cache_dir=args.cache_dir
-    )
+    
+    if args.local_file:
+        # Load from local file
+        with open(args.local_file, 'r') as f:
+            examples = json.load(f)
+        
+        # If it's a dictionary with 'data' key (like HotpotQA format)
+        if isinstance(examples, dict) and 'data' in examples:
+            examples = examples['data']
+            
+        print(f"Loaded {len(examples)} examples from local file")
+    else:
+        # Load using DatasetLoader (original method)
+        examples = DatasetLoader.load_dataset(
+            args.dataset,
+            split=args.split,
+            limit=args.limit,
+            cache_dir=args.cache_dir
+        )
     
     print(f"Loaded {len(examples)} examples")
     
@@ -142,6 +155,12 @@ def main():
         default="hotpotqa",
         choices=["hotpotqa", "musique", "2wikimultihop", "nq", "triviaqa", "squad", "squad_v2"],
         help="Dataset to use"
+    )
+    parser.add_argument(
+    "--local_file",
+    type=str,
+    default=None,
+    help="Path to local dataset file (for hotpotqa, etc.)"
     )
     parser.add_argument(
         "--split",
