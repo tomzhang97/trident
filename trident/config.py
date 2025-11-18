@@ -85,7 +85,7 @@ class CalibrationConfig:
 @dataclass
 class NLIConfig:
     """Configuration for NLI/Cross-encoder scoring."""
-    model_name: str = "microsoft/deberta-v3-large-mnli"
+    model_name: str = "microsoft/deberta-v3-large"
     batch_size: int = 32
     max_length: int = 512
     use_cache: bool = True

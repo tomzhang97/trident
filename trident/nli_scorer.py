@@ -13,7 +13,7 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 from .facets import Facet
 from .candidates import Passage
-from ..trident.config import NLIConfig
+from .config import NLIConfig
 
 
 @dataclass
@@ -48,12 +48,15 @@ class NLIScorer:
     
     def _get_label_mapping(self, model_name: str) -> Dict[str, int]:
         """Get label mapping for different NLI models."""
-        if "deberta" in model_name.lower() or "mnli" in model_name.lower():
+        # Dynamically detect number of labels
+        num_labels = self.model.config.num_labels
+        if num_labels == 2:
+            return {"ENTAILMENT": 1, "NEUTRAL": 0, "CONTRADICTION": 0}
+        elif "deberta" in model_name.lower() or "mnli" in model_name.lower():
             return {"ENTAILMENT": 0, "NEUTRAL": 1, "CONTRADICTION": 2}
         elif "roberta" in model_name.lower():
             return {"entailment": 2, "neutral": 1, "contradiction": 0}
         else:
-            # Default mapping
             return {"entailment": 0, "neutral": 1, "contradiction": 2}
     
     def score(self, passage: Passage, facet: Facet) -> float:

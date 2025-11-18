@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModel
 
-from ..trident.config import TridentConfig, SafeCoverConfig, ParetoConfig
+from .config import TridentConfig, SafeCoverConfig, ParetoConfig
 from .facets import Facet, FacetMiner, FacetType
 from .candidates import Passage
 from .calibration import ReliabilityCalibrator, CalibrationMonitor
@@ -19,7 +19,8 @@ from .pareto import ParetoKnapsackOptimizer, ParetoResult
 from .retrieval import RetrievalResult
 from .nli_scorer import NLIScorer
 from .llm_interface import LLMInterface
-from .monitoring import DriftMonitor, TelemetryTracker
+from .monitoring import DriftMonitor
+from .logging_utils import TelemetryTracker
 from .vqc import VerifierQueryCompiler
 from .bwk import BwKController
 

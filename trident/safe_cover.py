@@ -108,7 +108,7 @@ class SafeCoverAlgorithm:
         abstained = False
         
         # Abstain if we have uncovered facets
-        if uncovered_facets:
+        if uncovered_facets or len(selected) == 0:
             abstained = True
         
         # Abstain if dual LB exceeds budget (early abstention)

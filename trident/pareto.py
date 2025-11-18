@@ -10,7 +10,7 @@ import numpy as np
 
 from .candidates import Passage
 from .facets import Facet
-from ..trident.config import ParetoConfig
+from .config import ParetoConfig
 
 
 @dataclass

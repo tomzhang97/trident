@@ -2,7 +2,6 @@
 
 from .config import (
     FacetConfig,
-    QueryConfig,
     SafeCoverConfig,
     ParetoConfig,
     CalibrationConfig,
@@ -17,7 +16,6 @@ __all__ = [
     "FacetConfig",
     "ParetoConfig",
     "Passage",
-    "QueryConfig",
     "SafeCoverConfig",
     "TridentPipeline",
 ]

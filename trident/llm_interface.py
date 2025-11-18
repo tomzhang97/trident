@@ -30,7 +30,7 @@ class LLMInterface:
     
     def __init__(
         self,
-        model_name: str = "meta-llama/Llama-2-7b-hf",
+        model_name: str = "Qwen/Qwen-7B",
         device: str = "cuda:0",
         temperature: float = 0.0,
         max_new_tokens: int = 256,
