@@ -70,8 +70,7 @@ class ExperimentRunner:
             config_dict = {
                 "mode": self.args.mode or "safe_cover",
                 "safe_cover": {
-                    "alpha": 0.01,
-                    "max_tests_per_facet": 10,
+                    "per_facet_alpha": 0.01,
                     "token_cap": self.args.budget_tokens,
                     "early_abstain": True
                 },
