@@ -24,8 +24,8 @@ psutil>=5.9.0
 # Data processing
 pandas>=2.0.0
 pyarrow>=12.0.0
-faiss-cpu>=1.7.4  # For efficient similarity search
-# faiss-gpu  # Uncomment for GPU support
+# faiss-cpu>=1.7.4  # For efficient similarity search
+faiss-gpu  # Uncomment for GPU support
 
 # Testing
 pytest>=7.4.0

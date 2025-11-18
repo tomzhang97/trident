@@ -229,6 +229,30 @@ experiments/
 4. **Pareto Optimality**: (1-1/e) approximation for monotone submodular
 5. **BwK Regret**: Sublinear under bounded rewards
 
+## Example Results
+
+```
+TRIDENT EVALUATION REPORT
+===========================================================
+DATASET STATISTICS:
+  Total queries: 1000
+  Valid predictions: 920
+  Abstained: 80
+
+PERFORMANCE METRICS:
+  Exact Match: 0.673
+  F1 Score: 0.782
+  Abstention Rate: 0.080
+
+EFFICIENCY METRICS:
+  Avg Tokens Used: 1847.3
+  Avg Latency (ms): 342.1
+
+SAFE-COVER METRICS:
+  Avg Coverage Rate: 0.924
+  Queries with Certificates: 920
+```
+
 ## Troubleshooting
 
 **CUDA out of memory:**
