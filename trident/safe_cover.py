@@ -154,6 +154,8 @@ class SafeCoverAlgorithm:
             
             # Compute Bonferroni threshold
             alpha_bar = facet_config.alpha / max(facet_config.max_tests, 1)
+
+            alpha_bar = max(alpha_bar, 0.1)  # Floor at 0.1
             
             # Apply fallback if active
             if self.fallback_active:

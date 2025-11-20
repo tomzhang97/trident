@@ -36,6 +36,10 @@ class Facet:
     def __post_init__(self):
         if self.metadata is None:
             object.__setattr__(self, 'metadata', {})
+
+        facet_type_val = object.__getattribute__(self, 'facet_type')
+        if isinstance(facet_type_val, str):
+            object.__setattr__(self, 'facet_type', FacetType(facet_type_val))    
     
     def to_hypothesis(self) -> str:
         """Convert facet to NLI hypothesis format."""

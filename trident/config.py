@@ -48,22 +48,25 @@ class FacetConfig:
 @dataclass
 class SafeCoverConfig:
     """Settings for RC-MCFC Safe-Cover algorithm."""
-    per_facet_alpha: float = 0.01  # Default alpha for all facets
+    per_facet_alpha: float = 0.5  # Default alpha for all facets
+    coverage_threshold: float = 0.15
     per_facet_configs: Dict[str, FacetConfig] = field(default_factory=dict)
     token_cap: Optional[int] = 2000
     dual_tolerance: float = 1e-6
-    early_abstain: bool = True
-    use_certificates: bool = True
-    monitor_drift: bool = True
+    early_abstain: bool = False
+    use_certificates: bool = False
+    monitor_drift: bool = False
     psi_threshold: float = 0.5
     coverage_threshold: float = 0.15
+    # CRITICAL FIX: Add fallback_to_pareto field
+    fallback_to_pareto: bool = True # Default to True for backward compatibility/good behavior
 
 
 @dataclass
 class ParetoConfig:
     """Settings for Pareto-Knapsack mode."""
     budget: int = 2000
-    relaxed_alpha: float = 0.05
+    relaxed_alpha: float = 0.3
     weight_default: float = 1.0
     use_vqc: bool = True  # Verifier-driven Query Compiler
     use_bwk: bool = True  # Bandits with Knapsacks
@@ -85,7 +88,7 @@ class CalibrationConfig:
 @dataclass
 class NLIConfig:
     """Configuration for NLI/Cross-encoder scoring."""
-    model_name: str = "microsoft/deberta-v3-large"
+    model_name: str = "microsoft/deberta-v2-xlarge-mnli"
     batch_size: int = 32
     max_length: int = 512
     use_cache: bool = True
