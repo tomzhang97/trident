@@ -7,8 +7,6 @@ import os
 import sys
 import time
 import traceback
-import re
-import string
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -43,31 +41,6 @@ class WorkerResult:
     mode: str
 
 
-def _normalize(text: str) -> str:
-    """Normalize text for EM/F1 calculation."""
-    text = text.lower().strip()
-    # remove punctuation
-    text = text.translate(str.maketrans("", "", string.punctuation))
-    # remove articles
-    text = re.sub(r'\b(a|an|the)\b', ' ', text)
-    # normalize whitespace
-    text = ' '.join(text.split())
-    return text
-
-def _f1(pred: str, gt: str) -> float:
-    """Calculate F1 score between prediction and ground truth."""
-    pred_tokens = _normalize(pred).split()
-    gt_tokens = _normalize(gt).split()
-    common = set(pred_tokens) & set(gt_tokens)
-    if not pred_tokens or not gt_tokens:
-        return 0.0
-    if not common:
-        return 0.0
-    prec = len(common) / len(pred_tokens)
-    rec = len(common) / len(gt_tokens)
-    return 2 * prec * rec / (prec + rec)
-
-
 class ExperimentRunner:
     """Main experiment orchestrator."""
     
@@ -97,13 +70,14 @@ class ExperimentRunner:
             config_dict = {
                 "mode": self.args.mode or "safe_cover",
                 "safe_cover": {
-                    "per_facet_alpha": 0.01,
+                    "alpha": 0.01,
+                    "max_tests_per_facet": 10,
                     "token_cap": self.args.budget_tokens,
                     "early_abstain": True
                 },
                 "pareto": {
                     "budget": self.args.budget_tokens,
-                    "relaxed_alpha": 0.5
+                    "relaxed_alpha": 0.05
                 },
                 "llm": {
                     "model_name": self.args.model or "meta-llama/Llama-2-7b-hf",
@@ -138,43 +112,21 @@ class ExperimentRunner:
         )
     
     def _init_retriever(self) -> Any:
-
         """Initialize the retrieval system."""
-        
-        # If we have a data file with contexts, build corpus from it
-        if hasattr(self.args, 'data_path') and self.args.data_path:
-            corpus_texts = []
-            corpus_ids = []
-            
-            with open(self.args.data_path) as f:
-                data = json.load(f)
-                
-            for idx, example in enumerate(data):
-                if 'context' in example:
-                    for ctx_idx, (title, sentences) in enumerate(example['context']):
-                        text = " ".join(sentences) if isinstance(sentences, list) else sentences
-                        corpus_texts.append(text)
-                        corpus_ids.append(f"doc_{idx}_{ctx_idx}_{title}")
-            
-            # Create retriever with this corpus
-            if self.config.retrieval.method == "hybrid":
-                retriever = HybridRetriever(
-                    encoder_model=self.config.retrieval.encoder_model,
-                    device=self.device,
-                    top_k=self.config.retrieval.top_k
-                )
-            else:
-                retriever = DenseRetriever(
-                    encoder_model=self.config.retrieval.encoder_model,
-                    device=self.device,
-                    top_k=self.config.retrieval.top_k
-                )
-            
-            # Load the corpus into retriever
-            retriever.corpus = corpus_texts
-            retriever.build_index()
-            
-            return retriever
+        if self.config.retrieval.method == "hybrid":
+            return HybridRetriever(
+                encoder_model=self.config.retrieval.encoder_model,
+                corpus_path=self.config.retrieval.corpus_path,
+                device=self.device,
+                top_k=self.config.retrieval.top_k
+            )
+        else:
+            return DenseRetriever(
+                encoder_model=self.config.retrieval.encoder_model,
+                corpus_path=self.config.retrieval.corpus_path,
+                device=self.device,
+                top_k=self.config.retrieval.top_k
+            )
     
     def _init_pipeline(self) -> TridentPipeline:
         """Initialize the TRIDENT pipeline."""
@@ -275,20 +227,22 @@ class ExperimentRunner:
             if result.get('abstained'):
                 abstained_count += 1
                 continue
-
-            pred = result.get('prediction')
-            gts = result.get('ground_truth') or []
-            if pred and gts:
-                best_em = 0.0
-                best_f1 = 0.0
-                for gt in gts:
-                    em = 1.0 if _normalize(pred) == _normalize(gt) else 0.0
-                    f1 = _f1(pred, gt)
-                    best_em = max(best_em, em)
-                    best_f1 = max(best_f1, f1)
-                em_scores.append(best_em)
-                f1_scores.append(best_f1)
-
+            
+            # Compute EM and F1 if we have predictions
+            if result.get('prediction') and result.get('ground_truth'):
+                pred = result['prediction'].strip().lower()
+                for gt in result['ground_truth']:
+                    gt = gt.strip().lower()
+                    em_scores.append(1.0 if pred == gt else 0.0)
+                    # Simple F1 computation (word overlap)
+                    pred_tokens = set(pred.split())
+                    gt_tokens = set(gt.split())
+                    if pred_tokens and gt_tokens:
+                        precision = len(pred_tokens & gt_tokens) / len(pred_tokens)
+                        recall = len(pred_tokens & gt_tokens) / len(gt_tokens)
+                        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+                        f1_scores.append(f1)
+            
             tokens_used.append(result.get('tokens_used', 0))
             latencies.append(result.get('latency_ms', 0))
         

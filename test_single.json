@@ -1,0 +1,12 @@
+[{
+  "_id": "test_1",
+  "question": "What is the capital of France?",
+  "answer": "Paris",
+  "type": "comparison",
+  "level": "easy",
+  "supporting_facts": [],
+  "context": [
+    ["France", ["France is a country in Europe.", "Paris is the capital of France."]],
+    ["Paris", ["Paris is a city in France.", "It has many museums."]]
+  ]
+}]
