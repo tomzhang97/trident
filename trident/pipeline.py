@@ -287,7 +287,7 @@ class TridentPipeline:
         if not result['abstained'] and result['selected_passages']:
             # Build prompt with selected passages
             prompt = self.llm.build_multi_hop_prompt(
-                query=query,
+                question=query,
                 passages=result['selected_passages'],
                 facets=[f.to_dict() for f in facets]
             )
