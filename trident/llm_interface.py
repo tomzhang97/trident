@@ -172,47 +172,84 @@ Answer:"""
         
         return prompt
     
+#     def build_multi_hop_prompt(
+#         self,
+#         query: str,
+#         passages: List[Dict[str, Any]],
+#         facets: List[Dict[str, Any]]
+#     ) -> str:
+#         """Build a prompt for multi-hop reasoning."""
+#         # Build context
+#         context_parts = []
+#         for i, passage in enumerate(passages, 1):
+#             text = passage.get('text', passage.get('content', ''))
+#             source = passage.get('source', f'Document {i}')
+#             context_parts.append(f"[{source}] {text}")
+        
+#         context = "\n\n".join(context_parts)
+        
+#         # Build reasoning requirements
+#         requirements = []
+#         for facet in facets:
+#             facet_type = facet.get('type', 'UNKNOWN')
+#             template = facet.get('template', {})
+#             requirements.append(f"- {facet_type}: {template}")
+        
+#         requirements_text = "\n".join(requirements) if requirements else "None specified"
+        
+#         # Build full prompt
+#         prompt = f"""You are answering a complex question that requires multi-hop reasoning.
+
+# Context Documents:
+# {context}
+
+# Reasoning Requirements:
+# {requirements_text}
+
+# Question: {query}
+
+# Please provide a step-by-step answer that addresses all reasoning requirements:
+
+# Answer:"""
+        
+#         return prompt
+    
     def build_multi_hop_prompt(
         self,
-        query: str,
+        question: str,
         passages: List[Dict[str, Any]],
-        facets: List[Dict[str, Any]]
+        facets: List[Any],
     ) -> str:
-        """Build a prompt for multi-hop reasoning."""
-        # Build context
-        context_parts = []
-        for i, passage in enumerate(passages, 1):
-            text = passage.get('text', passage.get('content', ''))
-            source = passage.get('source', f'Document {i}')
-            context_parts.append(f"[{source}] {text}")
-        
-        context = "\n\n".join(context_parts)
-        
-        # Build reasoning requirements
-        requirements = []
-        for facet in facets:
-            facet_type = facet.get('type', 'UNKNOWN')
-            template = facet.get('template', {})
-            requirements.append(f"- {facet_type}: {template}")
-        
-        requirements_text = "\n".join(requirements) if requirements else "None specified"
-        
-        # Build full prompt
-        prompt = f"""You are answering a complex question that requires multi-hop reasoning.
+        """
+        Build a multi-hop QA prompt with an explicit 'Final answer:' line
+        so that downstream extraction is robust.
+        """
+        context_block = self.build_rag_prompt(question, passages)
 
-Context Documents:
-{context}
+        if facets:
+            requirements = "\n".join(f"- {f}" for f in facets)
+            requirements_block = f"Reasoning requirements:\n{requirements}\n\n"
+        else:
+            requirements_block = ""
 
-Reasoning Requirements:
-{requirements_text}
-
-Question: {query}
-
-Please provide a step-by-step answer that addresses all reasoning requirements:
-
-Answer:"""
-        
+        prompt = (
+            f"{context_block}\n"
+            f"{requirements_block}"
+            "You are answering a multi-hop question from the HotpotQA dataset.\n"
+            "1. Use ONLY the information in the context above.\n"
+            "2. First, think briefly and, if helpful, reason in a few short steps.\n"
+            "3. Then, on the LAST line of your response, output the answer in the form:\n"
+            "   Final answer: <short answer>\n"
+            "   - If the question is yes/no, use exactly 'yes' or 'no' as the short answer.\n"
+            "   - Otherwise, use a short phrase or name, not a full sentence.\n"
+            "4. Do NOT add anything after the 'Final answer:' line.\n"
+            "If you truly cannot answer based on the context, use:\n"
+            "   Final answer: I cannot answer based on the given context.\n\n"
+            f"Question: {question}\n"
+            "Now reason and then give the final answer.\n"
+        )
         return prompt
+
     
     def extract_answer(self, generated_text: str) -> str:
         """Extract the answer from generated text."""

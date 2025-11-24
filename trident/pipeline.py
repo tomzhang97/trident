@@ -58,15 +58,52 @@ def _normalize_for_filter(text: str) -> str:
     return t
 
 def _looks_like_meta(text: str) -> bool:
-    """Filter out lines like 'Answer:', 'Final answer', etc."""
+    """Filter out lines that look like meta / system chatter, not the actual answer."""
     norm = _normalize_for_filter(text)
     if not norm:
         return True
-    bad_exact = {"answer", "final answer", "short answer", "prediction"}
+
+    # Pure labels like "Answer", "Final answer"
+    bad_exact = {
+        "answer",
+        "final answer",
+        "short answer",
+        "prediction",
+        "explanation",
+        "reasoning",
+    }
     if norm in bad_exact:
         return True
-    bad_substrings = ["step ", "document ", "context ", "evidence "]
+
+    # Filler/meta phrases that often appear at the start
+    filler_prefixes = [
+        "ok",
+        "okay",
+        "sure",
+        "let us think",
+        "lets think",
+        "let s think",
+        "let's think",
+        "first",
+        "second",
+        "step",
+    ]
+    for pref in filler_prefixes:
+        if norm.startswith(pref + " "):
+            return True
+
+    bad_substrings = [
+        "step ",
+        "document ",
+        "context ",
+        "evidence ",
+        "reasoning:",
+        "reasoning :",
+        "analysis:",
+        "analysis :",
+    ]
     return any(bad in norm for bad in bad_substrings)
+
 
 def extract_final_answer(raw_text: str, question: str) -> str:
     """
@@ -114,20 +151,18 @@ def extract_final_answer(raw_text: str, question: str) -> str:
             if cand and not _looks_like_meta(cand):
                 return cand
 
-    # 3) Fallback: first non-meta short line
-    #    e.g., lines without colon and not obviously meta
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+    # 3) Fallback: scan from the BOTTOM for a non-meta short line
+    #    This avoids grabbing opening filler like "Okay,".
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for line in reversed(lines):
         if ":" in line:
             # usually labels like "Reasoning:", "Answer:", etc.
             continue
         if _looks_like_meta(line):
             continue
-        # reasonable length heuristic
         if 2 <= len(line) <= 80:
             return line
+
 
     # 4) Final fallback: last non-empty token sequence
     tokens = text.split()

@@ -48,7 +48,7 @@ class FacetConfig:
 @dataclass
 class SafeCoverConfig:
     """Settings for RC-MCFC Safe-Cover algorithm."""
-    per_facet_alpha: float = 0.5  # Default alpha for all facets
+    per_facet_alpha: float = 0.1  # Default alpha for all facets
     coverage_threshold: float = 0.15
     per_facet_configs: Dict[str, FacetConfig] = field(default_factory=dict)
     token_cap: Optional[int] = 2000
