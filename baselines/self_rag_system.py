@@ -122,6 +122,7 @@ class SelfRAGSystem:
         self,
         question: str,
         context: Optional[List[List[str]]] = None,
+        supporting_facts: Optional[List[tuple]] = None,
         metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
@@ -130,6 +131,7 @@ class SelfRAGSystem:
         Args:
             question: The question to answer
             context: Optional pre-provided context (for datasets like HotpotQA)
+            supporting_facts: Optional supporting facts (not used by Self-RAG, for interface compatibility)
             metadata: Optional metadata
 
         Returns:
