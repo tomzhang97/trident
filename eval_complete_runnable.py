@@ -108,7 +108,7 @@ class ExperimentRunner:
                 "llm": {
                     "model_name": self.args.model or "meta-llama/Llama-2-7b-hf",
                     "temperature": self.args.temperature or 0.0,
-                    "max_new_tokens": self.args.max_new_tokens or 256,
+                    "max_new_tokens": self.args.max_new_tokens or 512,
                     "device": self.device,
                     "load_in_8bit": self.args.load_in_8bit
                 },
@@ -318,7 +318,7 @@ def main():
     parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-hf", help="LLM model name")
     parser.add_argument("--device", type=int, default=0, help="CUDA device (-1 for CPU)")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
-    parser.add_argument("--max_new_tokens", type=int, default=256, help="Max tokens to generate")
+    parser.add_argument("--max_new_tokens", type=int, default=512, help="Max tokens to generate")
     parser.add_argument("--load_in_8bit", action="store_true", help="Load model in 8-bit mode")
     
     # Pipeline configuration
