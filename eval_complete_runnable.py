@@ -23,8 +23,14 @@ from trident.config import TridentConfig, ExperimentConfig
 from trident.pipeline import TridentPipeline
 from trident.evaluation import BenchmarkEvaluator, DatasetLoader
 from trident.llm_interface import LLMInterface
+from trident.llm_instrumentation import InstrumentedLLM
 from trident.retrieval import DenseRetriever, HybridRetriever
 from trident.logging_utils import setup_logger, log_metrics
+
+# Import baseline systems
+from baselines.self_rag_system import SelfRAGSystem
+from baselines.graphrag_system import GraphRAGSystem
+from baselines.trident_wrapper import TridentSystemWrapper
 
 
 @dataclass
@@ -75,14 +81,17 @@ class ExperimentRunner:
         self.args = args
         self.logger = setup_logger(args.output_dir)
         self.device = f"cuda:{args.device}" if args.device >= 0 else "cpu"
-        
+
         # Load configuration
         self.config = self._load_config()
-        
+
         # Initialize components
         self.llm = self._init_llm()
+        self.instrumented_llm = InstrumentedLLM(self.llm)
         self.retriever = self._init_retriever()
-        self.pipeline = self._init_pipeline()
+
+        # Initialize the appropriate system based on mode
+        self.system = self._init_system()
         self.evaluator = BenchmarkEvaluator(self.config.evaluation)
         
     def _load_config(self) -> TridentConfig:
@@ -121,6 +130,13 @@ class ExperimentRunner:
                 "evaluation": {
                     "metrics": ["em", "f1", "support_em", "faithfulness"],
                     "dataset": self.args.dataset or "hotpotqa"
+                },
+                "baselines": {
+                    "selfrag_k": getattr(self.args, 'selfrag_k', 8),
+                    "selfrag_use_critic": getattr(self.args, 'selfrag_use_critic', False),
+                    "graphrag_k": getattr(self.args, 'graphrag_k', 20),
+                    "graphrag_topk_nodes": getattr(self.args, 'graphrag_topk_nodes', 20),
+                    "graphrag_max_seeds": getattr(self.args, 'graphrag_max_seeds', 10),
                 }
             }
         
@@ -176,14 +192,41 @@ class ExperimentRunner:
             
             return retriever
     
-    def _init_pipeline(self) -> TridentPipeline:
-        """Initialize the TRIDENT pipeline."""
-        return TridentPipeline(
-            config=self.config,
-            llm=self.llm,
-            retriever=self.retriever,
-            device=self.device
-        )
+    def _init_system(self) -> Any:
+        """Initialize the appropriate system based on mode."""
+        mode = self.config.mode
+
+        if mode in ["safe_cover", "pareto", "both"]:
+            # Initialize TRIDENT pipeline
+            pipeline = TridentPipeline(
+                config=self.config,
+                llm=self.llm,
+                retriever=self.retriever,
+                device=self.device
+            )
+            return TridentSystemWrapper(pipeline, mode=mode)
+
+        elif mode == "self_rag":
+            # Initialize Self-RAG system
+            return SelfRAGSystem(
+                llm=self.instrumented_llm,
+                retriever=self.retriever,
+                k=self.config.baselines.selfrag_k,
+                use_critic=self.config.baselines.selfrag_use_critic
+            )
+
+        elif mode == "graphrag":
+            # Initialize GraphRAG system
+            return GraphRAGSystem(
+                llm=self.instrumented_llm,
+                retriever=self.retriever,
+                k=self.config.baselines.graphrag_k,
+                topk_nodes=self.config.baselines.graphrag_topk_nodes,
+                max_seeds=self.config.baselines.graphrag_max_seeds
+            )
+
+        else:
+            raise ValueError(f"Unknown mode: {mode}. Must be one of: safe_cover, pareto, both, self_rag, graphrag")
     
     def run_worker(self) -> None:
         """Run evaluation on a shard of data."""
@@ -199,30 +242,29 @@ class ExperimentRunner:
             
             try:
                 start_time = time.time()
-                
-                # Run TRIDENT pipeline
-                output = self.pipeline.process_query(
-                    query=example['question'],
-                    supporting_facts=example.get('supporting_facts'),
+
+                # Run the system (TRIDENT, Self-RAG, or GraphRAG)
+                output = self.system.answer(
+                    question=example['question'],
                     context=example.get('context'),
-                    mode=self.config.mode
+                    supporting_facts=example.get('supporting_facts')
                 )
-                
+
                 elapsed_ms = (time.time() - start_time) * 1000
-                
-                # Extract results
+
+                # Extract results (handle both TRIDENT and baseline output formats)
                 result = WorkerResult(
                     query_id=example['_id'],
                     question=example['question'],
-                    prediction=output.answer,
+                    prediction=output.get('answer', ''),
                     ground_truth=[example['answer']] if isinstance(example['answer'], str) else example['answer'],
-                    selected_passages=output.selected_passages,
-                    certificates=output.certificates if output.certificates else [],
-                    metrics=output.metrics,
-                    abstained=output.abstained,
-                    latency_ms=elapsed_ms,
-                    tokens_used=output.tokens_used,
-                    mode=self.config.mode
+                    selected_passages=output.get('selected_passages', []),
+                    certificates=output.get('certificates', []),
+                    metrics=output.get('stats', {}),
+                    abstained=output.get('abstained', False),
+                    latency_ms=output.get('latency_ms', elapsed_ms),
+                    tokens_used=output.get('tokens_used', 0),
+                    mode=output.get('mode', self.config.mode)
                 )
                 
                 results.append(asdict(result))
@@ -322,7 +364,12 @@ def main():
     parser.add_argument("--load_in_8bit", action="store_true", help="Load model in 8-bit mode")
     
     # Pipeline configuration
-    parser.add_argument("--mode", choices=["safe_cover", "pareto", "both"], default="safe_cover")
+    parser.add_argument(
+        "--mode",
+        choices=["safe_cover", "pareto", "both", "self_rag", "graphrag"],
+        default="safe_cover",
+        help="System mode: safe_cover/pareto/both (TRIDENT modes), self_rag, or graphrag"
+    )
     parser.add_argument("--budget_tokens", type=int, default=2000, help="Token budget")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     
@@ -335,6 +382,13 @@ def main():
     # Dataset configuration
     parser.add_argument("--dataset", type=str, default="hotpotqa", help="Dataset name")
     parser.add_argument("--config", type=str, help="Path to configuration file")
+
+    # Baseline-specific configuration
+    parser.add_argument("--selfrag_k", type=int, default=8, help="Number of documents for Self-RAG")
+    parser.add_argument("--selfrag_use_critic", action="store_true", help="Use critic in Self-RAG")
+    parser.add_argument("--graphrag_k", type=int, default=20, help="Number of documents for GraphRAG")
+    parser.add_argument("--graphrag_max_seeds", type=int, default=10, help="Max seed nodes for GraphRAG")
+    parser.add_argument("--graphrag_topk_nodes", type=int, default=20, help="Top-k nodes for GraphRAG")
     
     args = parser.parse_args()
     
