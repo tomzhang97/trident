@@ -1,0 +1,43 @@
+{
+  "mode": "pareto",
+  "safe_cover": {
+    "per_facet_alpha": 0.01,
+    "token_cap": 2000,
+    "early_abstain": true,
+    "fallback_to_pareto": true
+  },
+  "pareto": {
+    "budget": 2000,
+    "relaxed_alpha": 0.5,
+    "use_vqc": true,
+    "use_bwk": true,
+    "max_vqc_iterations": 3
+  },
+  "llm": {
+    "model_name": "meta-llama/Llama-2-7b-hf",
+    "temperature": 0.0,
+    "max_new_tokens": 256,
+    "load_in_8bit": false
+  },
+  "retrieval": {
+    "method": "dense",
+    "encoder_model": "facebook/contriever",
+    "top_k": 100
+  },
+  "nli": {
+    "model_name": "microsoft/deberta-v2-xlarge-mnli",
+    "batch_size": 32
+  },
+  "baselines": {
+    "selfrag_k": 8,
+    "selfrag_use_critic": false,
+    "graphrag_k": 20,
+    "graphrag_topk_nodes": 20,
+    "graphrag_max_seeds": 10,
+    "graphrag_max_hops": 2
+  },
+  "evaluation": {
+    "metrics": ["em", "f1"],
+    "dataset": "hotpotqa"
+  }
+}
