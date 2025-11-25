@@ -13,7 +13,7 @@ class LLMConfig:
     """Configuration for Large Language Model."""
     model_name: str = "meta-llama/Llama-2-7b-hf"
     temperature: float = 0.0
-    max_new_tokens: int = 256
+    max_new_tokens: int = 512
     device: str = "cuda:0"
     load_in_8bit: bool = False
     load_in_4bit: bool = False

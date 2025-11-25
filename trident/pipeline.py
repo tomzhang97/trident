@@ -71,6 +71,9 @@ def _looks_like_meta(text: str) -> bool:
         "prediction",
         "explanation",
         "reasoning",
+        "i cannot answer based on the given context",
+        "cannot answer",
+        "no answer",
     }
     if norm in bad_exact:
         return True
@@ -87,6 +90,9 @@ def _looks_like_meta(text: str) -> bool:
         "first",
         "second",
         "step",
+        "therefore",
+        "thus",
+        "so the answer",
     ]
     for pref in filler_prefixes:
         if norm.startswith(pref + " "):
@@ -101,6 +107,12 @@ def _looks_like_meta(text: str) -> bool:
         "reasoning :",
         "analysis:",
         "analysis :",
+        "the given context",
+        "given context",
+        "isnt",
+        "is not",
+        "should be",
+        "would be",
     ]
     return any(bad in norm for bad in bad_substrings)
 
@@ -108,68 +120,124 @@ def _looks_like_meta(text: str) -> bool:
 def extract_final_answer(raw_text: str, question: str) -> str:
     """
     Extract the final answer from raw LLM output using a more robust method.
-    
+
     Args:
         raw_text: The raw text output from the LLM.
         question: The original question, used for context (e.g., Yes/No detection).
-        
+
     Returns:
         The extracted answer string.
     """
     text = raw_text.strip()
 
+    if not text:
+        return ""
+
     # 0) Strip "Step N:" style reasoning lines (even at end of text)
     text = re.sub(r'(?mi)^step\s+\d+:[^\n]*$', '', text)
     text = re.sub(r'(?i)step\s+\d+:[^\.!\n]*', '', text)
 
-    # 1) Yes/No shortcut
-    q_lower = question.strip().lower()
-    if q_lower.startswith((
-        "is ", "are ", "was ", "were ",
-        "do ", "does ", "did ",
-        "can ", "could ", "should ",
-        "has ", "have ", "had "
-    )):
-        t_lower = text.lower()
-        # Prefer the last yes/no mention
-        if " no" in t_lower or t_lower.startswith("no"):
-            return "no"
-        if " yes" in t_lower or t_lower.startswith("yes"):
-            return "yes"
-
-    # 2) Explicit "Answer:" / "Final Answer:"
-    explicit_patterns = [
-        r"(?mi)^final answer\s*[:\-]\s*(.+)$",
-        r"(?mi)^answer\s*[:\-]\s*(.+)$",
-        r"(?mi)answer\s*[:\-]\s*(.+)$",
+    # 1) First priority: Look for "Final answer:" pattern (case-insensitive)
+    # This is the most explicit indicator from our prompt
+    final_answer_patterns = [
+        r"(?i)final\s+answer\s*[:\-]\s*(.+?)(?:\n|$)",  # "Final answer: <answer>"
+        r"(?i)final\s+answer\s*[:\-]\s*(.+)",  # Fallback without newline requirement
     ]
 
-    for pat in explicit_patterns:
+    for pat in final_answer_patterns:
         m = re.search(pat, text)
         if m:
             cand = m.group(1).strip()
-            if cand and not _looks_like_meta(cand):
+            # Clean up common trailing artifacts
+            cand = re.sub(r'\s*(Human:|Assistant:|Question:).*$', '', cand, flags=re.IGNORECASE)
+            if cand and len(cand) > 0 and not _looks_like_meta(cand):
                 return cand
 
-    # 3) Fallback: scan from the BOTTOM for a non-meta short line
+    # 2) Yes/No shortcut for binary questions
+    q_lower = question.strip().lower()
+    is_yesno_question = q_lower.startswith((
+        "is ", "are ", "was ", "were ",
+        "do ", "does ", "did ",
+        "can ", "could ", "should ", "would ",
+        "has ", "have ", "had "
+    ))
+
+    if is_yesno_question:
+        t_lower = text.lower()
+        # Look for explicit yes/no patterns
+        # Count occurrences and use the last one mentioned
+        yes_matches = list(re.finditer(r'\byes\b', t_lower))
+        no_matches = list(re.finditer(r'\bno\b', t_lower))
+
+        if yes_matches or no_matches:
+            # Get the position of the last yes/no
+            last_yes_pos = yes_matches[-1].start() if yes_matches else -1
+            last_no_pos = no_matches[-1].start() if no_matches else -1
+
+            # Return the one that appears last in the text
+            if last_no_pos > last_yes_pos:
+                return "no"
+            elif last_yes_pos > last_no_pos:
+                return "yes"
+
+    # 3) Look for other answer patterns
+    other_patterns = [
+        r"(?mi)^answer\s*[:\-]\s*(.+?)(?:\n|$)",
+        r"(?mi)the\s+answer\s+is\s+(.+?)(?:\.|$)",  # Require space after "is" to avoid matching "isn't"
+        r"(?mi)therefore[,]?\s+(?:the\s+answer\s+is\s+)?(.+?)(?:\.|$)",
+    ]
+
+    for pat in other_patterns:
+        m = re.search(pat, text)
+        if m:
+            cand = m.group(1).strip()
+            # Remove trailing punctuation and artifacts
+            cand = re.sub(r'[.,;]+$', '', cand)
+            # Clean up Human:/Assistant: artifacts
+            cand = re.sub(r'\s*(Human:|Assistant:|Question:).*$', '', cand, flags=re.IGNORECASE)
+            cand = re.sub(r'(Human:|Assistant:|Question:).*$', '', cand, flags=re.IGNORECASE)
+            if cand and len(cand) > 1 and not _looks_like_meta(cand):
+                return cand
+
+    # 4) Fallback: scan from the BOTTOM for a non-meta short line
     #    This avoids grabbing opening filler like "Okay,".
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     for line in reversed(lines):
+        # Skip lines with colons (usually labels)
         if ":" in line:
-            # usually labels like "Reasoning:", "Answer:", etc.
             continue
         if _looks_like_meta(line):
             continue
-        if 2 <= len(line) <= 80:
-            return line
+        # Look for substantive content (not too short, not too long)
+        if 2 <= len(line) <= 100:
+            # Clean up
+            line = re.sub(r'^(so|thus|therefore|hence)[,\s]+', '', line, flags=re.IGNORECASE)
+            # Clean artifacts
+            line = re.sub(r'\s*(Human:|Assistant:|Question:).*$', '', line, flags=re.IGNORECASE)
+            line = re.sub(r'(Human:|Assistant:|Question:).*$', '', line, flags=re.IGNORECASE)
+            if len(line) > 1 and not _looks_like_meta(line):
+                return line
 
+    # 5) Final fallback: last sentence or phrase
+    # Split by sentence-ending punctuation
+    sentences = re.split(r'[.!?]\s+', text)
+    if sentences:
+        last_sentence = sentences[-1].strip()
+        # Clean artifacts
+        last_sentence = re.sub(r'\s*(Human:|Assistant:|Question:).*$', '', last_sentence, flags=re.IGNORECASE)
+        last_sentence = re.sub(r'(Human:|Assistant:|Question:).*$', '', last_sentence, flags=re.IGNORECASE)
+        # Remove trailing periods
+        last_sentence = last_sentence.rstrip('.')
+        # Skip if it's just a fragment (starts with punctuation, is very short, or looks like meta)
+        if last_sentence.startswith(("'", '"', '-', 'n\'t')):
+            return ""
+        # Check if it's substantial (more than 4 chars and not just punctuation/fragments)
+        if last_sentence and len(last_sentence) > 4 and not _looks_like_meta(last_sentence):
+            # Make sure it has at least one letter
+            if any(c.isalpha() for c in last_sentence):
+                return last_sentence
 
-    # 4) Final fallback: last non-empty token sequence
-    tokens = text.split()
-    if tokens:
-        # e.g., last noun-ish phrase rather than everything
-        return " ".join(tokens[-5:]).strip()
-
+    # 6) If all else fails, return empty rather than garbage
     return ""
 
 
@@ -287,7 +355,7 @@ class TridentPipeline:
         if not result['abstained'] and result['selected_passages']:
             # Build prompt with selected passages
             prompt = self.llm.build_multi_hop_prompt(
-                query=query,
+                question=query,
                 passages=result['selected_passages'],
                 facets=[f.to_dict() for f in facets]
             )

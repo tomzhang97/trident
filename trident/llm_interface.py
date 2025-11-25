@@ -33,7 +33,7 @@ class LLMInterface:
         model_name: str = "Qwen/Qwen3-8B",
         device: str = "cuda:0",
         temperature: float = 0.0,
-        max_new_tokens: int = 256,
+        max_new_tokens: int = 512,
         load_in_8bit: bool = False,
         load_in_4bit: bool = False,
         seed: Optional[int] = None
