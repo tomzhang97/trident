@@ -119,6 +119,20 @@ class TelemetryConfig:
 
 
 @dataclass
+class BaselineConfig:
+    """Configuration for baseline systems (Self-RAG, GraphRAG)."""
+    # Self-RAG settings
+    selfrag_k: int = 8  # Number of documents to retrieve
+    selfrag_use_critic: bool = False  # Whether to use critic/verification
+
+    # GraphRAG settings
+    graphrag_k: int = 20  # Number of documents to retrieve
+    graphrag_topk_nodes: int = 20  # Candidate nodes to consider
+    graphrag_max_seeds: int = 10  # Maximum seed nodes
+    graphrag_max_hops: int = 2  # Maximum hops for subgraph expansion
+
+
+@dataclass
 class TridentConfig:
     """Complete TRIDENT system configuration."""
     mode: str = "safe_cover"  # safe_cover, pareto, both
@@ -130,6 +144,7 @@ class TridentConfig:
     nli: NLIConfig = field(default_factory=NLIConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
+    baselines: BaselineConfig = field(default_factory=BaselineConfig)
     
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> "TridentConfig":
@@ -142,7 +157,8 @@ class TridentConfig:
         nli = NLIConfig(**config_dict.get("nli", {}))
         evaluation = EvaluationConfig(**config_dict.get("evaluation", {}))
         telemetry = TelemetryConfig(**config_dict.get("telemetry", {}))
-        
+        baselines = BaselineConfig(**config_dict.get("baselines", {}))
+
         return cls(
             mode=config_dict.get("mode", "safe_cover"),
             safe_cover=safe_cover,
@@ -152,7 +168,8 @@ class TridentConfig:
             retrieval=retrieval,
             nli=nli,
             evaluation=evaluation,
-            telemetry=telemetry
+            telemetry=telemetry,
+            baselines=baselines
         )
     
     @classmethod
