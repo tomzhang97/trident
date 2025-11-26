@@ -121,12 +121,16 @@ class TelemetryConfig:
 @dataclass
 class BaselineConfig:
     """Configuration for baseline systems (Self-RAG, GraphRAG)."""
+    # Common settings for fair comparison
+    common_k: int = 8  # Shared retrieval k across all baselines
+
     # Self-RAG settings
     selfrag_k: int = 8  # Number of documents to retrieve
     selfrag_use_critic: bool = False  # Whether to use critic/verification
+    selfrag_allow_oracle_context: bool = False  # Allow oracle context or enforce retrieval-only
 
     # GraphRAG settings
-    graphrag_k: int = 20  # Number of documents to retrieve
+    graphrag_k: int = 8  # Number of documents to retrieve (harmonized with common_k)
     graphrag_topk_nodes: int = 20  # Candidate nodes to consider
     graphrag_max_seeds: int = 10  # Maximum seed nodes
     graphrag_max_hops: int = 2  # Maximum hops for subgraph expansion
@@ -157,7 +161,11 @@ class TridentConfig:
         nli = NLIConfig(**config_dict.get("nli", {}))
         evaluation = EvaluationConfig(**config_dict.get("evaluation", {}))
         telemetry = TelemetryConfig(**config_dict.get("telemetry", {}))
-        baselines = BaselineConfig(**config_dict.get("baselines", {}))
+
+        # Filter out non-dataclass fields like 'comments' from baselines config
+        baselines_dict = config_dict.get("baselines", {})
+        baselines_dict = {k: v for k, v in baselines_dict.items() if not k.startswith('_') and k != 'comments'}
+        baselines = BaselineConfig(**baselines_dict)
 
         return cls(
             mode=config_dict.get("mode", "safe_cover"),
