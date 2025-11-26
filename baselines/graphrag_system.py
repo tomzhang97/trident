@@ -282,7 +282,8 @@ class GraphRAGSystem:
                 question=question,
                 summaries="(no graph information available)",
             )
-            answer = self._call_llm(prompt, qstats, max_new_tokens=64).strip()
+            # Use max_new_tokens=16 to match TRIDENT/KET-RAG answer budget for fair comparison
+            answer = self._call_llm(prompt, qstats, max_new_tokens=16).strip()
             return {
                 "answer": answer,
                 "tokens_used": qstats.total_tokens,
@@ -345,7 +346,8 @@ class GraphRAGSystem:
             question=question,
             summaries=summaries_str,
         )
-        raw_answer = self._call_llm(answer_prompt, qstats, max_new_tokens=64)
+        # Use max_new_tokens=16 to match TRIDENT/KET-RAG answer budget for fair comparison
+        raw_answer = self._call_llm(answer_prompt, qstats, max_new_tokens=16)
         answer = raw_answer.strip()
 
         return {
