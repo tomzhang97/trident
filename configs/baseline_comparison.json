@@ -29,12 +29,19 @@
     "batch_size": 32
   },
   "baselines": {
+    "common_k": 8,
     "selfrag_k": 8,
     "selfrag_use_critic": false,
-    "graphrag_k": 20,
+    "selfrag_allow_oracle_context": false,
+    "graphrag_k": 8,
     "graphrag_topk_nodes": 20,
     "graphrag_max_seeds": 10,
     "graphrag_max_hops": 2
+  },
+  "comments": {
+    "common_k": "Shared retrieval k across all baselines for fair comparison",
+    "selfrag_allow_oracle_context": "Set to false for retrieval-only comparison, true for oracle-context regime",
+    "graphrag_max_hops": "Maximum hops for BFS-based subgraph expansion"
   },
   "evaluation": {
     "metrics": ["em", "f1"],
