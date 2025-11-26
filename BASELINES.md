@@ -20,10 +20,10 @@ All baselines follow simplified but valid implementations of their respective pa
 
 The Self-RAG baseline implements:
 
-1. **Retrieval gate**: LLM decides whether to retrieve documents (`RETRIEVE` vs `NO_RETRIEVE`)
-2. **Context-aware answer generation**: Answers using retrieved documents
+1. **Retrieval gate**: LLM decides whether to retrieve documents (`RETRIEVE` vs `NO_RETRIEVE`) with robust parsing
+2. **Context-aware answer generation**: Answers using retrieved documents (max_new_tokens=16, matching TRIDENT)
 3. **Optional critic**: Verifies answer support (`SUPPORTS`, `CONTRADICTS`, `INSUFFICIENT`)
-4. **Fallback generation**: If critic finds issues, generates answer without context
+4. **Fallback generation**: If critic finds issues, generates answer without context (max_new_tokens=16)
 
 ### Key Parameters
 
@@ -90,6 +90,8 @@ python eval_compare_baselines.py \
 2. ✅ **Functional critic**: Actually triggers fallback generation on issues
 3. ✅ **Harmonized k**: Uses same retrieval count as other baselines
 4. ✅ **Clear naming**: Distinguishes retrieval vs oracle-context modes
+5. ✅ **Robust gate parsing**: Regex-based parsing handles malformed LLM outputs
+6. ✅ **Unified answer budget**: Uses max_new_tokens=16 matching TRIDENT
 
 ---
 
@@ -103,8 +105,8 @@ The GraphRAG baseline implements:
 2. **Graph construction**: Build simple graph from documents
 3. **Seed selection**: LLM selects relevant seed nodes
 4. **Subgraph expansion**: BFS-based multi-hop expansion
-5. **Community summarization**: Summarize subgraphs
-6. **Answer generation**: Answer from summaries
+5. **Community summarization**: Summarize subgraphs (max_new_tokens=128)
+6. **Answer generation**: Answer from summaries (max_new_tokens=16, matching TRIDENT)
 
 ### Key Parameters
 
@@ -143,6 +145,7 @@ python eval_compare_baselines.py \
 2. ✅ **Seed ID validation**: Validates LLM-generated node IDs and falls back to top candidates
 3. ✅ **Harmonized k**: Uses same retrieval count as other baselines
 4. ✅ **Robust to LLM errors**: Won't crash on malformed seed outputs
+5. ✅ **Unified answer budget**: Uses max_new_tokens=16 matching TRIDENT
 
 ### Honest Limitations (to mention in paper)
 
@@ -202,7 +205,7 @@ KETRAGSystem(
    - Retrieve top-matching chunks
 3. **Dual-Channel Generation**:
    - Combine skeleton facts and keyword chunks
-   - Generate answer using both contexts
+   - Generate answer using both contexts (max_new_tokens=16, matching TRIDENT)
 
 ### Evaluation
 
@@ -222,6 +225,7 @@ Our implementation provides a simplified but valid KET-RAG baseline:
 2. ✅ **Skeleton KG construction**: From key chunks using LLM extraction
 3. ✅ **Keyword-chunk graph**: Lightweight bipartite graph
 4. ✅ **Harmonized k**: Uses same retrieval count as other baselines
+5. ✅ **Unified answer budget**: Uses max_new_tokens=16 matching TRIDENT
 
 ### Honest Limitations (to mention in paper)
 
@@ -253,8 +257,10 @@ To ensure baselines are not "strawman" and reviewers accept them:
 All systems use identical:
 - Model name and version
 - Temperature (0.0 for deterministic comparison)
-- `max_new_tokens` (64 for answers)
+- `max_new_tokens` (16 for final answers, matching TRIDENT)
 - Random seed
+
+**Note:** Intermediate steps (GraphRAG summaries, entity extraction, etc.) may use different token budgets, but all final answer generation uses exactly 16 tokens for fair comparison.
 
 ### 2. Same Retrieval Settings ✅
 

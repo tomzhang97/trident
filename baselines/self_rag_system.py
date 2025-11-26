@@ -160,10 +160,15 @@ class SelfRAGSystem:
                 text = " ".join(sentences) if isinstance(sentences, list) else sentences
                 docs.append({"text": text, "title": title})
         else:
-            # Use retrieval gate
+            # Use retrieval gate with robust parsing
             retrieve_prompt = SELF_RAG_RETRIEVE_PROMPT.format(question=question)
             gate_output = self._call_llm(retrieve_prompt, qstats, max_new_tokens=4)
-            gate = gate_output.strip().split()[0].upper()
+            # Robust parsing: extract first word, strip non-alphabetic characters
+            import re
+            tok = gate_output.strip().split()[0].upper() if gate_output.strip() else "RETRIEVE"
+            gate = re.sub(r'[^A-Z_]+', '', tok)
+            if gate not in ("RETRIEVE", "NO_RETRIEVE"):
+                gate = "RETRIEVE"  # Default to retrieve if parsing fails
             do_retrieve = (gate == "RETRIEVE")
 
             # 2) Retrieve if needed
@@ -184,7 +189,8 @@ class SelfRAGSystem:
             question=question,
             context=context_str,
         )
-        raw_answer = self._call_llm(answer_prompt, qstats, max_new_tokens=64)
+        # Use max_new_tokens=16 to match TRIDENT/KET-RAG answer budget for fair comparison
+        raw_answer = self._call_llm(answer_prompt, qstats, max_new_tokens=16)
         answer = raw_answer.strip()
 
         # 4) Optional critic with fallback generation
@@ -204,7 +210,8 @@ class SelfRAGSystem:
                     question=question,
                     context="(none)",
                 )
-                raw_answer2 = self._call_llm(fallback_prompt, qstats, max_new_tokens=64)
+                # Use max_new_tokens=16 to match TRIDENT/KET-RAG answer budget for fair comparison
+                raw_answer2 = self._call_llm(fallback_prompt, qstats, max_new_tokens=16)
                 answer = raw_answer2.strip()
 
         return {
