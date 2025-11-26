@@ -1,5 +1,5 @@
 {
-  "mode": "pareto",
+  "mode": "ketrag",
   "safe_cover": {
     "per_facet_alpha": 0.01,
     "token_cap": 2000,
@@ -30,25 +30,15 @@
   },
   "baselines": {
     "common_k": 8,
-    "selfrag_k": 8,
-    "selfrag_use_critic": false,
-    "selfrag_allow_oracle_context": false,
-    "graphrag_k": 8,
-    "graphrag_topk_nodes": 20,
-    "graphrag_max_seeds": 10,
-    "graphrag_max_hops": 2,
     "ketrag_k": 8,
     "ketrag_skeleton_ratio": 0.3,
     "ketrag_max_skeleton_triples": 10,
     "ketrag_max_keyword_chunks": 5
   },
   "comments": {
-    "common_k": "Shared retrieval k across all baselines for fair comparison",
-    "selfrag_allow_oracle_context": "Set to false for retrieval-only comparison, true for oracle-context regime",
-    "graphrag_max_hops": "Maximum hops for BFS-based subgraph expansion",
     "ketrag_skeleton_ratio": "Ratio of top chunks to use for skeleton KG construction (0.3 = 30%)",
-    "ketrag_max_skeleton_triples": "Maximum KG triples from skeleton for answer generation",
-    "ketrag_max_keyword_chunks": "Maximum chunks from keyword-chunk bipartite graph"
+    "ketrag_max_skeleton_triples": "Maximum knowledge graph triples to use from skeleton",
+    "ketrag_max_keyword_chunks": "Maximum chunks to retrieve from keyword-chunk bipartite graph"
   },
   "evaluation": {
     "metrics": ["em", "f1"],

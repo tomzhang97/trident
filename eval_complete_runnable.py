@@ -30,6 +30,7 @@ from trident.logging_utils import setup_logger, log_metrics
 # Import baseline systems
 from baselines.self_rag_system import SelfRAGSystem
 from baselines.graphrag_system import GraphRAGSystem
+from baselines.ketrag_system import KETRAGSystem
 from baselines.trident_wrapper import TridentSystemWrapper
 
 
@@ -230,8 +231,19 @@ class ExperimentRunner:
                 max_hops=getattr(self.config.baselines, 'graphrag_max_hops', 2)
             )
 
+        elif mode == "ketrag":
+            # Initialize KET-RAG system
+            return KETRAGSystem(
+                llm=self.instrumented_llm,
+                retriever=self.retriever,
+                k=getattr(self.config.baselines, 'ketrag_k', 8),
+                skeleton_ratio=getattr(self.config.baselines, 'ketrag_skeleton_ratio', 0.3),
+                max_skeleton_triples=getattr(self.config.baselines, 'ketrag_max_skeleton_triples', 10),
+                max_keyword_chunks=getattr(self.config.baselines, 'ketrag_max_keyword_chunks', 5)
+            )
+
         else:
-            raise ValueError(f"Unknown mode: {mode}. Must be one of: safe_cover, pareto, both, self_rag, graphrag")
+            raise ValueError(f"Unknown mode: {mode}. Must be one of: safe_cover, pareto, both, self_rag, graphrag, ketrag")
     
     def run_worker(self) -> None:
         """Run evaluation on a shard of data."""
@@ -272,6 +284,14 @@ class ExperimentRunner:
                     output = self.system.answer(
                         question=example['question'],
                         context=example.get('context') if use_oracle else None,
+                        supporting_facts=example.get('supporting_facts')
+                    )
+                elif self.args.mode == 'ketrag':
+                    # KET-RAG: uses retrieval by default (dual-channel approach)
+                    # Can optionally use oracle context for ablation studies
+                    output = self.system.answer(
+                        question=example['question'],
+                        context=example.get('context'),  # KET-RAG can use context to build skeleton+keyword indices
                         supporting_facts=example.get('supporting_facts')
                     )
                 else:
@@ -398,9 +418,9 @@ def main():
     # Pipeline configuration
     parser.add_argument(
         "--mode",
-        choices=["safe_cover", "pareto", "both", "self_rag", "graphrag"],
+        choices=["safe_cover", "pareto", "both", "self_rag", "graphrag", "ketrag"],
         default="safe_cover",
-        help="System mode: safe_cover/pareto/both (TRIDENT modes), self_rag, or graphrag"
+        help="System mode: safe_cover/pareto/both (TRIDENT modes), self_rag, graphrag, or ketrag"
     )
     parser.add_argument("--budget_tokens", type=int, default=2000, help="Token budget")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -425,7 +445,11 @@ def main():
     parser.add_argument("--graphrag_topk_nodes", type=int, default=20, help="Top-k nodes for GraphRAG")
     parser.add_argument("--graphrag_max_hops", type=int, default=2, help="Max hops for GraphRAG BFS expansion")
     parser.add_argument("--graphrag_use_oracle_context", action="store_true", help="Use oracle context for GraphRAG (default: uses retrieval)")
-    
+    parser.add_argument("--ketrag_k", type=int, help="Number of documents for KET-RAG (defaults to --common_k)")
+    parser.add_argument("--ketrag_skeleton_ratio", type=float, default=0.3, help="Ratio of chunks for skeleton KG (default: 0.3)")
+    parser.add_argument("--ketrag_max_skeleton_triples", type=int, default=10, help="Max triples from skeleton KG (default: 10)")
+    parser.add_argument("--ketrag_max_keyword_chunks", type=int, default=5, help="Max chunks from keyword index (default: 5)")
+
     args = parser.parse_args()
 
     # Apply common_k defaults
@@ -433,6 +457,8 @@ def main():
         args.selfrag_k = args.common_k
     if args.graphrag_k is None:
         args.graphrag_k = args.common_k
+    if args.ketrag_k is None:
+        args.ketrag_k = args.common_k
 
     # Set random seeds
     np.random.seed(args.seed)

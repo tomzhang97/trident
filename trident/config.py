@@ -120,7 +120,7 @@ class TelemetryConfig:
 
 @dataclass
 class BaselineConfig:
-    """Configuration for baseline systems (Self-RAG, GraphRAG)."""
+    """Configuration for baseline systems (Self-RAG, GraphRAG, KET-RAG)."""
     # Common settings for fair comparison
     common_k: int = 8  # Shared retrieval k across all baselines
 
@@ -134,6 +134,12 @@ class BaselineConfig:
     graphrag_topk_nodes: int = 20  # Candidate nodes to consider
     graphrag_max_seeds: int = 10  # Maximum seed nodes
     graphrag_max_hops: int = 2  # Maximum hops for subgraph expansion
+
+    # KET-RAG settings
+    ketrag_k: int = 8  # Number of documents to retrieve
+    ketrag_skeleton_ratio: float = 0.3  # Ratio of chunks to use for skeleton KG
+    ketrag_max_skeleton_triples: int = 10  # Maximum triples from skeleton KG
+    ketrag_max_keyword_chunks: int = 5  # Maximum chunks from keyword index
 
 
 @dataclass

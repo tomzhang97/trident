@@ -69,6 +69,17 @@ python eval_complete_runnable.py --worker \
   --selfrag_use_critic
 ```
 
+### KET-RAG (Dual-Channel Retrieval)
+```bash
+python eval_complete_runnable.py --worker \
+  --data_path runs/_shards/validation_0_99.json \
+  --output_dir runs/ketrag \
+  --mode ketrag \
+  --config configs/ketrag.json \
+  --device 2 \
+  --model Meta-Llama-3-8B-Instruct
+```
+
 ---
 
 ## With HF_ENDPOINT (for mirror access)
@@ -124,6 +135,15 @@ python eval_complete_runnable.py --worker \
   --device $DEVICE \
   --model "$MODEL" \
   --selfrag_use_critic
+
+# KET-RAG
+python eval_complete_runnable.py --worker \
+  --data_path "$DATA" \
+  --output_dir runs/ketrag \
+  --mode ketrag \
+  --config configs/ketrag.json \
+  --device $DEVICE \
+  --model "$MODEL"
 
 # TRIDENT Pareto
 python eval_complete_runnable.py --worker \
@@ -254,6 +274,12 @@ All commands support these arguments:
 - `--graphrag_k 8`: GraphRAG retrieval k
 - `--graphrag_max_hops 2`: Max BFS hops
 - `--graphrag_use_oracle_context`: Use oracle context instead of retrieval (default: False)
+
+**KET-RAG:**
+- `--ketrag_k 8`: KET-RAG retrieval k
+- `--ketrag_skeleton_ratio 0.3`: Ratio of chunks for skeleton KG (default: 0.3)
+- `--ketrag_max_skeleton_triples 10`: Max triples from skeleton KG (default: 10)
+- `--ketrag_max_keyword_chunks 5`: Max chunks from keyword index (default: 5)
 
 **TRIDENT:**
 - `--budget_tokens 2000`: TRIDENT token budget
