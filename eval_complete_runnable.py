@@ -132,11 +132,14 @@ class ExperimentRunner:
                     "dataset": self.args.dataset or "hotpotqa"
                 },
                 "baselines": {
+                    "common_k": getattr(self.args, 'common_k', 8),
                     "selfrag_k": getattr(self.args, 'selfrag_k', 8),
                     "selfrag_use_critic": getattr(self.args, 'selfrag_use_critic', False),
-                    "graphrag_k": getattr(self.args, 'graphrag_k', 20),
+                    "selfrag_allow_oracle_context": getattr(self.args, 'selfrag_allow_oracle_context', False),
+                    "graphrag_k": getattr(self.args, 'graphrag_k', 8),
                     "graphrag_topk_nodes": getattr(self.args, 'graphrag_topk_nodes', 20),
                     "graphrag_max_seeds": getattr(self.args, 'graphrag_max_seeds', 10),
+                    "graphrag_max_hops": getattr(self.args, 'graphrag_max_hops', 2),
                 }
             }
         
@@ -212,7 +215,8 @@ class ExperimentRunner:
                 llm=self.instrumented_llm,
                 retriever=self.retriever,
                 k=self.config.baselines.selfrag_k,
-                use_critic=self.config.baselines.selfrag_use_critic
+                use_critic=self.config.baselines.selfrag_use_critic,
+                allow_oracle_context=self.config.baselines.get('selfrag_allow_oracle_context', False)
             )
 
         elif mode == "graphrag":
@@ -222,7 +226,8 @@ class ExperimentRunner:
                 retriever=self.retriever,
                 k=self.config.baselines.graphrag_k,
                 topk_nodes=self.config.baselines.graphrag_topk_nodes,
-                max_seeds=self.config.baselines.graphrag_max_seeds
+                max_seeds=self.config.baselines.graphrag_max_seeds,
+                max_hops=self.config.baselines.get('graphrag_max_hops', 2)
             )
 
         else:
@@ -384,14 +389,23 @@ def main():
     parser.add_argument("--config", type=str, help="Path to configuration file")
 
     # Baseline-specific configuration
-    parser.add_argument("--selfrag_k", type=int, default=8, help="Number of documents for Self-RAG")
+    parser.add_argument("--common_k", type=int, default=8, help="Common k for retrieval across all baselines")
+    parser.add_argument("--selfrag_k", type=int, help="Number of documents for Self-RAG (defaults to --common_k)")
     parser.add_argument("--selfrag_use_critic", action="store_true", help="Use critic in Self-RAG")
-    parser.add_argument("--graphrag_k", type=int, default=20, help="Number of documents for GraphRAG")
+    parser.add_argument("--selfrag_allow_oracle_context", action="store_true", help="Allow Self-RAG to use oracle context")
+    parser.add_argument("--graphrag_k", type=int, help="Number of documents for GraphRAG (defaults to --common_k)")
     parser.add_argument("--graphrag_max_seeds", type=int, default=10, help="Max seed nodes for GraphRAG")
     parser.add_argument("--graphrag_topk_nodes", type=int, default=20, help="Top-k nodes for GraphRAG")
+    parser.add_argument("--graphrag_max_hops", type=int, default=2, help="Max hops for GraphRAG BFS expansion")
     
     args = parser.parse_args()
-    
+
+    # Apply common_k defaults
+    if args.selfrag_k is None:
+        args.selfrag_k = args.common_k
+    if args.graphrag_k is None:
+        args.graphrag_k = args.common_k
+
     # Set random seeds
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
