@@ -216,7 +216,7 @@ class ExperimentRunner:
                 retriever=self.retriever,
                 k=self.config.baselines.selfrag_k,
                 use_critic=self.config.baselines.selfrag_use_critic,
-                allow_oracle_context=self.config.baselines.get('selfrag_allow_oracle_context', False)
+                allow_oracle_context=getattr(self.config.baselines, 'selfrag_allow_oracle_context', False)
             )
 
         elif mode == "graphrag":
@@ -227,7 +227,7 @@ class ExperimentRunner:
                 k=self.config.baselines.graphrag_k,
                 topk_nodes=self.config.baselines.graphrag_topk_nodes,
                 max_seeds=self.config.baselines.graphrag_max_seeds,
-                max_hops=self.config.baselines.get('graphrag_max_hops', 2)
+                max_hops=getattr(self.config.baselines, 'graphrag_max_hops', 2)
             )
 
         else:
