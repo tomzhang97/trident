@@ -1,7 +1,14 @@
-"""KET-RAG baseline system for comparison with TRIDENT.
+"""Simplified KET-RAG-style baseline for comparison with TRIDENT.
 
+This is a simplified reimplementation of the KET-RAG approach for fair baseline comparison.
 KET-RAG (Knowledge-Enhanced Text RAG) is a cost-efficient multi-granular indexing framework
 that combines SkeletonRAG (KG skeleton from key chunks) and KeywordRAG (keyword-chunk bipartite graph).
+
+Key simplifications in this baseline:
+- Simplified importance scoring (vocabulary richness instead of PageRank)
+- Per-query construction (not persistent index like original KET-RAG)
+- Simple keyword extraction (instead of sophisticated NLP pipeline)
+- LLM-based entity extraction for skeleton KG
 
 Paper: KET-RAG: A Cost-Efficient Multi-Granular Indexing Framework for Graph-RAG
 https://arxiv.org/abs/2502.09304
@@ -124,13 +131,17 @@ class KeywordIndex:
 
 class KETRAGSystem:
     """
-    KET-RAG baseline system implementation.
+    Simplified KET-RAG-style baseline system.
 
-    Implements a simplified version of KET-RAG with:
-    1. SkeletonRAG: PageRank-style selection of key chunks + KG extraction
+    Implements a streamlined version of KET-RAG for fair comparison with TRIDENT:
+    1. SkeletonRAG: Key chunk selection (vocab-based importance) + LLM KG extraction
     2. KeywordRAG: Lightweight keyword-chunk bipartite graph
-    3. Dual-channel retrieval: Entity + keyword channels
-    4. Answer generation with both contexts
+    3. Dual-channel retrieval: Entity/KG channel + keyword channel
+    4. Answer generation conditioned on both contexts
+
+    This is NOT the official KET-RAG implementation. It's a simplified baseline
+    that captures the core dual-channel architecture while using the same
+    retrieval and LLM infrastructure as other baselines for fair comparison.
     """
 
     def __init__(
@@ -166,17 +177,18 @@ class KETRAGSystem:
 
     def _compute_chunk_importance(self, chunks: List[str]) -> List[float]:
         """
-        Compute importance scores for chunks using PageRank-like algorithm.
-        Simplified version: uses term overlap as edge weights.
+        Compute importance scores for chunks.
+
+        Simplified heuristic: chunks with richer vocabulary (more unique terms)
+        are considered more important. This is not true PageRank, just a proxy
+        for information density.
         """
         n = len(chunks)
         if n == 0:
             return []
 
-        # Build similarity matrix based on term overlap
-        scores = [1.0] * n  # Initialize with equal scores
-
         # Simple approach: chunks with more unique terms are more important
+        scores = [1.0] * n
         for i, chunk in enumerate(chunks):
             words = set(re.findall(r'\b\w{4,}\b', chunk.lower()))
             scores[i] = len(words)  # Simple importance: vocabulary richness
@@ -292,6 +304,8 @@ class KETRAGSystem:
         for doc in docs:
             if isinstance(doc, dict):
                 chunks.append(doc.get("text", str(doc)))
+            elif hasattr(doc, "page_content"):
+                chunks.append(doc.page_content)
             elif hasattr(doc, "text"):
                 chunks.append(doc.text)
             else:
@@ -345,7 +359,8 @@ class KETRAGSystem:
             skeleton_context=skeleton_context,
             keyword_context=keyword_context
         )
-        raw_answer = self._call_llm(answer_prompt, qstats, max_new_tokens=64)
+        # Use max_new_tokens=16 to match TRIDENT's answer budget
+        raw_answer = self._call_llm(answer_prompt, qstats, max_new_tokens=16)
         answer = raw_answer.strip()
 
         return {
