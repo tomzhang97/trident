@@ -144,7 +144,7 @@ class SimpleGraphIndex:
         max_nodes: int = 64
     ) -> Dict[str, List[Tuple[str, str, str]]]:
         """
-        Expand subgraph from seed nodes.
+        Expand subgraph from seed nodes using BFS.
 
         Args:
             seed_node_ids: Starting node IDs
@@ -154,30 +154,34 @@ class SimpleGraphIndex:
         Returns:
             Dict mapping node_id to list of triples
         """
-        subgraph = {}
+        from collections import defaultdict, deque
 
-        for seed_id in seed_node_ids:
-            if seed_id not in self.nodes:
+        # Build adjacency list
+        adj = defaultdict(list)
+        for s, r, o in self.edges:
+            adj[s].append((s, r, o))
+            adj[o].append((s, r, o))  # undirected for simplicity
+
+        visited = set()
+        queue = deque([(seed, 0) for seed in seed_node_ids if seed in self.nodes])
+        subgraph: Dict[str, List[Tuple[str, str, str]]] = {}
+
+        while queue and len(visited) < max_nodes:
+            node_id, hop = queue.popleft()
+            if node_id in visited or hop > max_hops:
                 continue
+            visited.add(node_id)
 
-            # Get node and its edges
-            node = self.nodes[seed_id]
-            triples = []
+            node = self.nodes[node_id]
+            triples = list(adj[node_id])
+            triples.append((node_id, "has_content", node["description"]))
+            subgraph[node_id] = triples
 
-            # Find edges involving this node
-            for s, r, o in self.edges:
-                if s == seed_id:
-                    triples.append((s, r, o))
-                elif o == seed_id:
-                    triples.append((s, r, o))
-
-            # Add a self-description triple
-            triples.append((seed_id, "has_content", node["description"]))
-
-            subgraph[seed_id] = triples
-
-            if len(subgraph) >= max_nodes:
-                break
+            # Enqueue neighbors
+            for s, r, o in adj[node_id]:
+                neighbor = o if s == node_id else s
+                if neighbor not in visited:
+                    queue.append((neighbor, hop + 1))
 
         return subgraph
 
@@ -308,6 +312,13 @@ class GraphRAGSystem:
         seed_output = self._call_llm(seed_prompt, qstats, max_new_tokens=32)
         seed_ids = [s.strip() for s in seed_output.split(",") if s.strip()]
         seed_ids = seed_ids[: self.max_seeds]
+
+        # Validate seed IDs and fallback if needed
+        seed_ids = [s for s in seed_ids if s in graph_index.nodes]
+
+        if not seed_ids:
+            # Fallback: use top candidates directly
+            seed_ids = [c["id"] for c in candidates[: min(self.max_seeds, len(candidates))]]
 
         # 5) Subgraph expansion
         subgraph = graph_index.expand_subgraph(

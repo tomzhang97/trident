@@ -82,7 +82,8 @@ class SelfRAGSystem:
         llm: InstrumentedLLM,
         retriever: Any,
         k: int = 8,
-        use_critic: bool = False
+        use_critic: bool = False,
+        allow_oracle_context: bool = False
     ):
         """
         Initialize Self-RAG system.
@@ -92,11 +93,13 @@ class SelfRAGSystem:
             retriever: Retrieval system (should have get_relevant_documents or retrieve method)
             k: Number of documents to retrieve
             use_critic: Whether to use critic/verification step
+            allow_oracle_context: If False, raises error when context is provided (enforces retrieval regime)
         """
         self.llm = llm
         self.retriever = retriever
         self.k = k
         self.use_critic = use_critic
+        self.allow_oracle_context = allow_oracle_context
 
     def _call_llm(self, prompt: str, qstats: QueryStats, **gen_kwargs) -> str:
         """Make a timed LLM call and update query stats."""
@@ -139,10 +142,18 @@ class SelfRAGSystem:
 
         # 1) Decide whether to retrieve (if context not provided)
         docs = []
-        gate = "PROVIDED_CONTEXT"
+        gate = "RETRIEVE"
 
-        if context is not None:
-            # Use provided context directly
+        if context is not None and not self.allow_oracle_context:
+            # Enforce retrieval regime: don't accept oracle context
+            raise ValueError(
+                "Self-RAG in retrieval mode does not accept oracle context. "
+                "Set allow_oracle_context=True to use provided context."
+            )
+
+        if context is not None and self.allow_oracle_context:
+            # Use provided context directly (oracle-context regime)
+            gate = "PROVIDED_CONTEXT"
             for title, sentences in context:
                 text = " ".join(sentences) if isinstance(sentences, list) else sentences
                 docs.append({"text": text, "title": title})
@@ -174,7 +185,7 @@ class SelfRAGSystem:
         raw_answer = self._call_llm(answer_prompt, qstats, max_new_tokens=64)
         answer = raw_answer.strip()
 
-        # 4) Optional critic
+        # 4) Optional critic with fallback generation
         critic_label = None
         if self.use_critic and docs:
             critic_prompt = SELF_RAG_CRITIC_PROMPT.format(
@@ -184,6 +195,15 @@ class SelfRAGSystem:
             )
             critic_output = self._call_llm(critic_prompt, qstats, max_new_tokens=4)
             critic_label = critic_output.strip().split()[0].upper()
+
+            # If critic finds issues, generate fallback answer without context
+            if critic_label in ("CONTRADICTS", "INSUFFICIENT"):
+                fallback_prompt = SELF_RAG_ANSWER_PROMPT.format(
+                    question=question,
+                    context="(none)",
+                )
+                raw_answer2 = self._call_llm(fallback_prompt, qstats, max_new_tokens=64)
+                answer = raw_answer2.strip()
 
         return {
             "answer": answer,

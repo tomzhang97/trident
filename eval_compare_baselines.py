@@ -129,10 +129,15 @@ class BaselineComparator:
                     "encoder_model": "facebook/contriever"
                 },
                 "baselines": {
-                    "selfrag_k": 8,
+                    # Common retrieval k for fair comparison
+                    "common_k": self.args.common_k if hasattr(self.args, 'common_k') else 8,
+                    "selfrag_k": self.args.common_k if hasattr(self.args, 'common_k') else 8,
                     "selfrag_use_critic": self.args.selfrag_use_critic,
-                    "graphrag_k": 20,
-                    "graphrag_max_seeds": 10
+                    "selfrag_allow_oracle_context": self.args.selfrag_allow_oracle_context if hasattr(self.args, 'selfrag_allow_oracle_context') else False,
+                    "graphrag_k": self.args.common_k if hasattr(self.args, 'common_k') else 8,
+                    "graphrag_topk_nodes": 20,
+                    "graphrag_max_seeds": 10,
+                    "graphrag_max_hops": 2
                 }
             }
 
@@ -221,7 +226,8 @@ class BaselineComparator:
                 llm=self.instrumented_llm,
                 retriever=self.retriever,
                 k=self.config.baselines.selfrag_k,
-                use_critic=self.config.baselines.selfrag_use_critic
+                use_critic=self.config.baselines.selfrag_use_critic,
+                allow_oracle_context=self.config.baselines.selfrag_allow_oracle_context
             )
 
         # Initialize GraphRAG
@@ -231,7 +237,8 @@ class BaselineComparator:
                 retriever=self.retriever,
                 k=self.config.baselines.graphrag_k,
                 topk_nodes=self.config.baselines.graphrag_topk_nodes,
-                max_seeds=self.config.baselines.graphrag_max_seeds
+                max_seeds=self.config.baselines.graphrag_max_seeds,
+                max_hops=self.config.baselines.graphrag_max_hops
             )
 
         return systems
@@ -254,6 +261,8 @@ class BaselineComparator:
 
             try:
                 # Run system
+                # Note: For retrieval-only experiments, pass context=None
+                # For oracle-context experiments, pass context=example.get('context')
                 output = system.answer(
                     question=question,
                     context=example.get('context'),
@@ -406,7 +415,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
     # Baseline-specific options
+    parser.add_argument("--common_k", type=int, default=8, help="Common k for retrieval across all baselines (default: 8)")
     parser.add_argument("--selfrag_use_critic", action="store_true", help="Use critic in Self-RAG")
+    parser.add_argument("--selfrag_allow_oracle_context", action="store_true", help="Allow Self-RAG to use oracle context (default: retrieval-only mode)")
 
     # Evaluation options
     parser.add_argument("--max_examples", type=int, default=0, help="Maximum examples to evaluate (0 for all)")
