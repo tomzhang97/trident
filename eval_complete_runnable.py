@@ -216,7 +216,7 @@ class ExperimentRunner:
                 retriever=self.retriever,
                 k=self.config.baselines.selfrag_k,
                 use_critic=self.config.baselines.selfrag_use_critic,
-                allow_oracle_context=self.config.baselines.get('selfrag_allow_oracle_context', False)
+                allow_oracle_context=getattr(self.config.baselines, 'selfrag_allow_oracle_context', False)
             )
 
         elif mode == "graphrag":
@@ -227,7 +227,7 @@ class ExperimentRunner:
                 k=self.config.baselines.graphrag_k,
                 topk_nodes=self.config.baselines.graphrag_topk_nodes,
                 max_seeds=self.config.baselines.graphrag_max_seeds,
-                max_hops=self.config.baselines.get('graphrag_max_hops', 2)
+                max_hops=getattr(self.config.baselines, 'graphrag_max_hops', 2)
             )
 
         else:
@@ -248,12 +248,39 @@ class ExperimentRunner:
             try:
                 start_time = time.time()
 
-                # Run the system (TRIDENT, Self-RAG, or GraphRAG)
-                output = self.system.answer(
-                    question=example['question'],
-                    context=example.get('context'),
-                    supporting_facts=example.get('supporting_facts')
-                )
+                # Determine whether to pass oracle context based on mode
+                # For TRIDENT modes: pass context for facet mining from supporting facts
+                # For baseline modes: only pass context if explicitly allowed
+                if self.args.mode in ['safe_cover', 'pareto', 'both']:
+                    # TRIDENT modes: pass context and supporting_facts
+                    output = self.system.answer(
+                        question=example['question'],
+                        context=example.get('context'),
+                        supporting_facts=example.get('supporting_facts')
+                    )
+                elif self.args.mode == 'self_rag':
+                    # Self-RAG: only pass context if allow_oracle_context is enabled
+                    use_context = getattr(self.config.baselines, 'selfrag_allow_oracle_context', False)
+                    output = self.system.answer(
+                        question=example['question'],
+                        context=example.get('context') if use_context else None,
+                        supporting_facts=example.get('supporting_facts')
+                    )
+                elif self.args.mode == 'graphrag':
+                    # GraphRAG: pass context for graph building if flag is set, else use retrieval
+                    use_oracle = getattr(self.args, 'graphrag_use_oracle_context', False)
+                    output = self.system.answer(
+                        question=example['question'],
+                        context=example.get('context') if use_oracle else None,
+                        supporting_facts=example.get('supporting_facts')
+                    )
+                else:
+                    # Fallback: pass everything
+                    output = self.system.answer(
+                        question=example['question'],
+                        context=example.get('context'),
+                        supporting_facts=example.get('supporting_facts')
+                    )
 
                 elapsed_ms = (time.time() - start_time) * 1000
 
@@ -397,6 +424,7 @@ def main():
     parser.add_argument("--graphrag_max_seeds", type=int, default=10, help="Max seed nodes for GraphRAG")
     parser.add_argument("--graphrag_topk_nodes", type=int, default=20, help="Top-k nodes for GraphRAG")
     parser.add_argument("--graphrag_max_hops", type=int, default=2, help="Max hops for GraphRAG BFS expansion")
+    parser.add_argument("--graphrag_use_oracle_context", action="store_true", help="Use oracle context for GraphRAG (default: uses retrieval)")
     
     args = parser.parse_args()
 
