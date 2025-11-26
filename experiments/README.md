@@ -25,7 +25,17 @@ cd ~/trident-main  # or wherever your repo is
 pwd  # Should show /path/to/trident
 ```
 
-### GraphRAG
+### ⚙️ Important: Retrieval vs Oracle Context
+
+**By default, all baseline systems use retrieval** (like TRIDENT does):
+- Self-RAG: Uses retrieval gate and retriever
+- GraphRAG: Retrieves documents and builds graphs from them
+
+This ensures fair comparison. To use oracle context instead, add flags:
+- `--selfrag_allow_oracle_context` for Self-RAG
+- `--graphrag_use_oracle_context` for GraphRAG
+
+### GraphRAG (Retrieval Mode - Default)
 ```bash
 python eval_complete_runnable.py --worker \
   --data_path runs/_shards/validation_0_99.json \
@@ -36,7 +46,7 @@ python eval_complete_runnable.py --worker \
   --model Meta-Llama-3-8B-Instruct
 ```
 
-### Self-RAG
+### Self-RAG (Retrieval Mode - Default)
 ```bash
 python eval_complete_runnable.py --worker \
   --data_path runs/_shards/validation_0_99.json \
@@ -146,6 +156,38 @@ chmod +x run_all.sh
 
 ---
 
+## Oracle Context Mode (For Ablation Studies)
+
+If you want to test baselines with oracle context (provided gold passages) instead of retrieval:
+
+### Self-RAG with Oracle Context
+```bash
+python eval_complete_runnable.py --worker \
+  --data_path runs/_shards/validation_0_99.json \
+  --output_dir runs/selfrag_oracle \
+  --mode self_rag \
+  --config configs/self_rag.json \
+  --device 2 \
+  --model Meta-Llama-3-8B-Instruct \
+  --selfrag_allow_oracle_context
+```
+
+### GraphRAG with Oracle Context
+```bash
+python eval_complete_runnable.py --worker \
+  --data_path runs/_shards/validation_0_99.json \
+  --output_dir runs/graphrag_oracle \
+  --mode graphrag \
+  --config configs/graphrag.json \
+  --device 2 \
+  --model Meta-Llama-3-8B-Instruct \
+  --graphrag_use_oracle_context
+```
+
+**Note:** When using oracle context mode, clearly label results in your paper as "over oracle context" to distinguish from retrieval-based comparison.
+
+---
+
 ## Troubleshooting
 
 ### Error: No module named 'trident'
@@ -181,20 +223,39 @@ git pull origin claude/strengthen-baselines-0133AVGR6VmM1Xny6rXttn2A
 git pull origin claude/strengthen-baselines-0133AVGR6VmM1Xny6rXttn2A
 ```
 
+### Error: ValueError: Self-RAG in retrieval mode does not accept oracle context
+
+**Cause**: Self-RAG is in retrieval-only mode (default) but oracle context is being passed.
+
+**Solution**: This is the correct behavior for fair comparison! Self-RAG will use retrieval.
+
+If you actually want oracle context mode, add the flag:
+```bash
+--selfrag_allow_oracle_context
+```
+
 ---
 
 ## Key Parameters
 
 All commands support these arguments:
 
+**General:**
 - `--common_k 8`: Shared retrieval k (default: 8)
 - `--device 2`: GPU device number
 - `--model Meta-Llama-3-8B-Instruct`: Model name
 - `--config configs/xxx.json`: Config file
+
+**Self-RAG:**
 - `--selfrag_use_critic`: Enable Self-RAG critic
-- `--selfrag_allow_oracle_context`: Allow oracle context
+- `--selfrag_allow_oracle_context`: Use oracle context instead of retrieval (default: False)
+
+**GraphRAG:**
 - `--graphrag_k 8`: GraphRAG retrieval k
 - `--graphrag_max_hops 2`: Max BFS hops
+- `--graphrag_use_oracle_context`: Use oracle context instead of retrieval (default: False)
+
+**TRIDENT:**
 - `--budget_tokens 2000`: TRIDENT token budget
 
 See `RUN_BASELINES.md` for complete documentation.
