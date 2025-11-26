@@ -4,12 +4,13 @@ This document describes the baseline systems implemented for fair comparison wit
 
 ## Overview
 
-We implement two baseline systems for comparison:
+We implement three baseline systems for comparison:
 
 1. **Self-RAG-style baseline**: Retrieval-gated question answering with optional critic
 2. **GraphRAG-style baseline**: Graph-based retrieval and reasoning
+3. **KET-RAG-style baseline**: Cost-efficient multi-granular indexing with skeleton KG and keyword-chunk bipartite graph
 
-Both baselines follow simplified but valid implementations of their respective papers, with careful attention to fairness and consistency with TRIDENT.
+All baselines follow simplified but valid implementations of their respective papers, with careful attention to fairness and consistency with TRIDENT.
 
 ---
 
@@ -151,6 +152,94 @@ python eval_compare_baselines.py \
 
 ---
 
+## KET-RAG Baseline
+
+### Design
+
+The KET-RAG baseline implements a cost-efficient multi-granular indexing framework:
+
+1. **SkeletonRAG**: Selects key chunks via importance scoring (PageRank-style), then extracts KG skeleton
+2. **KeywordRAG**: Builds keyword-chunk bipartite graph for lightweight retrieval
+3. **Dual-channel retrieval**: Combines entity/knowledge and keyword channels
+4. **Answer generation**: Uses both skeleton facts and keyword-matched chunks
+
+### Key Parameters
+
+```python
+KETRAGSystem(
+    llm=instrumented_llm,
+    retriever=retriever,
+    k=8,                         # Number of documents to retrieve
+    skeleton_ratio=0.3,          # Ratio of chunks for skeleton KG (30%)
+    max_skeleton_triples=10,     # Max triples from skeleton
+    max_keyword_chunks=5         # Max chunks from keyword index
+)
+```
+
+### How It Works
+
+#### Indexing Phase (Per-Query)
+
+1. **Document Retrieval**: Retrieve top-k documents
+2. **Chunk Importance**: Compute importance scores (vocabulary richness)
+3. **Skeleton Construction**:
+   - Select top 30% of chunks by importance
+   - Extract entities and relationships using LLM
+   - Build knowledge graph skeleton
+4. **Keyword Index**:
+   - Extract keywords from all chunks
+   - Build keyword-chunk bipartite graph
+
+#### Query Phase
+
+1. **Entity Channel**:
+   - Extract query entities
+   - Retrieve relevant KG triples from skeleton
+2. **Keyword Channel**:
+   - Match query keywords against index
+   - Retrieve top-matching chunks
+3. **Dual-Channel Generation**:
+   - Combine skeleton facts and keyword chunks
+   - Generate answer using both contexts
+
+### Evaluation
+
+```bash
+python eval_complete_runnable.py --worker \
+    --systems ketrag \
+    --common_k 8 \
+    --data_path data/hotpotqa_dev.json \
+    --output_dir results/ketrag
+```
+
+### Improvements from Original Paper
+
+Our implementation provides a simplified but valid KET-RAG baseline:
+
+1. ✅ **Dual-channel retrieval**: Entity/KG + keyword channels
+2. ✅ **Skeleton KG construction**: From key chunks using LLM extraction
+3. ✅ **Keyword-chunk graph**: Lightweight bipartite graph
+4. ✅ **Harmonized k**: Uses same retrieval count as other baselines
+
+### Honest Limitations (to mention in paper)
+
+- Simplified importance scoring (vocabulary richness vs. full PageRank)
+- Per-query construction (not persistent index like original KET-RAG)
+- Simple keyword extraction (vs. sophisticated NLP pipeline)
+- Should be called "KET-RAG-style baseline" or "Simplified KET-RAG"
+
+### Key Advantages
+
+- **Cost-efficient**: Skeleton KG only from key chunks (30%), not all chunks
+- **Multi-granular**: Combines structured (KG) and unstructured (keywords) indexing
+- **Balanced**: Better cost-quality tradeoff than full Graph-RAG
+
+### Citation
+
+Based on: [KET-RAG: A Cost-Efficient Multi-Granular Indexing Framework for Graph-RAG](https://arxiv.org/abs/2502.09304)
+
+---
+
 ## Fairness Checklist for Paper Comparison
 
 To ensure baselines are not "strawman" and reviewers accept them:
@@ -175,13 +264,13 @@ All systems use:
 **Choose one regime and apply to all systems:**
 
 #### Option A: Retrieval regime (recommended)
-- All systems: `context=None`
-- TRIDENT, Self-RAG, GraphRAG all use retrievers
+- All systems: `context=None` (or used for indexing only in KET-RAG)
+- TRIDENT, Self-RAG, GraphRAG, KET-RAG all use retrievers
 - Most realistic for real-world comparison
 
 #### Option B: Oracle-context regime
 - All systems: `context=gold_paragraphs`
-- No one uses retriever
+- No one uses retriever (or uses oracle docs for building indices)
 - Tests evidence selection only
 - **Must** label clearly in paper (e.g., "over oracle context")
 
