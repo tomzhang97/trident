@@ -345,23 +345,36 @@ class KETRAGSystem:
         keyword_chunk_indices = keyword_index.retrieve_chunks(question, self.max_keyword_chunks)
         keyword_chunks_text = [chunks[i] for i in keyword_chunk_indices if i < len(chunks)]
 
-        if keyword_chunks_text:
-            keyword_context = "\n\n".join(
-                f"[{i+1}] {text[:300]}..." if len(text) > 300 else f"[{i+1}] {text}"
-                for i, text in enumerate(keyword_chunks_text)
-            )
-        else:
-            keyword_context = "(no relevant chunks found)"
+        # 6) Generate answer using both contexts with standardized interface
+        # Combine skeleton and keyword contexts into passage format
+        passages = []
 
-        # 6) Generate answer using both contexts
-        answer_prompt = KETRAG_ANSWER_PROMPT.format(
+        # Add skeleton knowledge as first passage
+        if relevant_triples:
+            skeleton_text = "Key facts from knowledge graph:\n" + "\n".join(
+                f"- {s} {r} {o}" for s, r, o in relevant_triples
+            )
+            passages.append({"text": skeleton_text})
+
+        # Add keyword chunks as additional passages
+        for i, text in enumerate(keyword_chunks_text):
+            passages.append({"text": text})
+
+        # If no passages, add placeholder
+        if not passages:
+            passages = [{"text": "(no relevant information found)"}]
+
+        # Use standardized build_multi_hop_prompt for consistency across all systems
+        answer_prompt = self.llm.build_multi_hop_prompt(
             question=question,
-            skeleton_context=skeleton_context,
-            keyword_context=keyword_context
+            passages=passages,
+            facets=[]
         )
         # Use max_new_tokens=16 to match TRIDENT's answer budget
         raw_answer = self._call_llm(answer_prompt, qstats, max_new_tokens=16)
-        answer = raw_answer.strip()
+
+        # Use standardized extract_answer for consistency
+        answer = self.llm.extract_answer(raw_answer)
 
         return {
             "answer": answer,

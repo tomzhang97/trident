@@ -277,13 +277,16 @@ class GraphRAGSystem:
                 docs = []
 
         if not docs:
-            # Fallback: direct answer without graph
-            prompt = GRAPHRAG_ANSWER_PROMPT.format(
+            # Fallback: direct answer without graph using standardized interface
+            fallback_passages = [{"text": "(no graph information available)"}]
+            prompt = self.llm.build_multi_hop_prompt(
                 question=question,
-                summaries="(no graph information available)",
+                passages=fallback_passages,
+                facets=[]
             )
             # Use max_new_tokens=16 to match TRIDENT/KET-RAG answer budget for fair comparison
-            answer = self._call_llm(prompt, qstats, max_new_tokens=16).strip()
+            raw_answer = self._call_llm(prompt, qstats, max_new_tokens=16)
+            answer = self.llm.extract_answer(raw_answer)
             return {
                 "answer": answer,
                 "tokens_used": qstats.total_tokens,
@@ -339,16 +342,21 @@ class GraphRAGSystem:
             summary = self._call_llm(summary_prompt, qstats, max_new_tokens=128)
             summaries.append(summary.strip())
 
-        summaries_str = "\n\n".join(f"- {s}" for s in summaries)
+        # 7) Final answer using standardized interface
+        # Convert summaries to passage format for build_multi_hop_prompt
+        summary_passages = [{"text": summary} for summary in summaries]
 
-        # 7) Final answer
-        answer_prompt = GRAPHRAG_ANSWER_PROMPT.format(
+        # Use standardized build_multi_hop_prompt for consistency across all systems
+        answer_prompt = self.llm.build_multi_hop_prompt(
             question=question,
-            summaries=summaries_str,
+            passages=summary_passages,
+            facets=[]
         )
         # Use max_new_tokens=16 to match TRIDENT/KET-RAG answer budget for fair comparison
         raw_answer = self._call_llm(answer_prompt, qstats, max_new_tokens=16)
-        answer = raw_answer.strip()
+
+        # Use standardized extract_answer for consistency
+        answer = self.llm.extract_answer(raw_answer)
 
         return {
             "answer": answer,
