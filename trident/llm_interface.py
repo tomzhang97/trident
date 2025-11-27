@@ -256,7 +256,8 @@ Answer:"""
         Extract the answer from generated text.
 
         Prioritizes extracting from "Final answer:" format (used by build_multi_hop_prompt),
-        then falls back to removing common prefixes.
+        then falls back to removing common prefixes. Also strips trailing punctuation for
+        fair evaluation against ground truth.
         """
         answer = generated_text.strip()
 
@@ -287,6 +288,19 @@ Answer:"""
         # Take first sentence if answer is very long
         if len(answer) > 500 and '.' in answer:
             answer = answer.split('.')[0] + '.'
+
+        # Strip trailing punctuation for fair evaluation
+        # Remove trailing periods, commas, exclamation marks, question marks
+        # But preserve them if they're part of abbreviations (e.g., "U.S.", "Inc.")
+        answer = answer.rstrip()
+
+        # Remove trailing punctuation (but not if preceded by single letter - likely abbreviation)
+        while answer and answer[-1] in '.,!?;:':
+            # Check if it's an abbreviation (single letter followed by period)
+            if answer[-1] == '.' and len(answer) >= 2 and answer[-2].isupper() and (len(answer) == 2 or answer[-3] in ' .'):
+                # This looks like an abbreviation like "U." or "D.C.", keep the period
+                break
+            answer = answer[:-1].rstrip()
 
         return answer
     
