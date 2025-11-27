@@ -182,16 +182,33 @@ class SelfRAGSystem:
                 else:
                     docs = []
 
-        context_str = self._format_docs(docs) if docs else "(none)"
+        # 3) Answer using standardized interface
+        # Convert docs to passage format for build_multi_hop_prompt
+        passages = []
+        if docs:
+            for d in docs:
+                if hasattr(d, "page_content"):
+                    passages.append({"text": d.page_content})
+                elif hasattr(d, "text"):
+                    passages.append({"text": d.text})
+                elif isinstance(d, dict):
+                    passages.append({"text": d.get("text", d.get("content", str(d)))})
+                else:
+                    passages.append({"text": str(d)})
+        else:
+            passages = [{"text": "(none)"}]
 
-        # 3) Answer
-        answer_prompt = SELF_RAG_ANSWER_PROMPT.format(
+        # Use standardized build_multi_hop_prompt for consistency across all systems
+        answer_prompt = self.llm.build_multi_hop_prompt(
             question=question,
-            context=context_str,
+            passages=passages,
+            facets=[]
         )
         # Use max_new_tokens=16 to match TRIDENT/KET-RAG answer budget for fair comparison
         raw_answer = self._call_llm(answer_prompt, qstats, max_new_tokens=16)
-        answer = raw_answer.strip()
+
+        # Use standardized extract_answer for consistency
+        answer = self.llm.extract_answer(raw_answer)
 
         # 4) Optional critic with fallback generation
         critic_label = None
@@ -204,15 +221,17 @@ class SelfRAGSystem:
             critic_output = self._call_llm(critic_prompt, qstats, max_new_tokens=4)
             critic_label = critic_output.strip().split()[0].upper()
 
-            # If critic finds issues, generate fallback answer without context
+            # If critic finds issues, generate fallback answer without context using standardized interface
             if critic_label in ("CONTRADICTS", "INSUFFICIENT"):
-                fallback_prompt = SELF_RAG_ANSWER_PROMPT.format(
+                fallback_passages = [{"text": "(none)"}]
+                fallback_prompt = self.llm.build_multi_hop_prompt(
                     question=question,
-                    context="(none)",
+                    passages=fallback_passages,
+                    facets=[]
                 )
                 # Use max_new_tokens=16 to match TRIDENT/KET-RAG answer budget for fair comparison
                 raw_answer2 = self._call_llm(fallback_prompt, qstats, max_new_tokens=16)
-                answer = raw_answer2.strip()
+                answer = self.llm.extract_answer(raw_answer2)
 
         return {
             "answer": answer,

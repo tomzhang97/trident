@@ -92,6 +92,7 @@ python eval_compare_baselines.py \
 4. ✅ **Clear naming**: Distinguishes retrieval vs oracle-context modes
 5. ✅ **Robust gate parsing**: Regex-based parsing handles malformed LLM outputs
 6. ✅ **Unified answer budget**: Uses max_new_tokens=16 matching TRIDENT
+7. ✅ **Standardized prompting**: Uses `build_multi_hop_prompt()` and `extract_answer()` for fairness
 
 ---
 
@@ -146,6 +147,7 @@ python eval_compare_baselines.py \
 3. ✅ **Harmonized k**: Uses same retrieval count as other baselines
 4. ✅ **Robust to LLM errors**: Won't crash on malformed seed outputs
 5. ✅ **Unified answer budget**: Uses max_new_tokens=16 matching TRIDENT
+6. ✅ **Standardized prompting**: Uses `build_multi_hop_prompt()` and `extract_answer()` for fairness
 
 ### Honest Limitations (to mention in paper)
 
@@ -226,6 +228,7 @@ Our implementation provides a simplified but valid KET-RAG baseline:
 3. ✅ **Keyword-chunk graph**: Lightweight bipartite graph
 4. ✅ **Harmonized k**: Uses same retrieval count as other baselines
 5. ✅ **Unified answer budget**: Uses max_new_tokens=16 matching TRIDENT
+6. ✅ **Standardized prompting**: Uses `build_multi_hop_prompt()` and `extract_answer()` for fairness
 
 ### Honest Limitations (to mention in paper)
 
@@ -259,8 +262,10 @@ All systems use identical:
 - Temperature (0.0 for deterministic comparison)
 - `max_new_tokens` (16 for final answers, matching TRIDENT)
 - Random seed
+- **Prompt interface**: All systems use `build_multi_hop_prompt()` for final answer generation
+- **Answer extraction**: All systems use `extract_answer()` for consistent answer parsing
 
-**Note:** Intermediate steps (GraphRAG summaries, entity extraction, etc.) may use different token budgets, but all final answer generation uses exactly 16 tokens for fair comparison.
+**Note:** Intermediate steps (GraphRAG summaries, entity extraction, etc.) may use different token budgets and prompts specific to each baseline's methodology, but all final answer generation uses exactly the same prompting and extraction interface for fair comparison.
 
 ### 2. Same Retrieval Settings ✅
 
