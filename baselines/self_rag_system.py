@@ -213,6 +213,9 @@ class SelfRAGSystem:
         # 4) Optional critic with fallback generation
         critic_label = None
         if self.use_critic and docs:
+            # Format docs for critic (critic uses original format, not passages)
+            context_str = self._format_docs(docs) if docs else "(none)"
+
             critic_prompt = SELF_RAG_CRITIC_PROMPT.format(
                 question=question,
                 answer=answer,

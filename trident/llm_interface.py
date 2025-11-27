@@ -252,24 +252,42 @@ Answer:"""
 
     
     def extract_answer(self, generated_text: str) -> str:
-        """Extract the answer from generated text."""
-        # Simple extraction - can be enhanced based on model output format
+        """
+        Extract the answer from generated text.
+
+        Prioritizes extracting from "Final answer:" format (used by build_multi_hop_prompt),
+        then falls back to removing common prefixes.
+        """
         answer = generated_text.strip()
-        
-        # Remove common prefixes
-        prefixes_to_remove = [
-            "Answer:", "A:", "Response:", "The answer is:",
-            "Based on the context,", "According to the documents,"
-        ]
-        
-        for prefix in prefixes_to_remove:
-            if answer.lower().startswith(prefix.lower()):
-                answer = answer[len(prefix):].strip()
-        
+
+        # First, try to extract from "Final answer:" format (case-insensitive)
+        # This is the format requested by build_multi_hop_prompt
+        import re
+
+        # Look for "Final answer:" pattern (case-insensitive)
+        match = re.search(r'(?:^|\n)\s*final\s+answer\s*:\s*(.+?)(?:\n|$)', answer, re.IGNORECASE | re.MULTILINE)
+        if match:
+            # Extract the answer portion after "Final answer:"
+            answer = match.group(1).strip()
+            # If there are multiple "Final answer:" lines, we already got the first one
+            # Remove any trailing "Final answer:" artifacts
+            answer = re.sub(r'\s*final\s+answer\s*:.*$', '', answer, flags=re.IGNORECASE).strip()
+        else:
+            # Fall back to removing common prefixes
+            prefixes_to_remove = [
+                "Answer:", "A:", "Response:", "The answer is:",
+                "Based on the context,", "According to the documents,"
+            ]
+
+            for prefix in prefixes_to_remove:
+                if answer.lower().startswith(prefix.lower()):
+                    answer = answer[len(prefix):].strip()
+                    break
+
         # Take first sentence if answer is very long
         if len(answer) > 500 and '.' in answer:
             answer = answer.split('.')[0] + '.'
-        
+
         return answer
     
     def batch_generate(

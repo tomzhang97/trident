@@ -263,7 +263,12 @@ All systems use identical:
 - `max_new_tokens` (16 for final answers, matching TRIDENT)
 - Random seed
 - **Prompt interface**: All systems use `build_multi_hop_prompt()` for final answer generation
+  - Asks model to output "Final answer: <answer>" on last line
+  - Provides consistent multi-hop reasoning instructions
 - **Answer extraction**: All systems use `extract_answer()` for consistent answer parsing
+  - Extracts from "Final answer:" format (case-insensitive regex)
+  - Handles malformed outputs gracefully
+  - Falls back to prefix removal if "Final answer:" not found
 
 **Note:** Intermediate steps (GraphRAG summaries, entity extraction, etc.) may use different token budgets and prompts specific to each baseline's methodology, but all final answer generation uses exactly the same prompting and extraction interface for fair comparison.
 
