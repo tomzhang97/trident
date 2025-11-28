@@ -67,6 +67,61 @@ PARETO_MID_2500 = ParetoConfig(
     bwk_exploration_bonus=0.1,
 )
 
+# Self-RAG token-matching configs: Target ~1450 total tokens (Self-RAG level)
+# These aim for total_tokens ≈ 1.5-1.6× budget due to answer overhead
+PARETO_MATCH_1500 = ParetoConfig(
+    budget=1000,
+    max_evidence_tokens=1000,
+    max_units=8,
+    stop_on_budget=True,
+    relaxed_alpha=0.5,  # More lenient to maintain coverage at low budget
+    weight_default=1.0,
+    use_vqc=False,  # Disable VQC to save tokens
+    use_bwk=False,
+    max_vqc_iterations=0,
+    bwk_exploration_bonus=0.1,
+)
+
+PARETO_MATCH_1300 = ParetoConfig(
+    budget=800,
+    max_evidence_tokens=800,
+    max_units=7,
+    stop_on_budget=True,
+    relaxed_alpha=0.5,
+    weight_default=1.0,
+    use_vqc=False,
+    use_bwk=False,
+    max_vqc_iterations=0,
+    bwk_exploration_bonus=0.1,
+)
+
+PARETO_MATCH_1100 = ParetoConfig(
+    budget=650,
+    max_evidence_tokens=650,
+    max_units=6,
+    stop_on_budget=True,
+    relaxed_alpha=0.5,
+    weight_default=1.0,
+    use_vqc=False,
+    use_bwk=False,
+    max_vqc_iterations=0,
+    bwk_exploration_bonus=0.1,
+)
+
+# Variant with higher alpha for quality at low budget
+PARETO_MATCH_1500_ALPHA06 = ParetoConfig(
+    budget=1000,
+    max_evidence_tokens=1000,
+    max_units=8,
+    stop_on_budget=True,
+    relaxed_alpha=0.6,  # More lenient threshold for better coverage
+    weight_default=1.0,
+    use_vqc=False,
+    use_bwk=False,
+    max_vqc_iterations=0,
+    bwk_exploration_bonus=0.1,
+)
+
 
 # =============================================================================
 # Safe-Cover configs: Strict risk control
@@ -188,6 +243,11 @@ PARETO_CONFIGS = {
     "pareto_cheap_1500": PARETO_CHEAP_1500,
     "pareto_cheap_2000": PARETO_CHEAP_2000,
     "pareto_mid_2500": PARETO_MID_2500,
+    # Self-RAG token-matching configs
+    "pareto_match_1500": PARETO_MATCH_1500,
+    "pareto_match_1300": PARETO_MATCH_1300,
+    "pareto_match_1100": PARETO_MATCH_1100,
+    "pareto_match_1500_alpha06": PARETO_MATCH_1500_ALPHA06,
 }
 
 SAFE_COVER_CONFIGS = {
