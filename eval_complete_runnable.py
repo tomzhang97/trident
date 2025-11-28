@@ -19,7 +19,8 @@ import numpy as np
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from trident.config import TridentConfig, ExperimentConfig
+from trident.config import TridentConfig, ExperimentConfig, ParetoConfig, SafeCoverConfig
+from trident.config_families import get_config, get_selfrag_config, ALL_CONFIGS, SELFRAG_CONFIGS
 from trident.pipeline import TridentPipeline
 from trident.evaluation import BenchmarkEvaluator, DatasetLoader
 from trident.llm_interface import LLMInterface
@@ -98,12 +99,16 @@ class ExperimentRunner:
     def _load_config(self) -> TridentConfig:
         """Load or create configuration."""
         config_path = self.args.config or "configs/default.json"
-        
+
         if Path(config_path).exists():
             with open(config_path) as f:
                 config_dict = json.load(f)
         else:
-            # Default configuration
+            # Use config family if specified, otherwise use default configuration
+            if self.args.config_family:
+                return self._load_config_family()
+
+            # Default configuration (backward compatible)
             config_dict = {
                 "mode": self.args.mode or "safe_cover",
                 "safe_cover": {
@@ -145,7 +150,106 @@ class ExperimentRunner:
             }
         
         return TridentConfig.from_dict(config_dict)
-    
+
+    def _load_config_family(self) -> TridentConfig:
+        """Load configuration from a named config family."""
+        config_family_name = self.args.config_family
+
+        # Check if it's a Self-RAG config
+        if config_family_name in SELFRAG_CONFIGS:
+            baseline_cfg = get_selfrag_config(config_family_name)
+            mode = "self_rag"
+        # Check if it's a TRIDENT config
+        elif config_family_name in ALL_CONFIGS:
+            trident_cfg = get_config(config_family_name)
+            # Determine mode from config name
+            if config_family_name.startswith("pareto"):
+                mode = "pareto"
+                pareto_cfg = trident_cfg
+                safe_cover_cfg = SafeCoverConfig()  # Use defaults
+            elif config_family_name.startswith("safe_cover"):
+                mode = "safe_cover"
+                safe_cover_cfg = trident_cfg
+                pareto_cfg = ParetoConfig()  # Use defaults
+            else:
+                raise ValueError(f"Unknown config family type: {config_family_name}")
+        else:
+            raise ValueError(
+                f"Unknown config family: {config_family_name}. "
+                f"Available: {', '.join(list(ALL_CONFIGS.keys()) + list(SELFRAG_CONFIGS.keys()))}"
+            )
+
+        # Build full config dict
+        config_dict = {
+            "mode": mode,
+            "llm": {
+                "model_name": self.args.model or "meta-llama/Llama-2-7b-hf",
+                "temperature": self.args.temperature or 0.0,
+                "max_new_tokens": self.args.max_new_tokens or 512,
+                "device": self.device,
+                "load_in_8bit": self.args.load_in_8bit
+            },
+            "retrieval": {
+                "method": self.args.retrieval_method or "dense",
+                "top_k": self.args.top_k or 100,
+                "encoder_model": self.args.encoder_model or "facebook/contriever",
+                "corpus_path": self.args.corpus_path
+            },
+            "evaluation": {
+                "metrics": ["em", "f1", "support_em", "faithfulness"],
+                "dataset": self.args.dataset or "hotpotqa"
+            }
+        }
+
+        # Add mode-specific config
+        if mode == "pareto":
+            config_dict["pareto"] = {
+                "budget": pareto_cfg.budget,
+                "max_evidence_tokens": pareto_cfg.max_evidence_tokens,
+                "max_units": pareto_cfg.max_units,
+                "stop_on_budget": pareto_cfg.stop_on_budget,
+                "relaxed_alpha": pareto_cfg.relaxed_alpha,
+                "weight_default": pareto_cfg.weight_default,
+                "use_vqc": pareto_cfg.use_vqc,
+                "use_bwk": pareto_cfg.use_bwk,
+                "max_vqc_iterations": pareto_cfg.max_vqc_iterations,
+                "bwk_exploration_bonus": pareto_cfg.bwk_exploration_bonus,
+            }
+            config_dict["safe_cover"] = {}  # Empty defaults
+        elif mode == "safe_cover":
+            config_dict["safe_cover"] = {
+                "per_facet_alpha": safe_cover_cfg.per_facet_alpha,
+                "token_cap": safe_cover_cfg.token_cap,
+                "max_evidence_tokens": safe_cover_cfg.max_evidence_tokens,
+                "max_units": safe_cover_cfg.max_units,
+                "stop_on_budget": safe_cover_cfg.stop_on_budget,
+                "abstain_on_infeasible": safe_cover_cfg.abstain_on_infeasible,
+                "coverage_threshold": safe_cover_cfg.coverage_threshold,
+                "dual_tolerance": safe_cover_cfg.dual_tolerance,
+                "early_abstain": safe_cover_cfg.early_abstain,
+                "use_certificates": safe_cover_cfg.use_certificates,
+                "monitor_drift": safe_cover_cfg.monitor_drift,
+                "psi_threshold": safe_cover_cfg.psi_threshold,
+                "fallback_to_pareto": safe_cover_cfg.fallback_to_pareto,
+            }
+            config_dict["pareto"] = {}  # Empty defaults
+        elif mode == "self_rag":
+            config_dict["baselines"] = {
+                "common_k": baseline_cfg.common_k,
+                "selfrag_k": baseline_cfg.selfrag_k,
+                "selfrag_use_critic": baseline_cfg.selfrag_use_critic,
+                "selfrag_allow_oracle_context": baseline_cfg.selfrag_allow_oracle_context,
+                "graphrag_k": baseline_cfg.graphrag_k,
+                "graphrag_topk_nodes": baseline_cfg.graphrag_topk_nodes,
+                "graphrag_max_seeds": baseline_cfg.graphrag_max_seeds,
+                "graphrag_max_hops": baseline_cfg.graphrag_max_hops,
+            }
+            config_dict["safe_cover"] = {}
+            config_dict["pareto"] = {}
+
+        self.logger.info(f"Loaded config family: {config_family_name} (mode: {mode})")
+        return TridentConfig.from_dict(config_dict)
+
     def _init_llm(self) -> LLMInterface:
         """Initialize the local LLM."""
         return LLMInterface(
@@ -354,17 +458,19 @@ class ExperimentRunner:
     def _compute_summary(self, results: List[Dict]) -> Dict:
         """Compute summary statistics."""
         valid_results = [r for r in results if 'error' not in r]
-        
+
         if not valid_results:
             return {'error': 'No valid results'}
-        
+
         # Compute metrics
         em_scores = []
         f1_scores = []
         tokens_used = []
+        evidence_tokens = []
+        num_units = []
         latencies = []
         abstained_count = 0
-        
+
         for result in valid_results:
             if result.get('abstained'):
                 abstained_count += 1
@@ -385,19 +491,37 @@ class ExperimentRunner:
 
             tokens_used.append(result.get('tokens_used', 0))
             latencies.append(result.get('latency_ms', 0))
-        
-        return {
+
+            # Track evidence tokens and num_units if available (new config families)
+            metrics = result.get('metrics', {})
+            if 'evidence_tokens' in metrics:
+                evidence_tokens.append(metrics['evidence_tokens'])
+            if 'num_units' in metrics:
+                num_units.append(metrics['num_units'])
+
+        summary = {
             'num_examples': len(results),
             'num_valid': len(valid_results),
             'num_abstained': abstained_count,
             'abstention_rate': abstained_count / len(valid_results) if valid_results else 0,
             'avg_em': np.mean(em_scores) if em_scores else 0,
             'avg_f1': np.mean(f1_scores) if f1_scores else 0,
-            'avg_tokens': np.mean(tokens_used) if tokens_used else 0,
+            'avg_tokens_total': np.mean(tokens_used) if tokens_used else 0,
             'avg_latency_ms': np.mean(latencies) if latencies else 0,
             'total_tokens': sum(tokens_used),
             'mode': self.config.mode
         }
+
+        # Add evidence token metrics if available
+        if evidence_tokens:
+            summary['avg_evidence_tokens'] = np.mean(evidence_tokens)
+            summary['total_evidence_tokens'] = sum(evidence_tokens)
+
+        # Add num_units metrics if available
+        if num_units:
+            summary['avg_num_units'] = np.mean(num_units)
+
+        return summary
 
 
 def main():
@@ -422,7 +546,8 @@ def main():
         default="safe_cover",
         help="System mode: safe_cover/pareto/both (TRIDENT modes), self_rag, graphrag, or ketrag"
     )
-    parser.add_argument("--budget_tokens", type=int, default=2000, help="Token budget")
+    parser.add_argument("--budget_tokens", type=int, default=2000, help="Token budget (legacy, use --config_family instead)")
+    parser.add_argument("--config_family", type=str, help="Named config family (e.g., pareto_cheap_1500, safe_cover_equal_2500, selfrag_base)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     
     # Retrieval configuration
@@ -451,6 +576,18 @@ def main():
     parser.add_argument("--ketrag_max_keyword_chunks", type=int, default=5, help="Max chunks from keyword index (default: 5)")
 
     args = parser.parse_args()
+
+    # Validate config_family and mode compatibility
+    if args.config_family:
+        if args.config_family.startswith("pareto") and args.mode not in ["pareto", None]:
+            print(f"Warning: config_family '{args.config_family}' is for Pareto mode, but --mode={args.mode}")
+            args.mode = "pareto"
+        elif args.config_family.startswith("safe_cover") and args.mode not in ["safe_cover", None]:
+            print(f"Warning: config_family '{args.config_family}' is for Safe-Cover mode, but --mode={args.mode}")
+            args.mode = "safe_cover"
+        elif args.config_family.startswith("selfrag") and args.mode not in ["self_rag", None]:
+            print(f"Warning: config_family '{args.config_family}' is for Self-RAG mode, but --mode={args.mode}")
+            args.mode = "self_rag"
 
     # Apply common_k defaults
     if args.selfrag_k is None:
