@@ -74,7 +74,6 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        required=True,
         help="Config preset name (e.g., 'pareto_cheap_1500', 'safe_cover_equal_2500')",
     )
     parser.add_argument(
@@ -108,6 +107,10 @@ def main():
         for name in SELFRAG_CONFIGS:
             print(f"  - {name}")
         return
+
+    # Validate that config is provided
+    if not args.config:
+        parser.error("--config is required (unless using --list)")
 
     # Create config from preset
     config = create_config_from_preset(args.config, args.baseline)
