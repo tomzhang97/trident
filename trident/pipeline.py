@@ -572,11 +572,9 @@ class TridentPipeline:
                 'calibrator_version': self.config.calibration.version
             })
 
-        # Determine if the result is infeasible or leads to abstention
-        # This depends on the specific return structure of self.safe_cover_algo.run
-        # Assuming result.abstained or result.infeasible might be set, or inferring from selected_passages
-        is_infeasible = getattr(result, 'infeasible', False) # Adjust based on actual result object
-        is_abstained = result.abstained or is_infeasible or len(selected) == 0 # Adjust condition if needed
+        # Use infeasible and abstained flags from result
+        is_infeasible = result.infeasible
+        is_abstained = result.abstained
 
         return {
             'selected_passages': selected,

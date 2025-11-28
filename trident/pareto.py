@@ -63,7 +63,11 @@ class ParetoKnapsackOptimizer:
         Enforces max_evidence_tokens and max_units constraints if configured.
         """
         # Use config-specified limits if available, otherwise fall back to budget parameter
-        budget = budget or self.config.budget
+        if budget is None:
+            if self.config.budget is None or self.config.budget <= 0:
+                raise ValueError("Pareto budget must be specified and positive")
+            budget = self.config.budget
+
         max_evidence_tokens = self.config.max_evidence_tokens or budget
         max_units = self.config.max_units or len(passages)
 
