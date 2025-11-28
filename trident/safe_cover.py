@@ -106,15 +106,25 @@ class SafeCoverAlgorithm:
         # Step 5: Check abstention conditions
         total_cost = sum(p.cost for p in selected)
         abstained = False
-        
-        # Abstain if we have uncovered facets
+        is_infeasible = False
+
+        # Check if solution is infeasible (has uncovered facets or no selection)
         if uncovered_facets or len(selected) == 0:
+            is_infeasible = True
+
+        # Check if dual LB exceeds budget (early infeasibility detection)
+        if self.config.early_abstain:
+            budget_cap = self.config.max_evidence_tokens or self.config.token_cap
+            if budget_cap and dual_lb > budget_cap:
+                is_infeasible = True
+
+        # Decide whether to abstain based on config
+        if is_infeasible and self.config.abstain_on_infeasible:
             abstained = True
-        
-        # Abstain if dual LB exceeds budget (early abstention)
-        if self.config.early_abstain and self.config.token_cap:
-            if dual_lb > self.config.token_cap:
-                abstained = True
+        elif uncovered_facets or len(selected) == 0:
+            # Legacy behavior: abstain if we have uncovered facets
+            # (unless abstain_on_infeasible=False, which means we accept partial solutions)
+            abstained = self.config.abstain_on_infeasible
         
         return SafeCoverResult(
             selected_passages=selected,
@@ -187,58 +197,70 @@ class SafeCoverAlgorithm:
     ) -> Tuple[List[Passage], List[CoverageCertificate], Dict[str, List[str]]]:
         """
         Greedy set cover with cost-effectiveness and tie-breaking.
-        
+
         Implements the greedy algorithm that achieves O(log |F|) approximation.
+        Enforces max_evidence_tokens and max_units constraints if configured.
         """
         selected_passages = []
         certificates = []
         coverage_map = {}
-        
+
         uncovered = {f.facet_id for f in facets}
         remaining_passages = {p.pid: p for p in passages}
-        
-        while uncovered and remaining_passages:
+
+        # Get budget constraints from config
+        max_evidence_tokens = self.config.max_evidence_tokens
+        max_units = self.config.max_units or len(passages)
+        total_cost = 0
+
+        while uncovered and remaining_passages and len(selected_passages) < max_units:
             # Find most cost-effective passage
             best_passage = None
             best_score = (-float('inf'), float('inf'), float('inf'))
-            
+
             for pid, passage in remaining_passages.items():
                 # Calculate newly covered facets
                 newly_covered = coverage_sets[pid] & uncovered
-                
+
                 if not newly_covered:
                     continue
-                
+
+                # Check budget constraint
+                if max_evidence_tokens is not None and self.config.stop_on_budget:
+                    if total_cost + passage.cost > max_evidence_tokens:
+                        continue  # Skip passages that would exceed budget
+
                 # Cost-effectiveness ratio
                 effectiveness = len(newly_covered) / max(passage.cost, 1)
-                
+
                 # Mean p-value for tie-breaking
                 mean_p = np.mean([
                     p_values.get((pid, fid), 1.0)
                     for fid in newly_covered
                 ])
-                
+
                 # Score tuple: (effectiveness, -cost, -mean_p)
                 score = (effectiveness, -passage.cost, -mean_p)
-                
+
                 if score > best_score:
                     best_score = score
                     best_passage = passage
-            
-            # No more passages can cover uncovered facets
+
+            # No more passages can cover uncovered facets (or budget exhausted)
             if best_passage is None:
                 break
-            
+
             # Add best passage to selection
             selected_passages.append(best_passage)
+            total_cost += best_passage.cost
             newly_covered = coverage_sets[best_passage.pid] & uncovered
             coverage_map[best_passage.pid] = list(newly_covered)
-            
+
             # Generate certificates for newly covered facets
             for facet_id in newly_covered:
                 # Find the facet object
                 facet = next(f for f in facets if f.facet_id == facet_id)
-                
+
                 # Get configuration
                 if facet_id in self.config.per_facet_configs:
                     facet_config = self.config.per_facet_configs[facet_id]
@@ -247,9 +269,9 @@ class SafeCoverAlgorithm:
                         'alpha': self.config.per_facet_alpha,
                         'max_tests': 10
                     })()
-                
+
                 alpha_bar = facet_config.alpha / max(facet_config.max_tests, 1)
-                
+
                 certificate = CoverageCertificate(
                     facet_id=facet_id,
                     passage_id=best_passage.pid,
@@ -258,13 +280,13 @@ class SafeCoverAlgorithm:
                     calibrator_version=self.calibrator.version
                 )
                 certificates.append(certificate)
-            
+
             # Update uncovered set
             uncovered -= newly_covered
-            
+
             # Remove selected passage from remaining
             del remaining_passages[best_passage.pid]
-        
+
         return selected_passages, certificates, coverage_map
     
     def _compute_dual_lower_bound(

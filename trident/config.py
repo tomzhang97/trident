@@ -60,6 +60,11 @@ class SafeCoverConfig:
     coverage_threshold: float = 0.15
     # CRITICAL FIX: Add fallback_to_pareto field
     fallback_to_pareto: bool = True # Default to True for backward compatibility/good behavior
+    # Budget control fields for config families
+    max_evidence_tokens: Optional[int] = None  # Maximum evidence tokens to use
+    max_units: Optional[int] = None  # Maximum number of passages/units to select
+    stop_on_budget: bool = True  # Stop selection when budget is exhausted
+    abstain_on_infeasible: bool = False  # Abstain if constraints cannot be satisfied under budget
 
 
 @dataclass
@@ -72,6 +77,10 @@ class ParetoConfig:
     use_bwk: bool = True  # Bandits with Knapsacks
     max_vqc_iterations: int = 3
     bwk_exploration_bonus: float = 0.1
+    # Budget control fields for config families
+    max_evidence_tokens: Optional[int] = None  # Maximum evidence tokens to use
+    max_units: Optional[int] = None  # Maximum number of passages/units to select
+    stop_on_budget: bool = True  # Stop selection when budget is exhausted
 
 
 @dataclass
