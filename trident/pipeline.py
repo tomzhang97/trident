@@ -623,8 +623,10 @@ class TridentPipeline:
                 'iterations': 0
             }
             self.bwk.start_episode(episode_state)
-        
-        while vqc_iterations < self.config.pareto.max_vqc_iterations:
+
+        # Run optimization at least once, then optionally iterate with VQC
+        result = None
+        while True:
             # Run Pareto optimization with actual budget
             result = self.pareto_optimizer.optimize(
                 facets=current_facets,
@@ -632,14 +634,18 @@ class TridentPipeline:
                 p_values=scores.p_values,
                 budget=actual_budget
             )
-            
+
+            # Check if we should continue with VQC iterations
+            if vqc_iterations >= self.config.pareto.max_vqc_iterations:
+                break
+
             # Check if we should use VQC to improve coverage
             should_run_vqc = (
                 self.config.pareto.use_vqc and
                 result.uncovered_facets and
                 result.total_cost < actual_budget * 0.8
             )
-            
+
             # If conditions are met to run VQC
             if should_run_vqc:
                 # If BwK is enabled, we can log its action or use it differently,
