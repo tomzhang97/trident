@@ -46,14 +46,37 @@ from baselines.full_ketrag_adapter import FullKETRAGAdapter
 
 
 def load_hotpotqa_data(data_path: str, max_samples: int = None) -> List[Dict[str, Any]]:
-    """Load HotpotQA data from JSONL file."""
-    data = []
+    """Load HotpotQA data from JSONL or JSON array files.
+
+    The loader skips empty lines in JSONL files and also supports files that
+    contain a single JSON array (common when exporting small evaluation shards).
+    """
+
     with open(data_path, 'r') as f:
+        # Peek at the first non-empty line to determine file shape
+        first_non_empty = ""
+        for line in f:
+            stripped = line.strip()
+            if stripped:
+                first_non_empty = stripped
+                break
+
+        f.seek(0)
+
+        if first_non_empty.startswith("["):
+            data = json.load(f)
+            if max_samples:
+                data = data[:max_samples]
+            return data
+
+        data: List[Dict[str, Any]] = []
         for i, line in enumerate(f):
             if max_samples and i >= max_samples:
                 break
+            if not line.strip():
+                continue
             data.append(json.loads(line))
-    return data
+        return data
 
 
 def evaluate_baseline(

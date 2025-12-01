@@ -13,7 +13,8 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
-import torch
+import importlib
+import importlib.util
 import numpy as np
 
 # Add parent directory to path
@@ -25,7 +26,7 @@ from trident.pipeline import TridentPipeline
 from trident.evaluation import BenchmarkEvaluator, DatasetLoader
 from trident.llm_interface import LLMInterface
 from trident.llm_instrumentation import InstrumentedLLM
-from trident.retrieval import DenseRetriever, HybridRetriever
+from trident.retrieval import DenseRetriever, HybridRetriever, BM25Retriever
 from trident.logging_utils import setup_logger, log_metrics
 
 # Import baseline systems
@@ -269,17 +270,17 @@ class ExperimentRunner:
         if hasattr(self.args, 'data_path') and self.args.data_path:
             corpus_texts = []
             corpus_ids = []
-            
+
             with open(self.args.data_path) as f:
                 data = json.load(f)
-                
+
             for idx, example in enumerate(data):
                 if 'context' in example:
                     for ctx_idx, (title, sentences) in enumerate(example['context']):
                         text = " ".join(sentences) if isinstance(sentences, list) else sentences
                         corpus_texts.append(text)
                         corpus_ids.append(f"doc_{idx}_{ctx_idx}_{title}")
-            
+
             # Create retriever with this corpus
             if self.config.retrieval.method == "hybrid":
                 retriever = HybridRetriever(
@@ -287,17 +288,22 @@ class ExperimentRunner:
                     device=self.device,
                     top_k=self.config.retrieval.top_k
                 )
+            elif self.config.retrieval.method == "sparse":
+                retriever = BM25Retriever()
             else:
                 retriever = DenseRetriever(
                     encoder_model=self.config.retrieval.encoder_model,
                     device=self.device,
                     top_k=self.config.retrieval.top_k
                 )
-            
+
             # Load the corpus into retriever
             retriever.corpus = corpus_texts
-            retriever.build_index()
-            
+
+            # Build appropriate index
+            if hasattr(retriever, "build_index"):
+                retriever.build_index()
+
             return retriever
     
     def _init_system(self) -> Any:
@@ -599,9 +605,13 @@ def main():
 
     # Set random seeds
     np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+
+    torch_spec = importlib.util.find_spec("torch")
+    if torch_spec is not None:
+        torch = importlib.import_module("torch")
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
     
     # Run experiment
     runner = ExperimentRunner(args)

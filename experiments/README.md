@@ -284,4 +284,4 @@ All commands support these arguments:
 **TRIDENT:**
 - `--budget_tokens 2000`: TRIDENT token budget
 
-See `RUN_BASELINES.md` for complete documentation.
+See `../docs/baselines/RUN_BASELINES.md` for complete documentation.
