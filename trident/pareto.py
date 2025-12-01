@@ -58,23 +58,31 @@ class ParetoKnapsackOptimizer:
     ) -> ParetoResult:
         """
         Optimize passage selection for coverage utility under budget.
-        
+
         Uses lazy greedy algorithm for submodular maximization.
+        Enforces max_evidence_tokens and max_units constraints if configured.
         """
-        budget = budget or self.config.budget
-        
+        # Use config-specified limits if available, otherwise fall back to budget parameter
+        if budget is None:
+            if self.config.budget is None or self.config.budget <= 0:
+                raise ValueError("Pareto budget must be specified and positive")
+            budget = self.config.budget
+
+        max_evidence_tokens = self.config.max_evidence_tokens or budget
+        max_units = self.config.max_units or len(passages)
+
         # Initialize
         selected = []
         covered = set()
         uncovered = {f.facet_id for f in facets}
         total_cost = 0
         trace = []
-        
+
         # Lazy evaluation with priority queue
         # Heap elements: (-marginal_gain_per_cost, passage)
         heap = []
         passage_gains = {}  # Cache marginal gains
-        
+
         # Initialize heap with all passages
         for passage in passages:
             gain = self._compute_marginal_gain(
@@ -83,42 +91,46 @@ class ParetoKnapsackOptimizer:
             gain_per_cost = gain / max(passage.cost, 1)
             heapq.heappush(heap, (-gain_per_cost, id(passage), passage))
             passage_gains[passage.pid] = gain
-        
-        # Lazy greedy selection
-        while heap and total_cost < budget:
+
+        # Lazy greedy selection with budget and unit constraints
+        while heap and total_cost < max_evidence_tokens and len(selected) < max_units:
             # Get best candidate
             neg_gain_per_cost, _, passage = heapq.heappop(heap)
             gain_per_cost = -neg_gain_per_cost
-            
+
             # Recompute marginal gain (lazy evaluation)
             current_gain = self._compute_marginal_gain(
                 passage, facets, covered, p_values
             )
             current_gain_per_cost = current_gain / max(passage.cost, 1)
-            
+
             # Check if this is still the best option
             if current_gain_per_cost < gain_per_cost - 1e-9:
                 # Gain has decreased, re-insert with updated value
                 heapq.heappush(heap, (-current_gain_per_cost, id(passage), passage))
                 passage_gains[passage.pid] = current_gain
                 continue
-            
+
             # Check budget constraint
-            if total_cost + passage.cost > budget:
-                # Try to find a smaller passage that fits
+            if self.config.stop_on_budget and total_cost + passage.cost > max_evidence_tokens:
+                # Skip this passage if it would exceed budget
                 continue
-            
+
+            # Check unit limit
+            if len(selected) >= max_units:
+                break
+
             # Select this passage
             selected.append(passage)
             total_cost += passage.cost
-            
+
             # Update covered facets
             newly_covered = self._get_covered_facets(
                 passage, facets, p_values
             ) - covered
             covered.update(newly_covered)
             uncovered -= newly_covered
-            
+
             # Log trace
             trace.append({
                 'passage_id': passage.pid,

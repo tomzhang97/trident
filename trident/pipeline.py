@@ -531,8 +531,9 @@ class TridentPipeline:
     ) -> Dict[str, Any]:
         """
         Run Safe-Cover mode with certificates.
-        
+
         CRITICAL FIX: Relaxed thresholds to avoid always-zero coverage.
+        Now tracks evidence tokens separately from total tokens.
         """
         # Monitor drift if enabled
         if self.drift_monitor:
@@ -540,14 +541,14 @@ class TridentPipeline:
             if drift_detected:
                 self.telemetry.log("drift_detected", {"timestamp": time.time()})
                 self.safe_cover_algo.apply_fallback()
-        
+
         # Run RC-MCFC algorithm
         result = self.safe_cover_algo.run(
             facets=facets,
             passages=passages,
             p_values=scores.p_values
         )
-        
+
         # Convert to output format
         selected = []
         total_cost = 0
@@ -559,7 +560,7 @@ class TridentPipeline:
                 'covered_facets': result.coverage_map.get(passage.pid, [])
             })
             total_cost += passage.cost
-        
+
         certificates = []
         for cert in result.certificates:
             certificates.append({
@@ -570,12 +571,10 @@ class TridentPipeline:
                 'timestamp': cert.timestamp,
                 'calibrator_version': self.config.calibration.version
             })
-        
-        # Determine if the result is infeasible or leads to abstention
-        # This depends on the specific return structure of self.safe_cover_algo.run
-        # Assuming result.abstained or result.infeasible might be set, or inferring from selected_passages
-        is_infeasible = getattr(result, 'infeasible', False) # Adjust based on actual result object
-        is_abstained = result.abstained or is_infeasible or len(selected) == 0 # Adjust condition if needed
+
+        # Use infeasible and abstained flags from result
+        is_infeasible = result.infeasible
+        is_abstained = result.abstained
 
         return {
             'selected_passages': selected,
@@ -584,10 +583,13 @@ class TridentPipeline:
             'infeasible': is_infeasible, # Add infeasible flag
             'dual_lower_bound': getattr(result, 'dual_lower_bound', None), # Adjust based on actual result object
             'retrieval_tokens': total_cost,
+            'evidence_tokens': total_cost,  # Track evidence tokens separately
             'metrics': {
                 'coverage': len(result.covered_facets) / len(facets) if facets else 0,
                 'utility': len(result.covered_facets),
-                'efficiency': len(result.covered_facets) / max(total_cost, 1) if total_cost > 0 else 0
+                'efficiency': len(result.covered_facets) / max(total_cost, 1) if total_cost > 0 else 0,
+                'num_units': len(selected),
+                'num_violated_facets': len(result.uncovered_facets),
             }
         }
     
@@ -621,8 +623,10 @@ class TridentPipeline:
                 'iterations': 0
             }
             self.bwk.start_episode(episode_state)
-        
-        while vqc_iterations < self.config.pareto.max_vqc_iterations:
+
+        # Run optimization at least once, then optionally iterate with VQC
+        result = None
+        while True:
             # Run Pareto optimization with actual budget
             result = self.pareto_optimizer.optimize(
                 facets=current_facets,
@@ -630,14 +634,18 @@ class TridentPipeline:
                 p_values=scores.p_values,
                 budget=actual_budget
             )
-            
+
+            # Check if we should continue with VQC iterations
+            if vqc_iterations >= self.config.pareto.max_vqc_iterations:
+                break
+
             # Check if we should use VQC to improve coverage
             should_run_vqc = (
                 self.config.pareto.use_vqc and
                 result.uncovered_facets and
                 result.total_cost < actual_budget * 0.8
             )
-            
+
             # If conditions are met to run VQC
             if should_run_vqc:
                 # If BwK is enabled, we can log its action or use it differently,
@@ -698,18 +706,20 @@ class TridentPipeline:
                 'cost': passage.cost,
                 'utility_contribution': passage.metadata.get('utility', 0)
             })
-        
+
         return {
             'selected_passages': selected,
             'certificates': None,
             'abstained': False, # Pareto mode typically does not abstain
             'infeasible': False, # Pareto mode typically is feasible
             'retrieval_tokens': result.total_cost,
+            'evidence_tokens': result.total_cost,  # Track evidence tokens separately
             'metrics': {
                 'utility': result.achieved_utility,
                 'coverage': len(result.covered_facets) / len(facets) if facets else 0,
                 'efficiency': result.achieved_utility / max(result.total_cost, 1),
-                'vqc_iterations': vqc_iterations
+                'vqc_iterations': vqc_iterations,
+                'num_units': len(selected),
             }
         }
     
