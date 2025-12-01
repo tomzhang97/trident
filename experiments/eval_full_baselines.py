@@ -334,6 +334,10 @@ def main():
 
     args = parser.parse_args()
 
+    # Normalize device format (handle both "3" and "cuda:3")
+    if args.local_llm_device and args.local_llm_device.isdigit():
+        args.local_llm_device = f"cuda:{args.local_llm_device}"
+
     # Expand 'all' to all baselines
     if 'all' in args.baselines:
         args.baselines = ['graphrag', 'selfrag', 'ketrag']

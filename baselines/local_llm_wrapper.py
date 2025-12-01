@@ -70,7 +70,7 @@ class LocalLLMWrapper:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         **kwargs
-    ) -> LLMResponse:
+    ) -> str:
         """
         Generate response from messages (compatible with ChatOpenAI interface).
 
@@ -81,7 +81,7 @@ class LocalLLMWrapper:
             **kwargs: Additional arguments (ignored for compatibility)
 
         Returns:
-            LLMResponse with content and usage
+            Generated text string (compatible with GraphRAG's ChatOpenAI)
         """
         # Convert messages to single prompt
         prompt = self._messages_to_prompt(messages)
@@ -93,15 +93,8 @@ class LocalLLMWrapper:
             max_new_tokens=max_tokens if max_tokens is not None else self.max_tokens,
         )
 
-        # Return in ChatOpenAI-compatible format
-        return LLMResponse(
-            content=output.text.strip(),
-            usage={
-                'prompt_tokens': output.tokens_used // 2,  # Approximate
-                'completion_tokens': output.tokens_used // 2,
-                'total_tokens': output.tokens_used,
-            }
-        )
+        # Return string directly (compatible with GraphRAG's ChatOpenAI interface)
+        return output.text.strip()
 
     def _messages_to_prompt(self, messages: List[Dict[str, str]]) -> str:
         """
