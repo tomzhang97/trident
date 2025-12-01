@@ -125,6 +125,10 @@ This generates:
 | `--corpus_path` | None | Path to retrieval corpus |
 | `--top_k` | 100 | Top-k passages to retrieve |
 
+**Tip for quick baseline smoke-tests:** Dense and hybrid retrieval paths depend on `torch`, `transformers`, and `sentence-transformers`.
+When you just want to sanity-check runs on tiny datasets (e.g., `test_single.json`) without installing heavy dependencies, set
+`--retrieval_method sparse` to use the built-in BM25 retriever instead.
+
 ## Configuration
 
 Edit `configs/default.json` to customize:
@@ -220,6 +224,13 @@ experiments/
 3. **Caching**: Results are cached automatically
 4. **Parallelism**: Use multiple GPUs with sharding
 5. **vLLM**: Install vLLM for high-throughput serving
+
+## Documentation Map
+
+- **Quickstart & overview:** This README for installation and usage basics
+- **Detailed documentation index:** [`docs/README.md`](docs/README.md)
+- **Baseline guides:** See the grouped files under [`docs/baselines/`](docs/baselines/) for comparisons, runbooks, and integration details
+- **Experiment workflows:** [`experiments/README.md`](experiments/README.md)
 
 ## Theory & Guarantees
 

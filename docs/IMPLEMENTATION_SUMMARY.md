@@ -25,7 +25,7 @@ This document summarizes the implementation of configurable baseline systems (Se
 - `configs/graphrag.json`
 
 ### 4. Documentation
-- `BASELINES_README.md`: Comprehensive user guide
+- `baselines/BASELINES_README.md`: Comprehensive user guide
 - `IMPLEMENTATION_SUMMARY.md`: Technical summary
 
 ## Usage

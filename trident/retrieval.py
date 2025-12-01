@@ -9,9 +9,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
-import torch
-from transformers import AutoTokenizer, AutoModel
-from sentence_transformers import SentenceTransformer
+import importlib
+import importlib.util
 
 from .candidates import Passage
 
@@ -38,13 +37,29 @@ class DenseRetriever:
         self.device = device
         self.top_k = top_k
         
-        # Load encoder
+        # Load encoder lazily to avoid heavyweight imports when unused
         if "contriever" in encoder_model.lower():
-            self.tokenizer = AutoTokenizer.from_pretrained(encoder_model)
-            self.encoder = AutoModel.from_pretrained(encoder_model).to(device)
+            transformers_spec = importlib.util.find_spec("transformers")
+            if transformers_spec is None:
+                raise ModuleNotFoundError(
+                    "transformers is required for dense retrieval. "
+                    "Install it or use --retrieval_method sparse"
+                )
+
+            transformers = importlib.import_module("transformers")
+            self.tokenizer = transformers.AutoTokenizer.from_pretrained(encoder_model)
+            self.encoder = transformers.AutoModel.from_pretrained(encoder_model).to(device)
             self.use_contriever = True
         else:
-            self.encoder = SentenceTransformer(encoder_model, device=device)
+            st_spec = importlib.util.find_spec("sentence_transformers")
+            if st_spec is None:
+                raise ModuleNotFoundError(
+                    "sentence-transformers is required for dense retrieval. "
+                    "Install it or use --retrieval_method sparse"
+                )
+
+            sentence_transformers = importlib.import_module("sentence_transformers")
+            self.encoder = sentence_transformers.SentenceTransformer(encoder_model, device=device)
             self.use_contriever = False
         
         # Load corpus and index
@@ -121,6 +136,7 @@ class DenseRetriever:
     
     def _encode_contriever(self, texts: List[str]) -> np.ndarray:
         """Encode texts using Contriever model."""
+        torch = importlib.import_module("torch")
         inputs = self.tokenizer(
             texts,
             padding=True,
@@ -136,8 +152,9 @@ class DenseRetriever:
         
         return embeddings
     
-    def _mean_pooling(self, token_embeddings: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def _mean_pooling(self, token_embeddings, attention_mask):
         """Mean pooling for sentence embeddings."""
+        torch = importlib.import_module("torch")
         input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
         return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
     
