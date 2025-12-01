@@ -1,11 +1,11 @@
-"""Full GraphRAG adapter for HotpotQA evaluation using Microsoft's GraphRAG library."""
+"""Full GraphRAG adapter for multi-dataset evaluation using Microsoft's GraphRAG library."""
 
 from __future__ import annotations
 
 import sys
 import os
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 import tempfile
 import shutil
 
@@ -19,6 +19,7 @@ from baselines.full_baseline_interface import (
     TokenTracker,
     LatencyTracker,
 )
+from baselines.local_llm_wrapper import LocalLLMWrapper
 
 try:
     from graphrag.query.llm.oai.chat_openai import ChatOpenAI
@@ -40,14 +41,17 @@ class FullGraphRAGAdapter(BaselineSystem):
     """
     Full GraphRAG adapter using Microsoft's GraphRAG library.
 
+    Supports multiple datasets: HotpotQA, MuSiQue, NarrativeQA
+    Supports both OpenAI API and local LLMs via HuggingFace
+
     This adapter:
-    1. Converts HotpotQA context into documents
+    1. Converts dataset context into documents (dataset-agnostic format)
     2. Builds a knowledge graph using GraphRAG's indexing pipeline (per-query)
     3. Uses GraphRAG's local search to answer questions
     4. Tracks all tokens and latency for fair comparison
 
     Note: This performs per-query indexing which is not how GraphRAG is designed
-    to be used (it expects a persistent index), but necessary for HotpotQA evaluation.
+    to be used (it expects a persistent index), but necessary for dynamic context evaluation.
     """
 
     def __init__(
@@ -57,17 +61,27 @@ class FullGraphRAGAdapter(BaselineSystem):
         temperature: float = 0.0,
         max_tokens: int = 500,
         use_local_search: bool = True,
+        use_local_llm: bool = False,
+        local_llm_model: str = "Qwen/Qwen2.5-7B-Instruct",
+        local_llm_device: str = "cuda:0",
+        load_in_8bit: bool = False,
+        load_in_4bit: bool = False,
         **kwargs
     ):
         """
         Initialize GraphRAG adapter.
 
         Args:
-            api_key: OpenAI API key (or from GRAPHRAG_API_KEY env var)
-            model: LLM model to use
+            api_key: OpenAI API key (required if use_local_llm=False)
+            model: LLM model to use (OpenAI model name)
             temperature: Sampling temperature
             max_tokens: Max tokens for generation
             use_local_search: Use local search (vs global search)
+            use_local_llm: Use local LLM instead of OpenAI (default: False)
+            local_llm_model: HuggingFace model name for local LLM
+            local_llm_device: Device for local LLM (cuda:0, cuda:1, cpu)
+            load_in_8bit: Use 8-bit quantization for local LLM
+            load_in_4bit: Use 4-bit quantization for local LLM
             **kwargs: Additional config
         """
         super().__init__(name="graphrag", **kwargs)
@@ -79,22 +93,38 @@ class FullGraphRAGAdapter(BaselineSystem):
                 f"Error: {GRAPHRAG_IMPORT_ERROR}"
             )
 
-        self.api_key = api_key or os.getenv("GRAPHRAG_API_KEY") or os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("API key required. Set GRAPHRAG_API_KEY or OPENAI_API_KEY environment variable.")
-
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.use_local_search = use_local_search
+        self.use_local_llm = use_local_llm
 
-        # Initialize LLM client
-        self.llm = ChatOpenAI(
-            api_key=self.api_key,
-            model=self.model,
-            api_type=OpenAIClientTypes.OpenAI,
-            max_retries=3,
-        )
+        # Initialize LLM client (OpenAI or Local)
+        if use_local_llm:
+            print(f"  [GraphRAG] Using local LLM: {local_llm_model}")
+            self.llm = LocalLLMWrapper(
+                model_name=local_llm_model,
+                device=local_llm_device,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                load_in_8bit=load_in_8bit,
+                load_in_4bit=load_in_4bit,
+            )
+            self.api_key = None
+        else:
+            self.api_key = api_key or os.getenv("GRAPHRAG_API_KEY") or os.getenv("OPENAI_API_KEY")
+            if not self.api_key:
+                raise ValueError(
+                    "API key required for OpenAI. Set GRAPHRAG_API_KEY/OPENAI_API_KEY "
+                    "or use use_local_llm=True for local models."
+                )
+            print(f"  [GraphRAG] Using OpenAI: {model}")
+            self.llm = ChatOpenAI(
+                api_key=self.api_key,
+                model=self.model,
+                api_type=OpenAIClientTypes.OpenAI,
+                max_retries=3,
+            )
 
     def _build_index_from_context(
         self,

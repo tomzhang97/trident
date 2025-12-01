@@ -1,6 +1,6 @@
 # Full Baseline Systems for TRIDENT Evaluation
 
-Complete integration of GraphRAG, Self-RAG, and KET-RAG as proper baselines for fair comparison with TRIDENT on HotpotQA.
+Complete integration of GraphRAG, Self-RAG, and KET-RAG as proper baselines for fair comparison with TRIDENT.
 
 ## Overview
 
@@ -18,21 +18,42 @@ This integration provides **full, runnable versions** of three state-of-the-art 
 - ✅ Fair comparison with consistent metrics
 - ✅ Unified interface for all systems
 - ✅ Comprehensive token tracking and cost analysis
+- ✅ **Supports both OpenAI API and local LLMs (NEW)**
+- ✅ **Dataset-agnostic: HotpotQA, MuSiQue, NarrativeQA**
 
 ## Quick Start
+
+### Option 1: Using OpenAI API
 
 ```bash
 # 1. Install dependencies
 ./install_full_baselines.sh
 
-# 2. Set API keys
+# 2. Set API key
 export GRAPHRAG_API_KEY="sk-..."  # For GraphRAG and KET-RAG
 
 # 3. Run evaluation
 python eval_full_baselines.py \
     --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
     --max_samples 10 \
-    --baselines all
+    --baselines graphrag ketrag \
+    --graphrag_model gpt-4o-mini
+```
+
+### Option 2: Using Local LLM (Recommended for cost-free experiments)
+
+```bash
+# 1. Install dependencies
+./install_full_baselines.sh
+
+# 2. Run evaluation with local LLM (no API key needed!)
+python eval_full_baselines.py \
+    --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
+    --max_samples 10 \
+    --baselines graphrag ketrag \
+    --use_local_llm \
+    --local_llm_model Qwen/Qwen2.5-7B-Instruct \
+    --local_llm_device cuda:0
 ```
 
 ## Project Structure
@@ -186,12 +207,48 @@ python eval_full_baselines.py \
     --selfrag_model selfrag/selfrag_llama2_13b \
     --data_path data/hotpotqa_dev_shards/shard_0.jsonl
 
-# GraphRAG with GPT-4o (more expensive but higher quality)
+# GraphRAG/KET-RAG with GPT-4o (OpenAI - more expensive but higher quality)
 python eval_full_baselines.py \
-    --baselines graphrag \
+    --baselines graphrag ketrag \
     --graphrag_model gpt-4o \
     --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
     --max_samples 20  # Limit due to cost
+
+# GraphRAG/KET-RAG with local Qwen2.5-7B (FREE, no API costs!)
+python eval_full_baselines.py \
+    --baselines graphrag ketrag \
+    --use_local_llm \
+    --local_llm_model Qwen/Qwen2.5-7B-Instruct \
+    --local_llm_device cuda:0 \
+    --data_path data/hotpotqa_dev_shards/shard_0.jsonl
+
+# Local LLM with quantization (for limited GPU memory)
+python eval_full_baselines.py \
+    --baselines graphrag ketrag \
+    --use_local_llm \
+    --local_llm_model meta-llama/Llama-3.1-8B-Instruct \
+    --load_in_4bit \  # Or --load_in_8bit
+    --local_llm_device cuda:0 \
+    --data_path data/hotpotqa_dev_shards/shard_0.jsonl
+```
+
+### Evaluate on Different Datasets
+
+```bash
+# HotpotQA (multi-hop QA)
+python eval_full_baselines.py \
+    --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
+    --baselines all --use_local_llm
+
+# MuSiQue (multi-hop QA with more hops)
+python eval_full_baselines.py \
+    --data_path data/musique_dev.jsonl \
+    --baselines all --use_local_llm
+
+# NarrativeQA (long-form narratives)
+python eval_full_baselines.py \
+    --data_path data/narrativeqa_dev.jsonl \
+    --baselines all --use_local_llm
 ```
 
 ### Compare with TRIDENT

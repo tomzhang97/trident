@@ -1,15 +1,27 @@
 #!/usr/bin/env python3
 """
-Evaluation script for full baseline systems (GraphRAG, Self-RAG, KET-RAG) on HotpotQA.
+Evaluation script for full baseline systems (GraphRAG, Self-RAG, KET-RAG).
 
-Usage:
+Supports multiple datasets: HotpotQA, MuSiQue, NarrativeQA
+Supports both OpenAI API and local LLMs via HuggingFace
+
+Usage with OpenAI:
     python eval_full_baselines.py \
         --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
         --output_dir results/full_baselines \
-        --baselines graphrag selfrag ketrag \
-        --max_samples 100
+        --baselines graphrag ketrag \
+        --graphrag_model gpt-4o-mini
 
-Environment variables:
+Usage with Local LLM:
+    python eval_full_baselines.py \
+        --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
+        --output_dir results/full_baselines \
+        --baselines graphrag ketrag \
+        --use_local_llm \
+        --local_llm_model Qwen/Qwen2.5-7B-Instruct \
+        --local_llm_device cuda:0
+
+Environment variables (when not using local LLM):
     GRAPHRAG_API_KEY or OPENAI_API_KEY: Required for GraphRAG and KET-RAG
     HF_TOKEN: Required for Self-RAG model download
 """
@@ -253,7 +265,34 @@ def main():
         "--graphrag_model",
         type=str,
         default="gpt-4o-mini",
-        help="Model to use for GraphRAG and KET-RAG"
+        help="Model to use for GraphRAG and KET-RAG (OpenAI model name)"
+    )
+    parser.add_argument(
+        "--use_local_llm",
+        action="store_true",
+        help="Use local LLM instead of OpenAI for GraphRAG/KET-RAG"
+    )
+    parser.add_argument(
+        "--local_llm_model",
+        type=str,
+        default="Qwen/Qwen2.5-7B-Instruct",
+        help="HuggingFace model name for local LLM"
+    )
+    parser.add_argument(
+        "--local_llm_device",
+        type=str,
+        default="cuda:0",
+        help="Device for local LLM (cuda:0, cuda:1, cpu)"
+    )
+    parser.add_argument(
+        "--load_in_8bit",
+        action="store_true",
+        help="Use 8-bit quantization for local LLM"
+    )
+    parser.add_argument(
+        "--load_in_4bit",
+        action="store_true",
+        help="Use 4-bit quantization for local LLM"
     )
 
     # Self-RAG options
@@ -281,11 +320,13 @@ def main():
     data = load_hotpotqa_data(args.data_path, args.max_samples)
     print(f"Loaded {len(data)} examples")
 
-    # Check API keys
-    api_key = os.getenv("GRAPHRAG_API_KEY") or os.getenv("OPENAI_API_KEY")
-    if ('graphrag' in args.baselines or 'ketrag' in args.baselines) and not api_key:
-        print("ERROR: GraphRAG and KET-RAG require GRAPHRAG_API_KEY or OPENAI_API_KEY environment variable")
-        sys.exit(1)
+    # Check API keys (only if not using local LLM)
+    api_key = None
+    if not args.use_local_llm:
+        api_key = os.getenv("GRAPHRAG_API_KEY") or os.getenv("OPENAI_API_KEY")
+        if ('graphrag' in args.baselines or 'ketrag' in args.baselines) and not api_key:
+            print("ERROR: GraphRAG and KET-RAG require GRAPHRAG_API_KEY or OPENAI_API_KEY when not using --use_local_llm")
+            sys.exit(1)
 
     # Evaluate each baseline
     summaries = {}
@@ -303,13 +344,18 @@ def main():
                     model=args.graphrag_model,
                     temperature=0.0,
                     max_tokens=500,
+                    use_local_llm=args.use_local_llm,
+                    local_llm_model=args.local_llm_model,
+                    local_llm_device=args.local_llm_device,
+                    load_in_8bit=args.load_in_8bit,
+                    load_in_4bit=args.load_in_4bit,
                 )
             elif baseline_name == 'selfrag':
                 baseline_system = FullSelfRAGAdapter(
                     model_name=args.selfrag_model,
                     max_tokens=args.selfrag_max_tokens,
                     temperature=0.0,
-                    provide_context=True,  # Use HotpotQA context
+                    provide_context=True,  # Provide dataset context
                 )
             elif baseline_name == 'ketrag':
                 baseline_system = FullKETRAGAdapter(
@@ -320,6 +366,11 @@ def main():
                     skeleton_ratio=0.3,
                     max_skeleton_triples=10,
                     max_keyword_chunks=5,
+                    use_local_llm=args.use_local_llm,
+                    local_llm_model=args.local_llm_model,
+                    local_llm_device=args.local_llm_device,
+                    load_in_8bit=args.load_in_8bit,
+                    load_in_4bit=args.load_in_4bit,
                 )
             else:
                 print(f"Unknown baseline: {baseline_name}")

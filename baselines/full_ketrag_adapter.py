@@ -1,11 +1,11 @@
-"""Full KET-RAG adapter for HotpotQA evaluation using the official KET-RAG library."""
+"""Full KET-RAG adapter for multi-dataset evaluation using the official KET-RAG library."""
 
 from __future__ import annotations
 
 import sys
 import os
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Set, Tuple
+from typing import Dict, Any, List, Optional, Set, Tuple, Union
 from collections import defaultdict, Counter
 import re
 
@@ -19,6 +19,7 @@ from baselines.full_baseline_interface import (
     TokenTracker,
     LatencyTracker,
 )
+from baselines.local_llm_wrapper import LocalLLMWrapper
 
 try:
     # KET-RAG uses GraphRAG as a base, so we import from graphrag
@@ -99,6 +100,9 @@ class FullKETRAGAdapter(BaselineSystem):
     """
     Full KET-RAG adapter using the official KET-RAG library.
 
+    Supports multiple datasets: HotpotQA, MuSiQue, NarrativeQA
+    Supports both OpenAI API and local LLMs via HuggingFace
+
     KET-RAG combines two indexing strategies:
     1. SkeletonRAG: PageRank-based key chunk selection + LLM entity extraction
     2. KeywordRAG: Lightweight keyword-chunk bipartite graph
@@ -108,7 +112,7 @@ class FullKETRAGAdapter(BaselineSystem):
     - Keyword channel: Retrieve from keyword index
 
     This adapter:
-    1. Builds SkeletonKG and KeywordIndex from HotpotQA context
+    1. Builds SkeletonKG and KeywordIndex from dataset context (dataset-agnostic)
     2. Retrieves from both channels
     3. Generates answer conditioned on both contexts
     4. Tracks all tokens and latency
@@ -123,19 +127,29 @@ class FullKETRAGAdapter(BaselineSystem):
         skeleton_ratio: float = 0.3,
         max_skeleton_triples: int = 10,
         max_keyword_chunks: int = 5,
+        use_local_llm: bool = False,
+        local_llm_model: str = "Qwen/Qwen2.5-7B-Instruct",
+        local_llm_device: str = "cuda:0",
+        load_in_8bit: bool = False,
+        load_in_4bit: bool = False,
         **kwargs
     ):
         """
         Initialize KET-RAG adapter.
 
         Args:
-            api_key: OpenAI API key (or from GRAPHRAG_API_KEY env var)
-            model: LLM model to use
+            api_key: OpenAI API key (required if use_local_llm=False)
+            model: LLM model to use (OpenAI model name)
             temperature: Sampling temperature
             max_tokens: Max tokens for generation
             skeleton_ratio: Ratio of chunks to use for skeleton KG (0.0-1.0)
             max_skeleton_triples: Max triples to use from skeleton
             max_keyword_chunks: Max chunks to retrieve from keyword index
+            use_local_llm: Use local LLM instead of OpenAI (default: False)
+            local_llm_model: HuggingFace model name for local LLM
+            local_llm_device: Device for local LLM (cuda:0, cuda:1, cpu)
+            load_in_8bit: Use 8-bit quantization for local LLM
+            load_in_4bit: Use 4-bit quantization for local LLM
             **kwargs: Additional config
         """
         super().__init__(name="ketrag", **kwargs)
@@ -147,24 +161,40 @@ class FullKETRAGAdapter(BaselineSystem):
                 f"Error: {KETRAG_IMPORT_ERROR}"
             )
 
-        self.api_key = api_key or os.getenv("GRAPHRAG_API_KEY") or os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("API key required. Set GRAPHRAG_API_KEY or OPENAI_API_KEY environment variable.")
-
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.skeleton_ratio = skeleton_ratio
         self.max_skeleton_triples = max_skeleton_triples
         self.max_keyword_chunks = max_keyword_chunks
+        self.use_local_llm = use_local_llm
 
-        # Initialize LLM client
-        self.llm = ChatOpenAI(
-            api_key=self.api_key,
-            model=self.model,
-            api_type=OpenAIClientTypes.OpenAI,
-            max_retries=3,
-        )
+        # Initialize LLM client (OpenAI or Local)
+        if use_local_llm:
+            print(f"  [KET-RAG] Using local LLM: {local_llm_model}")
+            self.llm = LocalLLMWrapper(
+                model_name=local_llm_model,
+                device=local_llm_device,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                load_in_8bit=load_in_8bit,
+                load_in_4bit=load_in_4bit,
+            )
+            self.api_key = None
+        else:
+            self.api_key = api_key or os.getenv("GRAPHRAG_API_KEY") or os.getenv("OPENAI_API_KEY")
+            if not self.api_key:
+                raise ValueError(
+                    "API key required for OpenAI. Set GRAPHRAG_API_KEY/OPENAI_API_KEY "
+                    "or use use_local_llm=True for local models."
+                )
+            print(f"  [KET-RAG] Using OpenAI: {model}")
+            self.llm = ChatOpenAI(
+                api_key=self.api_key,
+                model=self.model,
+                api_type=OpenAIClientTypes.OpenAI,
+                max_retries=3,
+            )
 
     def _compute_chunk_importance(self, chunks: List[str]) -> List[float]:
         """
