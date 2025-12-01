@@ -48,7 +48,7 @@ install_baseline "GraphRAG" \
 
 # Install Self-RAG dependencies
 # Ensure torch is available before installing flash-attn (Self-RAG dependency)
-if ! python - <<'PY' 2>/dev/null
+if ! python - <<'PY' 2>/dev/null; then
 import importlib.util
 exit(0 if importlib.util.find_spec('torch') else 1)
 PY
@@ -59,7 +59,7 @@ fi
 
 install_baseline "Self-RAG" \
     "$BASELINE_ROOT/self-rag" \
-    "PIP_NO_BUILD_ISOLATION=1 pip install -r requirements.txt --quiet"
+    "pip install -r requirements.txt --quiet"
 
 # Install KET-RAG
 echo ""
