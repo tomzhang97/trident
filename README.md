@@ -221,6 +221,13 @@ experiments/
 4. **Parallelism**: Use multiple GPUs with sharding
 5. **vLLM**: Install vLLM for high-throughput serving
 
+## Documentation Map
+
+- **Quickstart & overview:** This README for installation and usage basics
+- **Detailed documentation index:** [`docs/README.md`](docs/README.md)
+- **Baseline guides:** See the grouped files under [`docs/baselines/`](docs/baselines/) for comparisons, runbooks, and integration details
+- **Experiment workflows:** [`experiments/README.md`](experiments/README.md)
+
 ## Theory & Guarantees
 
 1. **RC-MCFC Approximation**: O(log |F|) approximation to min-cost cover
