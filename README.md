@@ -125,6 +125,10 @@ This generates:
 | `--corpus_path` | None | Path to retrieval corpus |
 | `--top_k` | 100 | Top-k passages to retrieve |
 
+**Tip for quick baseline smoke-tests:** Dense and hybrid retrieval paths depend on `torch`, `transformers`, and `sentence-transformers`.
+When you just want to sanity-check runs on tiny datasets (e.g., `test_single.json`) without installing heavy dependencies, set
+`--retrieval_method sparse` to use the built-in BM25 retriever instead.
+
 ## Configuration
 
 Edit `configs/default.json` to customize:
