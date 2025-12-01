@@ -277,7 +277,12 @@ Summary:"""
         metadata: Optional[Dict[str, Any]] = None
     ) -> BaselineResponse:
         """
-        Answer a question using GraphRAG.
+        Answer a question using GraphRAG (Separating Indexing vs Querying).
+
+        Metrics reported:
+        - tokens_used, latency_ms: QUERY ONLY (matches original GraphRAG paper)
+        - stats['indexing_*']: Offline indexing costs (community detection + summarization)
+        - stats['total_cost_tokens']: Full cost including indexing
 
         Args:
             question: The question to answer
@@ -286,13 +291,17 @@ Summary:"""
             metadata: Optional metadata
 
         Returns:
-            BaselineResponse with answer and metrics
+            BaselineResponse with separated indexing/query metrics
         """
-        token_tracker = TokenTracker()
-        latency_tracker = LatencyTracker()
+        # Trackers for the Setup/Indexing Phase
+        indexing_token_tracker = TokenTracker()
+        indexing_latency_tracker = LatencyTracker()
+
+        # Trackers for the Query Phase (The "Original" Baseline metrics)
+        query_token_tracker = TokenTracker()
+        query_latency_tracker = LatencyTracker()
 
         if not context:
-            # No context provided - return abstention
             return BaselineResponse(
                 answer="I don't have enough information to answer this question.",
                 tokens_used=0,
@@ -300,61 +309,62 @@ Summary:"""
                 selected_passages=[],
                 abstained=True,
                 mode="graphrag",
-                stats={
-                    "num_entities": 0,
-                    "num_relationships": 0,
-                    "error": "No context provided",
-                },
+                stats={"error": "No context provided"},
             )
 
         try:
-            # Build index from context
-            index_data = self._build_index_from_context(context, token_tracker, latency_tracker)
+            # --- PHASE 1: INDEXING (Offline Simulation) ---
+            # We track this separately to simulate a pre-built graph
+            print("  [GraphRAG] Building Index (Offline Simulation)...")
 
-            # Retrieve relevant information from graph
-            latency_tracker.start()
+            # Pass the indexing tracker here
+            index_data = self._build_index_from_context(
+                context,
+                indexing_token_tracker,
+                indexing_latency_tracker
+            )
 
-            # FULL GRAPHRAG SEARCH STRATEGY:
-            # Combine Global Search (Community Summaries) + Local Search (Entity Neighbors)
+            indexing_time_ms = indexing_latency_tracker.get_total_latency()
+            indexing_cost_tokens = indexing_token_tracker.total_tokens
+            print(f"  [GraphRAG] Index Built in {indexing_time_ms/1000:.2f}s using {indexing_cost_tokens} tokens")
+
+            # --- PHASE 2: QUERYING (Online / "Original Version" Metric) ---
+            # Now we start the "official" timer for the baseline comparison
+            query_latency_tracker.start()
 
             context_parts = []
 
             # 1. Global Context (from Community Summaries)
-            # This allows answering "What is the overarching theme?" type questions
             if "community_summaries" in index_data and index_data["community_summaries"]:
                 context_parts.append("--- Community Summaries (Global Context) ---")
                 for comm_id, summary in index_data["community_summaries"].items():
                     context_parts.append(f"Community {comm_id}: {summary}")
 
             # 2. Local Context (Specific Entities)
-            # Simple entity-based retrieval
             question_lower = question.lower()
             relevant_entities = []
             for entity in index_data["entities"]:
                 if entity["name"].lower() in question_lower:
                     relevant_entities.append(entity)
 
-            # If no exact matches, use first few entities
+            # Fallback if no entities match
             if not relevant_entities and index_data["entities"]:
                 relevant_entities = index_data["entities"][:5]
 
-            # Build context from relevant entities and their neighborhood
             if relevant_entities:
                 context_parts.append("\n--- Local Context (Specific Entities) ---")
                 for entity in relevant_entities[:3]:
                     context_parts.append(f"{entity['name']}: {entity['description']}")
-
-                    # Add related entities from graph
                     if entity["name"] in index_data["graph"]:
                         neighbors = list(index_data["graph"].neighbors(entity["name"]))[:3]
                         for neighbor in neighbors:
-                            edge_data = index_data["graph"][entity["name"]][neighbor]
-                            rel = edge_data.get("relationship", "related to")
+                            edge = index_data["graph"][entity["name"]][neighbor]
+                            rel = edge.get("relationship", "related to")
                             context_parts.append(f"{entity['name']} {rel} {neighbor}")
 
             context_text = "\n".join(context_parts) if context_parts else "No relevant information found."
 
-            # Generate answer
+            # Generate Answer
             answer_prompt = f"""You are a question answering assistant using knowledge graph information.
 
 Question: {question}
@@ -362,12 +372,7 @@ Question: {question}
 Knowledge Graph Context:
 {context_text}
 
-Instructions:
-- Use the knowledge graph information above to answer the question
-- If the information is insufficient, say you do not know
-- Answer with a single short phrase or sentence that directly answers the question
-
-Answer:"""
+Answer with a single short phrase or sentence."""
 
             response = self.llm.generate(
                 messages=[{"role": "user", "content": answer_prompt}],
@@ -375,30 +380,30 @@ Answer:"""
                 max_tokens=self.max_tokens,
             )
 
-            answer = response.strip()
+            query_latency_tracker.stop("answer_generation")
 
-            # Track tokens
-            prompt_tokens = len(answer_prompt.split()) * 1.3
-            completion_tokens = len(response.split()) * 1.3
-            token_tracker.add_call(int(prompt_tokens), int(completion_tokens), purpose="answer_generation")
+            # Count tokens for query phase
+            p_tok = len(answer_prompt.split()) * 1.3
+            c_tok = len(response.split()) * 1.3
+            query_token_tracker.add_call(int(p_tok), int(c_tok), "query_generation")
 
-            latency_tracker.stop("answer_generation")
-
-            # Prepare selected passages (from source documents)
-            selected_passages = [
-                {"text": doc["text"], "title": doc["title"]}
-                for doc in index_data["documents"][:3]
-            ]
+            # Prepare passages
+            selected_passages = [{"text": d["text"], "title": d["title"]} for d in index_data["documents"][:3]]
 
             return BaselineResponse(
-                answer=answer,
-                tokens_used=token_tracker.total_tokens,
-                latency_ms=latency_tracker.get_total_latency(),
+                answer=response.strip(),
+                # PRIMARY METRICS: Only include Query costs to match "Original Version" claims
+                tokens_used=query_token_tracker.total_tokens,
+                latency_ms=query_latency_tracker.get_total_latency(),
                 selected_passages=selected_passages,
                 abstained=False,
                 mode="graphrag",
                 stats={
-                    **token_tracker.get_stats(),
+                    # Save the heavy lifting here for reference
+                    "indexing_latency_ms": indexing_time_ms,
+                    "indexing_tokens": indexing_cost_tokens,
+                    "query_tokens": query_token_tracker.total_tokens,
+                    "total_cost_tokens": indexing_cost_tokens + query_token_tracker.total_tokens,
                     "num_entities": len(index_data["entities"]),
                     "num_relationships": len(index_data["relationships"]),
                     "num_documents": len(index_data["documents"]),
@@ -415,15 +420,12 @@ Answer:"""
 
             return BaselineResponse(
                 answer="Error processing question.",
-                tokens_used=token_tracker.total_tokens,
-                latency_ms=latency_tracker.get_total_latency(),
+                tokens_used=0,
+                latency_ms=0,
                 selected_passages=[],
                 abstained=True,
                 mode="graphrag",
-                stats={
-                    **token_tracker.get_stats(),
-                    "error": str(e),
-                },
+                stats={"error": str(e)},
             )
 
     def get_system_info(self) -> Dict[str, Any]:

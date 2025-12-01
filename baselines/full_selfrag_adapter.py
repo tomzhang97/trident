@@ -206,7 +206,12 @@ class FullSelfRAGAdapter(BaselineSystem):
         metadata: Optional[Dict[str, Any]] = None
     ) -> BaselineResponse:
         """
-        Answer a question using Self-RAG.
+        Answer a question using Self-RAG (Aligned with Separated Metrics).
+
+        Metrics reported:
+        - tokens_used, latency_ms: QUERY ONLY (Self-RAG has no indexing phase)
+        - stats['indexing_*']: Zero (Self-RAG uses pre-trained model, no per-query indexing)
+        - stats['total_cost_tokens']: Same as query_tokens (no offline costs)
 
         Args:
             question: The question to answer
@@ -217,17 +222,19 @@ class FullSelfRAGAdapter(BaselineSystem):
         Returns:
             BaselineResponse with answer and metrics
         """
-        token_tracker = TokenTracker()
-        latency_tracker = LatencyTracker()
+        # Self-RAG has NO indexing phase (uses pre-trained fine-tuned model)
+        # All costs are in the query phase
+        query_token_tracker = TokenTracker()
+        query_latency_tracker = LatencyTracker()
 
         try:
             # Format prompt
             prompt = self._format_prompt(question, context)
 
-            # Generate with Self-RAG
-            latency_tracker.start()
+            # Generate with Self-RAG (Query Phase)
+            query_latency_tracker.start()
             outputs = self.model.generate([prompt], self.sampling_params)
-            latency_tracker.stop("generation")
+            query_latency_tracker.stop("generation")
 
             # Extract generation
             if not outputs or not outputs[0].outputs:
@@ -241,7 +248,7 @@ class FullSelfRAGAdapter(BaselineSystem):
             # Count tokens
             prompt_tokens = self._count_tokens(prompt)
             completion_tokens = self._count_tokens(raw_generation)
-            token_tracker.add_call(prompt_tokens, completion_tokens, purpose="generation")
+            query_token_tracker.add_call(prompt_tokens, completion_tokens, purpose="generation")
 
             # Parse reflection tokens for stats
             used_retrieval = "[Retrieval]" in raw_generation
@@ -273,19 +280,27 @@ class FullSelfRAGAdapter(BaselineSystem):
 
             return BaselineResponse(
                 answer=answer,
-                tokens_used=token_tracker.total_tokens,
-                latency_ms=latency_tracker.get_total_latency(),
+                # PRIMARY METRICS: Only Query costs (matches original Self-RAG paper)
+                tokens_used=query_token_tracker.total_tokens,
+                latency_ms=query_latency_tracker.get_total_latency(),
                 selected_passages=selected_passages,
                 abstained=False,
                 mode="selfrag",
                 stats={
-                    **token_tracker.get_stats(),
+                    # Aligned with GraphRAG/KET-RAG format
+                    "indexing_latency_ms": 0.0,  # Zero for Self-RAG (no indexing phase)
+                    "indexing_tokens": 0,
+                    "query_tokens": query_token_tracker.total_tokens,
+                    "total_cost_tokens": query_token_tracker.total_tokens,
+                    # Self-RAG specific stats
                     "raw_generation": raw_generation,
                     "used_retrieval": used_retrieval,
                     "relevance_label": relevance_label,
                     "support_label": support_label,
                     "utility_score": utility_score,
                     "num_context_docs": len(context) if context else 0,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
                 },
             )
 
@@ -296,13 +311,16 @@ class FullSelfRAGAdapter(BaselineSystem):
 
             return BaselineResponse(
                 answer="Error processing question.",
-                tokens_used=token_tracker.total_tokens,
-                latency_ms=latency_tracker.get_total_latency(),
+                tokens_used=query_token_tracker.total_tokens,
+                latency_ms=query_latency_tracker.get_total_latency(),
                 selected_passages=[],
                 abstained=True,
                 mode="selfrag",
                 stats={
-                    **token_tracker.get_stats(),
+                    "indexing_latency_ms": 0.0,
+                    "indexing_tokens": 0,
+                    "query_tokens": query_token_tracker.total_tokens,
+                    "total_cost_tokens": query_token_tracker.total_tokens,
                     "error": str(e),
                 },
             )

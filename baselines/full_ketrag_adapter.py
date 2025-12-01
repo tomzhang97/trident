@@ -301,7 +301,12 @@ Relationships:"""
         metadata: Optional[Dict[str, Any]] = None
     ) -> BaselineResponse:
         """
-        Answer a question using KET-RAG dual-channel retrieval.
+        Answer a question using KET-RAG (Separating Indexing vs Querying).
+
+        Metrics reported:
+        - tokens_used, latency_ms: QUERY ONLY (matches original KET-RAG paper)
+        - stats['indexing_*']: Offline indexing costs (PageRank + Skeleton KG)
+        - stats['total_cost_tokens']: Full cost including indexing
 
         Args:
             question: The question to answer
@@ -310,59 +315,71 @@ Relationships:"""
             metadata: Optional metadata
 
         Returns:
-            BaselineResponse with answer and metrics
+            BaselineResponse with separated indexing/query metrics
         """
-        token_tracker = TokenTracker()
-        latency_tracker = LatencyTracker()
+        # Separate trackers
+        indexing_token_tracker = TokenTracker()
+        indexing_latency_tracker = LatencyTracker()
+
+        query_token_tracker = TokenTracker()
+        query_latency_tracker = LatencyTracker()
 
         if not context:
             return BaselineResponse(
                 answer="I don't have enough information to answer this question.",
                 tokens_used=0,
-                latency_ms=0.0,
+                latency_ms=0,
                 selected_passages=[],
                 abstained=True,
                 mode="ketrag",
-                stats={"error": "No context provided"},
+                stats={},
             )
 
         try:
-            # Convert context to chunks
+            # --- PHASE 1: INDEXING (Offline Simulation) ---
+            print("  [KET-RAG] Building Skeleton & Keyword Index (Offline Simulation)...")
+            indexing_latency_tracker.start()
+
+            # Prepare Chunks
             chunks = []
             for title, sentences in context:
                 text = " ".join(sentences) if isinstance(sentences, list) else sentences
                 chunks.append(text)
 
-            # 1) Compute chunk importance scores (proxy for PageRank)
-            latency_tracker.start()
+            # 1. PageRank / Importance Scoring (Expensive math)
             importance_scores = self._compute_chunk_importance(chunks)
-            latency_tracker.stop("importance_scoring")
 
-            # 2) Select key chunks for skeleton KG
+            # 2. Select Key Chunks
             num_key_chunks = max(1, int(len(chunks) * self.skeleton_ratio))
             scored_chunks = [(i, score) for i, score in enumerate(importance_scores)]
             scored_chunks.sort(key=lambda x: x[1], reverse=True)
             key_chunk_indices = [i for i, _ in scored_chunks[:num_key_chunks]]
             key_chunks = [(i, chunks[i]) for i in key_chunk_indices]
 
-            # 3) Build SkeletonKG (entity channel)
-            skeleton_kg = self._build_skeleton_kg(key_chunks, token_tracker, latency_tracker)
+            # 3. Build Skeleton KG (Expensive LLM calls)
+            skeleton_kg = self._build_skeleton_kg(
+                key_chunks,
+                indexing_token_tracker,
+                indexing_latency_tracker  # Pass indexing tracker!
+            )
 
-            # 4) Build KeywordIndex (keyword channel)
-            latency_tracker.start()
+            # 4. Build Keyword Index (Fast)
             keyword_index = KeywordIndex()
             for i, chunk in enumerate(chunks):
                 keyword_index.add_chunk(i, chunk)
-            latency_tracker.stop("keyword_indexing")
 
-            # 5) Dual-channel retrieval
-            latency_tracker.start()
+            indexing_time_ms = indexing_latency_tracker.get_total_latency()
+            indexing_cost_tokens = indexing_token_tracker.total_tokens
+            print(f"  [KET-RAG] Index Built in {indexing_time_ms/1000:.2f}s using {indexing_cost_tokens} tokens")
 
-            # Entity/skeleton channel
+            # --- PHASE 2: QUERYING (Online / "Original Version" Metric) ---
+            query_latency_tracker.start()
+
+            # 5. Dual-Channel Retrieval
+            # Entity Channel
             query_entities = self._extract_query_entities(question)
             relevant_triples = skeleton_kg.get_relevant_triples(query_entities, self.max_skeleton_triples)
 
-            # Format skeleton context
             if relevant_triples:
                 skeleton_context = "Key facts from knowledge graph:\n" + "\n".join(
                     f"- {s} {r} {o}" for s, r, o in relevant_triples
@@ -370,16 +387,11 @@ Relationships:"""
             else:
                 skeleton_context = "(no relevant knowledge graph facts found)"
 
-            # Keyword channel
+            # Keyword Channel
             keyword_chunk_indices = keyword_index.retrieve_chunks(question, self.max_keyword_chunks)
             keyword_chunks_text = [chunks[i] for i in keyword_chunk_indices if i < len(chunks)]
 
-            latency_tracker.stop("dual_channel_retrieval")
-
-            # 6) Generate answer using both contexts
-            latency_tracker.start()
-
-            # Combine contexts
+            # 6. Answer Generation
             combined_context = skeleton_context + "\n\nRelevant chunks:\n" + "\n\n".join(
                 f"[{i}] {text}" for i, text in enumerate(keyword_chunks_text)
             )
@@ -391,12 +403,7 @@ Question: {question}
 Knowledge:
 {combined_context}
 
-Instructions:
-- Use both the knowledge graph facts and text chunks to answer the question
-- If the information is insufficient, say you do not know
-- Answer with a single short phrase or sentence that directly answers the question
-
-Answer:"""
+Answer with a single short phrase or sentence."""
 
             response = self.llm.generate(
                 messages=[{"role": "user", "content": answer_prompt}],
@@ -404,30 +411,29 @@ Answer:"""
                 max_tokens=self.max_tokens,
             )
 
-            answer = response.strip()
+            query_latency_tracker.stop("answer_generation")
 
-            # Track tokens
-            prompt_tokens = len(answer_prompt.split()) * 1.3
-            completion_tokens = len(response.split()) * 1.3
-            token_tracker.add_call(int(prompt_tokens), int(completion_tokens), purpose="answer_generation")
+            # Count query tokens
+            p_tok = len(answer_prompt.split()) * 1.3
+            c_tok = len(response.split()) * 1.3
+            query_token_tracker.add_call(int(p_tok), int(c_tok), "query_generation")
 
-            latency_tracker.stop("answer_generation")
-
-            # Prepare selected passages
-            selected_passages = [
-                {"text": chunks[i][:200], "chunk_idx": i}
-                for i in keyword_chunk_indices[:5]
-            ]
+            # Prepare passages
+            selected_passages = [{"text": chunks[i][:200], "chunk_idx": i} for i in keyword_chunk_indices[:5]]
 
             return BaselineResponse(
-                answer=answer,
-                tokens_used=token_tracker.total_tokens,
-                latency_ms=latency_tracker.get_total_latency(),
+                answer=response.strip(),
+                # PRIMARY METRICS: Query Only
+                tokens_used=query_token_tracker.total_tokens,
+                latency_ms=query_latency_tracker.get_total_latency(),
                 selected_passages=selected_passages,
                 abstained=False,
                 mode="ketrag",
                 stats={
-                    **token_tracker.get_stats(),
+                    "indexing_latency_ms": indexing_time_ms,
+                    "indexing_tokens": indexing_cost_tokens,
+                    "query_tokens": query_token_tracker.total_tokens,
+                    "total_cost_tokens": indexing_cost_tokens + query_token_tracker.total_tokens,
                     "num_chunks": len(chunks),
                     "num_key_chunks": len(key_chunks),
                     "num_skeleton_triples": len(relevant_triples),
@@ -443,15 +449,12 @@ Answer:"""
 
             return BaselineResponse(
                 answer="Error processing question.",
-                tokens_used=token_tracker.total_tokens,
-                latency_ms=latency_tracker.get_total_latency(),
+                tokens_used=0,
+                latency_ms=0,
                 selected_passages=[],
                 abstained=True,
                 mode="ketrag",
-                stats={
-                    **token_tracker.get_stats(),
-                    "error": str(e),
-                },
+                stats={"error": str(e)},
             )
 
     def get_system_info(self) -> Dict[str, Any]:

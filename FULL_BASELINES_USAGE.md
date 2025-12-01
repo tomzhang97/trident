@@ -49,6 +49,55 @@ python eval_full_baselines.py \
     --output_dir results/full_baselines_complete
 ```
 
+## Understanding Metric Separation
+
+### Why We Separate Indexing from Query Costs
+
+To ensure **fair comparison** with original baseline papers, we report two sets of metrics:
+
+**1. Query-Only Metrics (PRIMARY)**
+- **Purpose**: Matches how original papers report performance
+- **Assumption**: Index is pre-built offline (one-time cost)
+- **Includes**: Only online inference costs (answer generation)
+- **Use for**: Fair comparison with published baseline results
+
+**2. Total Metrics (Reference)**
+- **Purpose**: Shows full cost for HotpotQA per-query adaptation
+- **Includes**: Indexing costs + query costs
+- **Use for**: Understanding full system overhead in dynamic context scenarios
+
+### Why This Matters
+
+**Original Design**:
+- GraphRAG/KET-RAG are designed for **persistent indices** over large static corpora
+- Index is built **once offline**, then reused for many queries
+- Papers report **query-only** costs assuming pre-built index
+
+**HotpotQA Adaptation**:
+- HotpotQA provides **dynamic contexts per question** (10-20 paragraphs each)
+- Requires **per-query indexing** to handle different contexts
+- Mixing indexing and query costs would **unfairly penalize** these systems
+
+### Example Breakdown
+
+**GraphRAG on HotpotQA:**
+- Indexing (offline simulation): ~2500 tokens (entity extraction + community detection)
+- Query (online): ~800 tokens (answer generation from graph)
+- **Primary metric reported**: 800 tokens (query-only)
+- **Reference metric**: 3300 tokens (total)
+
+**Self-RAG on HotpotQA:**
+- Indexing: 0 tokens (uses pre-trained model, no indexing)
+- Query: ~1650 tokens (generation with reflection tokens)
+- **Primary metric reported**: 1650 tokens (same as total)
+
+### How to Interpret Results
+
+When comparing results:
+- **For fairness**: Compare query-only metrics across all systems
+- **For HotpotQA cost**: Use total metrics (includes indexing overhead)
+- **For production**: Consider whether index would be pre-built (query-only) or rebuilt per-query (total)
+
 ## Detailed Installation
 
 ### Prerequisites
@@ -279,14 +328,20 @@ Example comparison output:
 - Good for multi-hop reasoning over entities
 
 **Limitations:**
-- High token cost due to per-query indexing (not designed for this)
+- High indexing cost due to per-query adaptation (not designed for this)
 - Slow due to multi-stage pipeline (entity extraction → graph building → summarization → answer)
 
-**Token breakdown:**
-- Entity extraction: ~1000-2000 tokens
-- Community summarization: ~500-1000 tokens
-- Answer generation: ~200-500 tokens
-- **Total: ~2000-4000 tokens per question**
+**Token breakdown (Separated Metrics):**
+- **Indexing (Offline)**:
+  - Entity extraction: ~1000-2000 tokens
+  - Community summarization: ~500-1000 tokens
+  - **Subtotal: ~2000-3000 tokens**
+- **Query (Online)**:
+  - Answer generation with graph context: ~500-800 tokens
+  - **Subtotal: ~500-800 tokens**
+- **Total (HotpotQA per-query): ~2500-4000 tokens**
+
+**Note**: Query-only costs (~500-800) are reported as primary metrics to match original paper.
 
 ### Self-RAG
 
@@ -300,10 +355,15 @@ Example comparison output:
 - Model-specific (can't easily swap LLM)
 - Requires GPU for reasonable performance
 
-**Token breakdown:**
-- Input (question + context): ~1000-1500 tokens
-- Output (answer + reflection tokens): ~50-150 tokens
+**Token breakdown (Separated Metrics):**
+- **Indexing (Offline)**: 0 tokens (uses pre-trained model, no per-query indexing)
+- **Query (Online)**:
+  - Input (question + context): ~1000-1500 tokens
+  - Output (answer + reflection tokens): ~50-150 tokens
+  - **Subtotal: ~1100-1700 tokens**
 - **Total: ~1100-1700 tokens per question**
+
+**Note**: Self-RAG has zero indexing costs, so query-only = total costs.
 
 ### KET-RAG
 
@@ -316,11 +376,17 @@ Example comparison output:
 - Still requires per-query indexing for HotpotQA
 - More complex than simple retrieval
 
-**Token breakdown:**
-- Skeleton extraction (top 30% chunks): ~800-1500 tokens
-- Keyword indexing: ~0 tokens (rule-based)
-- Answer generation: ~200-500 tokens
-- **Total: ~1500-2500 tokens per question**
+**Token breakdown (Separated Metrics):**
+- **Indexing (Offline)**:
+  - Skeleton extraction (PageRank + entity extraction on top 30%): ~800-1500 tokens
+  - Keyword indexing: ~0 tokens (rule-based)
+  - **Subtotal: ~800-1500 tokens**
+- **Query (Online)**:
+  - Dual-channel retrieval + answer generation: ~700-1000 tokens
+  - **Subtotal: ~700-1000 tokens**
+- **Total (HotpotQA per-query): ~1500-2500 tokens**
+
+**Note**: Query-only costs (~700-1000) are reported as primary metrics to match original paper.
 
 ## Troubleshooting
 

@@ -113,29 +113,48 @@ HotpotQA Context → TF-IDF Vectorization
 
 ## Evaluation Metrics
 
-All systems track:
+### Fair Comparison: Separated Indexing vs Query Metrics
+
+To ensure fair comparison with original baseline papers, we separate **offline indexing** costs from **online query** costs:
+
+**Query-Only Metrics (PRIMARY)**:
+- **Tokens Used**: Tokens consumed during answer generation only
+- **Latency**: Time for answer generation only
+- **Purpose**: Matches how original papers report performance (assumes pre-built index)
+
+**Total Metrics (Reference)**:
+- **Total Tokens**: Query tokens + indexing tokens
+- **Total Latency**: Query latency + indexing latency
+- **Purpose**: Shows full cost for HotpotQA per-query indexing adaptation
+
+**Why This Matters**:
+- GraphRAG/KET-RAG are designed for **persistent indices** over large corpora
+- HotpotQA requires **per-query indexing** (dynamic contexts per question)
+- Original papers assume indexing is done **once offline**, not per-query
+- Mixing indexing and query costs would unfairly penalize these systems
+
+**Accuracy Metrics** (all systems):
 - **Exact Match (EM)**: Exact string match after normalization
 - **F1 Score**: Token-level F1 between prediction and answer
-- **Total Tokens**: All tokens consumed (indexing + answering)
-- **Latency**: End-to-end time in milliseconds
 - **Abstention Rate**: Percentage of questions where system abstained
 
 ## Expected Performance on HotpotQA
 
-Based on our adaptations and original papers:
+Based on our adaptations and original papers (showing **query-only** token costs):
 
-| System | EM | F1 | Avg Tokens | Relative Cost | Speed |
-|--------|----|----|------------|---------------|-------|
-| **TRIDENT (Pareto)** | ~0.42 | ~0.53 | ~1500 | 1.0× | Fast |
-| **GraphRAG** | ~0.38 | ~0.49 | ~3500 | 2.3× | Slow |
-| **Self-RAG (7B)** | ~0.41 | ~0.52 | ~1650 | 1.1× | Medium |
-| **KET-RAG** | ~0.39 | ~0.50 | ~2500 | 1.7× | Medium |
+| System | EM | F1 | Query Tokens | Total Tokens (w/ indexing) | Speed |
+|--------|----|----|--------------|----------------------------|-------|
+| **TRIDENT (Pareto)** | ~0.42 | ~0.53 | ~1500 | ~1500 | Fast |
+| **GraphRAG** | ~0.38 | ~0.49 | ~800 | ~3500 | Slow |
+| **Self-RAG (7B)** | ~0.41 | ~0.52 | ~1650 | ~1650 | Medium |
+| **KET-RAG** | ~0.39 | ~0.50 | ~1000 | ~2500 | Medium |
 
 **Key Insights:**
-- TRIDENT matches Self-RAG efficiency while working with any LLM
-- GraphRAG/KET-RAG have higher costs due to per-query indexing (not their designed use case)
+- **Query-only costs**: GraphRAG and KET-RAG are competitive (~800-1000 tokens)
+- **Total costs**: GraphRAG/KET-RAG have high indexing overhead due to per-query adaptation
+- **Fair comparison**: Compare query-only metrics to match original paper claims
 - Self-RAG requires specialized fine-tuned model
-- TRIDENT provides best cost-quality tradeoff with standard LLMs
+- TRIDENT works with any LLM and has zero indexing overhead
 
 ## Usage Examples
 
