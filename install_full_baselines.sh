@@ -47,6 +47,16 @@ install_baseline "GraphRAG" \
     "pip install -e . --quiet"
 
 # Install Self-RAG dependencies
+# Ensure torch is available before installing flash-attn (Self-RAG dependency)
+if ! python - <<'PY' 2>/dev/null; then
+import importlib.util
+exit(0 if importlib.util.find_spec('torch') else 1)
+PY
+then
+    echo "torch not found. Installing torch before Self-RAG dependencies..."
+    pip install torch --quiet || echo "Warning: torch installation failed. Please install a CUDA-compatible torch manually."
+fi
+
 install_baseline "Self-RAG" \
     "$BASELINE_ROOT/self-rag" \
     "pip install -r requirements.txt --quiet"
