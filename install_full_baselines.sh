@@ -8,11 +8,11 @@ echo "Installing Full Baseline Systems"
 echo "=========================================="
 echo ""
 
-# Check if external_baselines directory exists
-if [ ! -d "external_baselines" ]; then
-    echo "ERROR: external_baselines directory not found!"
-    echo "Please ensure you've cloned the baseline repositories."
-    exit 1
+# Support both legacy external_baselines/ layout and repositories at repo root
+if [ -d "external_baselines" ]; then
+    BASELINE_ROOT="external_baselines"
+else
+    BASELINE_ROOT="."
 fi
 
 # Function to install a baseline
@@ -43,12 +43,12 @@ install_baseline() {
 
 # Install GraphRAG
 install_baseline "GraphRAG" \
-    "external_baselines/graphrag" \
+    "$BASELINE_ROOT/graphrag" \
     "pip install -e . --quiet"
 
 # Install Self-RAG dependencies
 install_baseline "Self-RAG" \
-    "external_baselines/self-rag" \
+    "$BASELINE_ROOT/self-rag" \
     "pip install -r requirements.txt --quiet"
 
 # Install KET-RAG
@@ -56,7 +56,7 @@ echo ""
 echo "------------------------------------------"
 echo "Installing KET-RAG"
 echo "------------------------------------------"
-cd external_baselines/KET-RAG
+cd "$BASELINE_ROOT/KET-RAG"
 
 # Check if poetry is installed
 if ! command -v poetry &> /dev/null; then

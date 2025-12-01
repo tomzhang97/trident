@@ -9,9 +9,22 @@ from typing import Dict, Any, List, Optional, Set, Tuple, Union
 from collections import defaultdict, Counter
 import re
 
-# Add external_baselines to path
-EXTERNAL_BASELINES = Path(__file__).parent.parent / "external_baselines"
-sys.path.insert(0, str(EXTERNAL_BASELINES / "KET-RAG"))
+# Add KET-RAG source to path (supports both external_baselines/ and repo root layouts)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+KETRAG_PATHS = [
+    PROJECT_ROOT / "external_baselines" / "KET-RAG",
+    PROJECT_ROOT / "KET-RAG",
+]
+ketrag_path = None
+for candidate in KETRAG_PATHS:
+    if candidate.exists():
+        sys.path.insert(0, str(candidate))
+        ketrag_path = candidate
+        break
+if ketrag_path is None:
+    raise ImportError(
+        "KET-RAG source not found. Clone KET-RAG into external_baselines/ or repository root."
+    )
 
 from baselines.full_baseline_interface import (
     BaselineSystem,
@@ -156,8 +169,9 @@ class FullKETRAGAdapter(BaselineSystem):
 
         if not KETRAG_AVAILABLE:
             raise ImportError(
-                f"KET-RAG library not available. Install with: "
-                f"cd external_baselines/KET-RAG && pip install poetry && poetry install "
+                "KET-RAG library not available. Install with: "
+                "pip install poetry && poetry install inside <path_to_KET-RAG> "
+                "(clone into external_baselines/ or repo root). "
                 f"Error: {KETRAG_IMPORT_ERROR}"
             )
 
