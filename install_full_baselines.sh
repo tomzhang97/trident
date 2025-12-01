@@ -59,7 +59,7 @@ fi
 
 install_baseline "Self-RAG" \
     "$BASELINE_ROOT/self-rag" \
-    "PIP_NO_BUILD_ISOLATION=1 pip install -r requirements.txt --quiet"
+    "pip install -r requirements.txt --quiet"
 
 # Install KET-RAG
 echo ""
