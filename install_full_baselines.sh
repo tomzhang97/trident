@@ -48,7 +48,7 @@ install_baseline "GraphRAG" \
 
 # Install Self-RAG dependencies
 # Ensure torch is available before installing flash-attn (Self-RAG dependency)
-if ! python - <<'PY' 2>/dev/null; then
+if ! python - <<'PY' 2>/dev/null
 import importlib.util
 exit(0 if importlib.util.find_spec('torch') else 1)
 PY
