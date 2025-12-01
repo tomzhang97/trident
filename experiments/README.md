@@ -96,6 +96,20 @@ HF_ENDPOINT=https://hf-mirror.com python eval_complete_runnable.py --worker \
   --model Meta-Llama-3-8B-Instruct
 ```
 
+The full baseline harness also respects `HF_ENDPOINT` for local model downloads. With
+the baseline repositories cloned into `external_baselines/` and their dependencies
+installed in your active conda environment, you can launch all baselines against a
+small shard using a GPU ID (numeric values are normalized to `cuda:<id>`):
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com python experiments/eval_full_baselines.py \
+  --data_path runs/_shards/validation_0_99.json \
+  --max_samples 10 \
+  --use_local_llm \
+  --local_llm_model Meta-Llama-3-8B-Instruct \
+  --local_llm_device 3
+```
+
 ---
 
 ## Full Comparison Run
@@ -284,4 +298,4 @@ All commands support these arguments:
 **TRIDENT:**
 - `--budget_tokens 2000`: TRIDENT token budget
 
-See `RUN_BASELINES.md` for complete documentation.
+See `../docs/baselines/RUN_BASELINES.md` for complete documentation.

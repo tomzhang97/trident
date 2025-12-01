@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, Union
 
 import torch
 from transformers import (
@@ -25,6 +25,22 @@ class LLMOutput:
     logprobs: Optional[List[float]] = None
 
 
+def _normalize_device(device: Union[str, int]) -> str:
+    """Normalize device specifiers to torch-friendly strings."""
+
+    if isinstance(device, int):
+        return f"cuda:{device}"
+
+    device_str = str(device).strip()
+    if device_str.isdigit():
+        return f"cuda:{device_str}"
+
+    if device_str.lower() in {"cuda", "gpu"}:
+        return "cuda:0"
+
+    return device_str
+
+
 class LLMInterface:
     """Interface for local LLM models."""
     
@@ -39,7 +55,7 @@ class LLMInterface:
         seed: Optional[int] = None
     ):
         self.model_name = model_name
-        self.device = device
+        self.device = _normalize_device(device)
         self.temperature = temperature
         self.max_new_tokens = max_new_tokens
         
@@ -60,11 +76,12 @@ class LLMInterface:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
+        device_map = self.device if self.device != "cpu" else "auto"
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=quantization_config,
-            device_map=device if device != "cpu" else "auto",
-            torch_dtype=torch.float16 if device != "cpu" else torch.float32,
+            device_map=device_map,
+            torch_dtype=torch.float16 if self.device != "cpu" else torch.float32,
             low_cpu_mem_usage=True
         )
         

@@ -14,6 +14,11 @@ cd /path/to/trident
 ./install_full_baselines.sh
 ```
 
+> Tip: Keep your active conda/virtualenv loaded when running the script so all
+> baseline dependencies land in the same environment as TRIDENT. The script now
+> forces Poetry (for KET-RAG) to reuse the current environment instead of
+> creating its own venv.
+
 ### 2. Set Environment Variables
 
 ```bash

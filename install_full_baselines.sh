@@ -64,8 +64,11 @@ if ! command -v poetry &> /dev/null; then
     pip install poetry --quiet
 fi
 
-echo "Installing KET-RAG with poetry..."
-poetry install --quiet
+echo "Installing KET-RAG with poetry (using current environment)..."
+# Force Poetry to reuse the active environment so dependencies stay compatible
+# with the current (e.g., conda) environment used by TRIDENT.
+export POETRY_VIRTUALENVS_CREATE=${POETRY_VIRTUALENVS_CREATE:-false}
+poetry install --quiet --no-root
 
 cd - > /dev/null
 echo "✓ KET-RAG installed successfully"

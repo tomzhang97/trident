@@ -39,6 +39,9 @@ import numpy as np
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
+PROJECT_ROOT = Path(__file__).parent
+EXTERNAL_BASELINES = PROJECT_ROOT / "external_baselines"
+
 from baselines.full_baseline_interface import compute_exact_match, compute_f1
 from baselines.full_graphrag_adapter import FullGraphRAGAdapter
 from baselines.full_selfrag_adapter import FullSelfRAGAdapter
@@ -46,14 +49,55 @@ from baselines.full_ketrag_adapter import FullKETRAGAdapter
 
 
 def load_hotpotqa_data(data_path: str, max_samples: int = None) -> List[Dict[str, Any]]:
-    """Load HotpotQA data from JSONL file."""
-    data = []
+    """Load HotpotQA data from JSONL or JSON array files.
+
+    The loader skips empty lines in JSONL files and also supports files that
+    contain a single JSON array (common when exporting small evaluation shards).
+    """
+
     with open(data_path, 'r') as f:
+        # Peek at the first non-empty line to determine file shape
+        first_non_empty = ""
+        for line in f:
+            stripped = line.strip()
+            if stripped:
+                first_non_empty = stripped
+                break
+
+        f.seek(0)
+
+        if first_non_empty.startswith("["):
+            data = json.load(f)
+            if max_samples:
+                data = data[:max_samples]
+            return data
+
+        data: List[Dict[str, Any]] = []
         for i, line in enumerate(f):
             if max_samples and i >= max_samples:
                 break
+            if not line.strip():
+                continue
             data.append(json.loads(line))
-    return data
+        return data
+
+
+def ensure_baseline_repos(requested_baselines: List[str]):
+    """Ensure required baseline repositories are present."""
+
+    required = {
+        "graphrag": EXTERNAL_BASELINES / "graphrag",
+        "selfrag": EXTERNAL_BASELINES / "self-rag",
+        "ketrag": EXTERNAL_BASELINES / "KET-RAG",
+    }
+
+    missing = [name for name in requested_baselines if name in required and not required[name].exists()]
+    if missing:
+        missing_paths = [str(required[name]) for name in missing]
+        raise FileNotFoundError(
+            "Missing baseline repositories: " + ", ".join(missing_paths) +
+            "\nClone the official repos into external_baselines/ or run install_full_baselines.sh after cloning."
+        )
 
 
 def evaluate_baseline(
@@ -314,6 +358,9 @@ def main():
     # Expand 'all' to all baselines
     if 'all' in args.baselines:
         args.baselines = ['graphrag', 'selfrag', 'ketrag']
+
+    # Ensure baseline repositories are available in the current environment
+    ensure_baseline_repos(args.baselines)
 
     # Load data
     print(f"Loading data from: {args.data_path}")
