@@ -44,5 +44,13 @@ safetensors>=0.3.0
 # For cross-encoder models
 sentence-transformers>=2.2.0
 
+# Full baseline systems (GraphRAG, KET-RAG, Self-RAG)
+openai>=1.68.0
+tiktoken>=0.11.0
+networkx>=3.4.2
+lancedb>=0.17.0
+pydantic>=2.10.0
+environs>=11.0.0
+
 # Download spaCy model after installation:
 # python -m spacy download en_core_web_sm
