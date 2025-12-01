@@ -47,19 +47,46 @@ install_baseline "GraphRAG" \
     "pip install -e . --quiet"
 
 # Install Self-RAG dependencies
-# Ensure torch is available before installing flash-attn (Self-RAG dependency)
-if ! python - <<'PY' 2>/dev/null
-import importlib.util
-exit(0 if importlib.util.find_spec('torch') else 1)
-PY
-then
-    echo "torch not found. Installing torch before Self-RAG dependencies..."
-    pip install torch --quiet || echo "Warning: torch installation failed. Please install a CUDA-compatible torch manually."
-fi
+# Flash-attn requires torch to be installed FIRST (needs it at build time)
+echo ""
+echo "------------------------------------------"
+echo "Installing Self-RAG dependencies (Step 1: torch)"
+echo "------------------------------------------"
 
-install_baseline "Self-RAG" \
-    "$BASELINE_ROOT/self-rag" \
-    "pip install -r requirements.txt --quiet"
+# Always ensure torch is installed before flash-attn
+pip install torch --quiet
+echo "✓ torch installed/verified"
+
+echo ""
+echo "------------------------------------------"
+echo "Installing Self-RAG dependencies (Step 2: requirements without flash-attn)"
+echo "------------------------------------------"
+
+# Install dependencies excluding flash-attn first
+if [ -d "$BASELINE_ROOT/self-rag" ]; then
+    cd "$BASELINE_ROOT/self-rag"
+    echo "Installing from: $(pwd)"
+
+    # Install all requirements except flash-attn
+    grep -v "flash-attn" requirements.txt > /tmp/selfrag_requirements_no_flash.txt
+    pip install -r /tmp/selfrag_requirements_no_flash.txt --quiet
+
+    echo "✓ Self-RAG core dependencies installed"
+
+    # Try to install flash-attn separately (optional)
+    echo ""
+    echo "Installing flash-attn (this may take a while and requires CUDA)..."
+    if pip install flash-attn>=2.3.6 --quiet 2>/dev/null; then
+        echo "✓ flash-attn installed successfully"
+    else
+        echo "⚠ Warning: flash-attn installation failed. This is optional for inference."
+        echo "  If you need flash-attn, please install it manually with CUDA support."
+    fi
+
+    cd - > /dev/null
+else
+    echo "ERROR: $BASELINE_ROOT/self-rag not found. Please clone the repository first."
+fi
 
 # Install KET-RAG
 echo ""
