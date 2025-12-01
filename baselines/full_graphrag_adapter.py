@@ -9,9 +9,22 @@ from typing import Dict, Any, List, Optional, Union
 import tempfile
 import shutil
 
-# Add external_baselines to path
-EXTERNAL_BASELINES = Path(__file__).parent.parent / "external_baselines"
-sys.path.insert(0, str(EXTERNAL_BASELINES / "graphrag"))
+# Add GraphRAG source to path (supports both external_baselines/ and repo root layouts)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+GRAPHRAG_PATHS = [
+    PROJECT_ROOT / "external_baselines" / "graphrag",
+    PROJECT_ROOT / "graphrag",
+]
+graphrag_path = None
+for candidate in GRAPHRAG_PATHS:
+    if candidate.exists():
+        sys.path.insert(0, str(candidate))
+        graphrag_path = candidate
+        break
+if graphrag_path is None:
+    raise ImportError(
+        "GraphRAG source not found. Clone graphrag into external_baselines/ or repository root."
+    )
 
 from baselines.full_baseline_interface import (
     BaselineSystem,
@@ -88,8 +101,8 @@ class FullGraphRAGAdapter(BaselineSystem):
 
         if not GRAPHRAG_AVAILABLE:
             raise ImportError(
-                f"GraphRAG library not available. Install with: "
-                f"cd external_baselines/graphrag && pip install -e . "
+                "GraphRAG library not available. Install with: "
+                "pip install -e <path_to_graphrag> (clone into external_baselines/ or repo root). "
                 f"Error: {GRAPHRAG_IMPORT_ERROR}"
             )
 
