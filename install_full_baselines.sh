@@ -70,6 +70,14 @@ poetry install --quiet
 cd - > /dev/null
 echo "✓ KET-RAG installed successfully"
 
+# Install scikit-learn for KET-RAG PageRank
+echo ""
+echo "------------------------------------------"
+echo "Installing scikit-learn for KET-RAG"
+echo "------------------------------------------"
+pip install scikit-learn --quiet
+echo "✓ scikit-learn installed successfully"
+
 # Install vllm for Self-RAG (if not already installed)
 echo ""
 echo "------------------------------------------"

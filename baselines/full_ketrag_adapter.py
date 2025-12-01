@@ -168,22 +168,62 @@ class FullKETRAGAdapter(BaselineSystem):
 
     def _compute_chunk_importance(self, chunks: List[str]) -> List[float]:
         """
-        Compute importance scores for chunks using vocabulary richness.
+        FULL VERSION: Compute importance using PageRank on a similarity graph.
 
-        In full KET-RAG, this would use PageRank on a chunk graph.
-        Here we use a simpler proxy: vocabulary richness.
+        This restores the original KET-RAG 'Skeleton' logic:
+        1. TF-IDF vectorization of chunks.
+        2. Build a graph where edges = cosine similarity > threshold.
+        3. Run PageRank to find the most "central" chunks.
         """
         if not chunks:
             return []
 
-        scores = []
-        for chunk in chunks:
-            words = set(re.findall(r'\b\w{4,}\b', chunk.lower()))
-            scores.append(len(words))
+        if len(chunks) == 1:
+            return [1.0]
 
-        # Normalize
-        max_score = max(scores) if scores else 1.0
-        return [s / max_score for s in scores]
+        try:
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            from sklearn.metrics.pairwise import cosine_similarity
+        except ImportError:
+            raise ImportError("Full KET-RAG requires scikit-learn. Run: pip install scikit-learn")
+
+        # 1. Vectorize Chunks
+        vectorizer = TfidfVectorizer(stop_words='english')
+        try:
+            tfidf_matrix = vectorizer.fit_transform(chunks)
+        except ValueError:
+            # Handle empty vocab case
+            return [1.0 / len(chunks)] * len(chunks)
+
+        # 2. Compute Similarity Matrix
+        sim_matrix = cosine_similarity(tfidf_matrix)
+
+        # 3. Build Similarity Graph
+        graph = nx.Graph()
+        graph.add_nodes_from(range(len(chunks)))
+
+        # Add edges for similarity > 0.2 (common threshold in graph-based NLP)
+        rows, cols = sim_matrix.shape
+        for i in range(rows):
+            for j in range(i + 1, cols):
+                if sim_matrix[i, j] > 0.2:
+                    graph.add_edge(i, j, weight=sim_matrix[i, j])
+
+        # 4. Run PageRank
+        try:
+            # Alpha=0.85 is standard PageRank damping
+            scores_dict = nx.pagerank(graph, alpha=0.85, weight='weight')
+
+            # Map back to list order
+            scores = [scores_dict.get(i, 0.0) for i in range(len(chunks))]
+
+            # Normalize
+            max_score = max(scores) if scores else 1.0
+            return [s / max_score if max_score > 0 else 0 for s in scores]
+
+        except Exception as e:
+            print(f"PageRank failed, falling back to uniform: {e}")
+            return [1.0] * len(chunks)
 
     def _build_skeleton_kg(
         self,

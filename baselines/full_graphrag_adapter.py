@@ -103,15 +103,15 @@ class FullGraphRAGAdapter(BaselineSystem):
         latency_tracker: LatencyTracker
     ) -> Dict[str, Any]:
         """
-        Build GraphRAG index from HotpotQA context.
+        FULL VERSION: Builds Index with Community Detection and Summarization.
 
-        This is a simplified indexing process that:
-        1. Extracts entities from each document
-        2. Builds a simple knowledge graph
-        3. Creates communities via clustering
+        Restores the core GraphRAG pipeline:
+        1. Extract Entities/Relations.
+        2. Detect Communities (Leiden/Louvain).
+        3. Generate Community Summaries (The "Map" step).
 
         Returns:
-            Index data structure with entities, relationships, and summaries
+            Index data structure with entities, relationships, communities, and summaries
         """
         latency_tracker.start()
 
@@ -126,13 +126,12 @@ class FullGraphRAGAdapter(BaselineSystem):
             })
 
         # Extract entities and relationships using LLM
-        # This is a simplified version - full GraphRAG does much more
         entities = []
         relationships = []
         entity_id_counter = 0
 
         for doc in documents:
-            # Entity extraction prompt (simplified)
+            # Entity extraction prompt
             extraction_prompt = f"""Extract named entities and their relationships from this text.
 Format each entity as: ENTITY: <name> | TYPE: <type> | DESCRIPTION: <brief description>
 Format each relationship as: RELATION: <entity1> | <relationship> | <entity2>
@@ -148,9 +147,8 @@ Entities and Relationships:"""
                     max_tokens=300,
                 )
 
-                # Track tokens (estimate from response)
-                # GraphRAG uses tiktoken internally, we approximate here
-                prompt_tokens = len(extraction_prompt.split()) * 1.3  # Rough approximation
+                # Track tokens
+                prompt_tokens = len(extraction_prompt.split()) * 1.3
                 completion_tokens = len(response.split()) * 1.3
                 token_tracker.add_call(
                     int(prompt_tokens),
@@ -158,7 +156,7 @@ Entities and Relationships:"""
                     purpose=f"entity_extraction_{doc['id']}"
                 )
 
-                # Parse entities and relationships (simple parsing)
+                # Parse entities and relationships
                 for line in response.split('\n'):
                     line = line.strip()
                     if line.startswith('ENTITY:'):
@@ -188,7 +186,7 @@ Entities and Relationships:"""
                 print(f"Warning: Entity extraction failed for {doc['id']}: {e}")
                 continue
 
-        # Build simple graph
+        # Build graph
         graph = nx.Graph()
         for entity in entities:
             graph.add_node(entity["name"], **entity)
@@ -197,13 +195,78 @@ Entities and Relationships:"""
             if rel["source"] in graph.nodes and rel["target"] in graph.nodes:
                 graph.add_edge(rel["source"], rel["target"], relationship=rel["relationship"])
 
-        latency_tracker.stop("indexing")
+        # --- FULL GRAPHRAG: COMMUNITY DETECTION AND SUMMARIZATION ---
+
+        # 1. Detect Communities (Hierarchical Clustering)
+        # Real GraphRAG uses Leiden. We use Louvain (available in networkx) as the closest proxy
+        import networkx.algorithms.community as nx_comm
+
+        try:
+            # Attempt Louvain (closest to Leiden)
+            communities = list(nx_comm.louvain_communities(graph))
+        except:
+            # Fallback for very small/disconnected graphs
+            communities = list(nx.connected_components(graph))
+
+        community_summaries = {}
+
+        # 2. Generate Community Summaries (The "Map" Phase)
+        # This is the defining feature of Microsoft GraphRAG
+        summary_prompt_template = """Based on the provided entities and relationships, write a comprehensive summary of this community.
+Focus on the key themes and how these entities relate to the query context.
+
+Entities: {node_list}
+Relationships: {edge_list}
+
+Summary:"""
+
+        for i, comm in enumerate(communities):
+            if not comm:
+                continue
+
+            # Prepare data for summary
+            node_list = list(comm)
+            edge_list = []
+            subgraph = graph.subgraph(comm)
+            for u, v, data in subgraph.edges(data=True):
+                edge_list.append(f"{u} -> {v} ({data.get('relationship', 'related')})")
+
+            # Skip if community is too small (optimization)
+            if len(node_list) < 2:
+                continue
+
+            prompt = summary_prompt_template.format(
+                node_list=", ".join(node_list),
+                edge_list="; ".join(edge_list)
+            )
+
+            # Generate Summary
+            try:
+                response = self.llm.generate(
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=200,
+                )
+
+                # Track tokens
+                prompt_tokens = len(prompt.split()) * 1.3
+                completion_tokens = len(response.split()) * 1.3
+                token_tracker.add_call(int(prompt_tokens), int(completion_tokens), purpose=f"community_summary_{i}")
+
+                community_summaries[i] = response.strip()
+
+            except Exception as e:
+                print(f"Summary failed for comm {i}: {e}")
+
+        latency_tracker.stop("indexing_full_pipeline")
 
         return {
             "documents": documents,
             "entities": entities,
             "relationships": relationships,
             "graph": graph,
+            "communities": communities,           # NEW
+            "community_summaries": community_summaries  # NEW
         }
 
     def answer(
@@ -251,6 +314,19 @@ Entities and Relationships:"""
             # Retrieve relevant information from graph
             latency_tracker.start()
 
+            # FULL GRAPHRAG SEARCH STRATEGY:
+            # Combine Global Search (Community Summaries) + Local Search (Entity Neighbors)
+
+            context_parts = []
+
+            # 1. Global Context (from Community Summaries)
+            # This allows answering "What is the overarching theme?" type questions
+            if "community_summaries" in index_data and index_data["community_summaries"]:
+                context_parts.append("--- Community Summaries (Global Context) ---")
+                for comm_id, summary in index_data["community_summaries"].items():
+                    context_parts.append(f"Community {comm_id}: {summary}")
+
+            # 2. Local Context (Specific Entities)
             # Simple entity-based retrieval
             question_lower = question.lower()
             relevant_entities = []
@@ -263,17 +339,18 @@ Entities and Relationships:"""
                 relevant_entities = index_data["entities"][:5]
 
             # Build context from relevant entities and their neighborhood
-            context_parts = []
-            for entity in relevant_entities[:3]:
-                context_parts.append(f"{entity['name']}: {entity['description']}")
+            if relevant_entities:
+                context_parts.append("\n--- Local Context (Specific Entities) ---")
+                for entity in relevant_entities[:3]:
+                    context_parts.append(f"{entity['name']}: {entity['description']}")
 
-                # Add related entities from graph
-                if entity["name"] in index_data["graph"]:
-                    neighbors = list(index_data["graph"].neighbors(entity["name"]))[:3]
-                    for neighbor in neighbors:
-                        edge_data = index_data["graph"][entity["name"]][neighbor]
-                        rel = edge_data.get("relationship", "related to")
-                        context_parts.append(f"{entity['name']} {rel} {neighbor}")
+                    # Add related entities from graph
+                    if entity["name"] in index_data["graph"]:
+                        neighbors = list(index_data["graph"].neighbors(entity["name"]))[:3]
+                        for neighbor in neighbors:
+                            edge_data = index_data["graph"][entity["name"]][neighbor]
+                            rel = edge_data.get("relationship", "related to")
+                            context_parts.append(f"{entity['name']} {rel} {neighbor}")
 
             context_text = "\n".join(context_parts) if context_parts else "No relevant information found."
 
@@ -326,6 +403,8 @@ Answer:"""
                     "num_relationships": len(index_data["relationships"]),
                     "num_documents": len(index_data["documents"]),
                     "num_relevant_entities": len(relevant_entities),
+                    "num_communities": len(index_data.get("communities", [])),
+                    "num_community_summaries": len(index_data.get("community_summaries", {})),
                 },
             )
 

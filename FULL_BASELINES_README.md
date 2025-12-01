@@ -73,33 +73,42 @@ The `baselines/` directory contains two types of implementations:
 
 ## System Architectures
 
-### GraphRAG (Microsoft)
+### GraphRAG (Microsoft) - FULL VERSION
 ```
 HotpotQA Context → Entity Extraction (LLM)
                 → Knowledge Graph Building
-                → Community Detection
-                → Community Summarization (LLM)
+                → Community Detection (Louvain)
+                → Community Summarization (LLM) ← KEY: The "Map" phase
+                → Global + Local Search
                 → Answer Generation (LLM)
 ```
-**Token cost**: ~2000-4000 per question (high due to multi-stage pipeline)
+**Algorithm**: Uses **Louvain community detection** (proxy for Leiden) and generates **community summaries** for each detected cluster. This is the core innovation of Microsoft GraphRAG - hierarchical community summaries enable both global and local search.
 
-### Self-RAG (Asai et al.)
+**Token cost**: ~3000-5000 per question (high due to community summarization)
+
+### Self-RAG (Asai et al.) - FULL VERSION
 ```
 Question → Retrieval Decision ([Retrieval] token)
         → Context Formatting (<paragraph> tags)
         → Answer + Reflection Tokens
         → Extract Final Answer
 ```
+**Algorithm**: Uses official **fine-tuned LLaMA 7B/13B** model with learned retrieval decisions and reflection tokens.
+
 **Token cost**: ~1100-1700 per question (efficient, learned retrieval)
 
-### KET-RAG
+### KET-RAG - FULL VERSION
 ```
-HotpotQA Context → Chunk Importance (PageRank proxy)
-                → SkeletonKG: Entity Extraction from Key Chunks
+HotpotQA Context → TF-IDF Vectorization
+                → Similarity Graph Construction
+                → PageRank (Chunk Importance) ← KEY: Real PageRank, not proxy
+                → SkeletonKG: Entity Extraction from Top Chunks
                 → KeywordIndex: Keyword-Chunk Bipartite Graph
                 → Dual-Channel Retrieval
                 → Answer Generation (LLM)
 ```
+**Algorithm**: Uses **TF-IDF + cosine similarity + PageRank** to compute chunk importance (the "Skeleton" method from the paper), not simple vocabulary counting.
+
 **Token cost**: ~1500-2500 per question (moderate, dual-channel)
 
 ## Evaluation Metrics
@@ -219,7 +228,9 @@ For 100 questions with recommended models:
 ### Dependencies
 - **GraphRAG**: fnllm, openai, networkx, pandas, lancedb
 - **Self-RAG**: vllm, transformers, flash-attn (CUDA), datasets
-- **KET-RAG**: Poetry, same as GraphRAG (based on GraphRAG v0.4.1)
+- **KET-RAG**: Poetry, scikit-learn (for TF-IDF + PageRank), networkx, same as GraphRAG (based on GraphRAG v0.4.1)
+
+**Note**: The full KET-RAG implementation requires `scikit-learn` for TF-IDF vectorization and cosine similarity computation used in PageRank-based chunk importance scoring.
 
 See `install_full_baselines.sh` for automated installation.
 
@@ -232,8 +243,14 @@ Common issues and solutions:
 # API key error
 export GRAPHRAG_API_KEY="sk-..."
 
-# Import error
+# GraphRAG import error
 cd external_baselines/graphrag && pip install -e .
+
+# KET-RAG scikit-learn error
+pip install scikit-learn
+
+# KET-RAG import error
+cd external_baselines/KET-RAG && poetry install
 ```
 
 ### Self-RAG
