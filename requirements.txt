@@ -72,3 +72,6 @@ spacy>=3.8.4
 
 # Download spaCy model after installation:
 # python -m spacy download en_core_web_sm
+
+# HippoRAG for baseline comparison
+hipporag>=0.1.0

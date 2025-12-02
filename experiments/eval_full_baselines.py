@@ -5,23 +5,29 @@ Evaluation script for full baseline systems (Self-RAG, KET-RAG, Vanilla RAG, Hip
 Supports multiple datasets: HotpotQA, MuSiQue, NarrativeQA
 Supports both OpenAI API and local LLMs via HuggingFace
 
+Baselines:
+    - Self-RAG: Self-reflective retrieval-augmented generation
+    - KET-RAG: Knowledge graph enhanced RAG with dual-channel retrieval
+    - Vanilla RAG: Simple TF-IDF retrieval + LLM generation (baseline)
+    - HippoRAG: Memory-enhanced RAG with personalized PageRank
+
 Usage with OpenAI:
     python eval_full_baselines.py \
         --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
         --output_dir results/full_baselines \
-        --baselines ketrag selfrag
+        --baselines vanillarag ketrag selfrag hipporag
 
 Usage with Local LLM:
     python eval_full_baselines.py \
         --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
         --output_dir results/full_baselines \
-        --baselines ketrag selfrag \
+        --baselines vanillarag ketrag selfrag \
         --use_local_llm \
         --local_llm_model Qwen/Qwen2.5-7B-Instruct \
         --local_llm_device cuda:0
 
 Environment variables:
-    OPENAI_API_KEY: Required for KET-RAG when not using local LLM
+    OPENAI_API_KEY: Required for KET-RAG, Vanilla RAG, HippoRAG when not using local LLM
     HF_TOKEN: Required for Self-RAG model download
 """
 
@@ -46,6 +52,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from baselines.full_baseline_interface import compute_exact_match, compute_f1
 from baselines.full_selfrag_adapter import FullSelfRAGAdapter
 from baselines.full_ketrag_adapter import FullKETRAGAdapter
+from baselines.full_vanillarag_adapter import FullVanillaRAGAdapter
+from baselines.full_hipporag_adapter import FullHippoRAGAdapter
 
 
 def load_hotpotqa_data(data_path: str, max_samples: int = None) -> List[Dict[str, Any]]:
@@ -275,7 +283,7 @@ def main():
     parser.add_argument(
         "--baselines",
         nargs='+',
-        choices=['selfrag', 'ketrag', 'all'],
+        choices=['selfrag', 'ketrag', 'vanillarag', 'hipporag', 'all'],
         default=['all'],
         help="Which baselines to evaluate"
     )
@@ -341,6 +349,52 @@ def main():
         help="GPU memory utilization fraction for Self-RAG (default 0.5)"
     )
 
+    # Vanilla RAG options
+    parser.add_argument(
+        "--vanillarag_model",
+        type=str,
+        default="gpt-4o-mini",
+        help="Model to use for Vanilla RAG (OpenAI model name)"
+    )
+    parser.add_argument(
+        "--vanillarag_top_k",
+        type=int,
+        default=5,
+        help="Number of chunks to retrieve for Vanilla RAG"
+    )
+
+    # HippoRAG options
+    parser.add_argument(
+        "--hipporag_model",
+        type=str,
+        default="gpt-4o-mini",
+        help="Model to use for HippoRAG (OpenAI model name or local model)"
+    )
+    parser.add_argument(
+        "--hipporag_embedding_model",
+        type=str,
+        default="nvidia/NV-Embed-v2",
+        help="Embedding model for HippoRAG (nvidia/NV-Embed-v2, GritLM, Contriever)"
+    )
+    parser.add_argument(
+        "--hipporag_num_retrieve",
+        type=int,
+        default=5,
+        help="Number of passages to retrieve for HippoRAG"
+    )
+    parser.add_argument(
+        "--hipporag_save_dir",
+        type=str,
+        default=None,
+        help="Directory to save HippoRAG outputs (default: temp dir)"
+    )
+    parser.add_argument(
+        "--hipporag_local_base_url",
+        type=str,
+        default=None,
+        help="Base URL for local vLLM server (e.g., http://localhost:8000/v1)"
+    )
+
     args = parser.parse_args()
 
     # Normalize device format (handle both "3" and "cuda:3")
@@ -349,7 +403,7 @@ def main():
 
     # Expand 'all' to all baselines
     if 'all' in args.baselines:
-        args.baselines = ['selfrag', 'ketrag']
+        args.baselines = ['selfrag', 'ketrag', 'vanillarag', 'hipporag']
 
     # Load data
     print(f"Loading data from: {args.data_path}")
@@ -360,8 +414,10 @@ def main():
     api_key = None
     if not args.use_local_llm:
         api_key = os.getenv("OPENAI_API_KEY")
-        if 'ketrag' in args.baselines and not api_key:
-            print("ERROR: KET-RAG requires OPENAI_API_KEY when not using --use_local_llm")
+        openai_baselines = {'ketrag', 'vanillarag', 'hipporag'}
+        needs_api_key = openai_baselines & set(args.baselines)
+        if needs_api_key and not api_key:
+            print(f"ERROR: {', '.join(needs_api_key)} require(s) OPENAI_API_KEY when not using --use_local_llm")
             sys.exit(1)
 
     # Evaluate each baseline
@@ -396,6 +452,32 @@ def main():
                     local_llm_device=args.local_llm_device,
                     load_in_8bit=args.load_in_8bit,
                     load_in_4bit=args.load_in_4bit,
+                )
+            elif baseline_name == 'vanillarag':
+                baseline_system = FullVanillaRAGAdapter(
+                    api_key=api_key,
+                    model=args.vanillarag_model,
+                    temperature=0.0,
+                    max_tokens=500,
+                    top_k=args.vanillarag_top_k,
+                    use_local_llm=args.use_local_llm,
+                    local_llm_model=args.local_llm_model,
+                    local_llm_device=args.local_llm_device,
+                    load_in_8bit=args.load_in_8bit,
+                    load_in_4bit=args.load_in_4bit,
+                )
+            elif baseline_name == 'hipporag':
+                baseline_system = FullHippoRAGAdapter(
+                    api_key=api_key,
+                    model=args.hipporag_model,
+                    embedding_model=args.hipporag_embedding_model,
+                    temperature=0.0,
+                    max_tokens=500,
+                    num_to_retrieve=args.hipporag_num_retrieve,
+                    save_dir=args.hipporag_save_dir,
+                    use_local_llm=args.use_local_llm,
+                    local_llm_base_url=args.hipporag_local_base_url,
+                    local_llm_model=args.local_llm_model,
                 )
             else:
                 print(f"Unknown baseline: {baseline_name}")
