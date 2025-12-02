@@ -35,14 +35,51 @@ from baselines.full_baseline_interface import (
 from baselines.local_llm_wrapper import LocalLLMWrapper
 
 try:
-    # KET-RAG uses GraphRAG as a base, so we import from graphrag
-    from graphrag.query.llm.oai.chat_openai import ChatOpenAI
-    from graphrag.query.llm.oai.typing import OpenAIClientTypes
+    # KET-RAG uses GraphRAG as a base, so we import from graphrag 2.7.0
+    from graphrag.config.enums import ModelType
+    from graphrag.config.models.language_model_config import LanguageModelConfig
+    from graphrag.language_model.manager import ModelManager
     import networkx as nx
     KETRAG_AVAILABLE = True
 except ImportError as e:
     KETRAG_AVAILABLE = False
     KETRAG_IMPORT_ERROR = str(e)
+
+
+class OpenAILLMWrapper:
+    """Wrapper for GraphRAG 2.7.0 chat model to provide compatible generate() method."""
+
+    def __init__(self, chat_model):
+        self.chat_model = chat_model
+
+    def generate(self, messages, temperature=0.0, max_tokens=500, **kwargs):
+        """Generate a response using the chat model."""
+        # Convert messages format if needed
+        if isinstance(messages, list) and len(messages) > 0:
+            if isinstance(messages[0], dict) and "content" in messages[0]:
+                # Extract the content from the messages
+                prompt = messages[0]["content"]
+            else:
+                prompt = str(messages[0])
+        else:
+            prompt = str(messages)
+
+        # Call the GraphRAG 2.7.0 chat model
+        # The model returns a response object, extract the text
+        response = self.chat_model.generate(
+            messages=prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **kwargs
+        )
+
+        # Return the response text
+        if hasattr(response, 'text'):
+            return response.text
+        elif hasattr(response, 'content'):
+            return response.content
+        else:
+            return str(response)
 
 
 class SkeletonKG:
@@ -203,12 +240,21 @@ class FullKETRAGAdapter(BaselineSystem):
                     "or use use_local_llm=True for local models."
                 )
             print(f"  [KET-RAG] Using OpenAI: {model}")
-            self.llm = ChatOpenAI(
+            # GraphRAG 2.7.0 API for chat model
+            chat_config = LanguageModelConfig(
                 api_key=self.api_key,
+                type=ModelType.Chat,
+                model_provider="openai",
                 model=self.model,
-                api_type=OpenAIClientTypes.OpenAI,
                 max_retries=3,
             )
+            self.llm_raw = ModelManager().get_or_create_chat_model(
+                name="ketrag_adapter",
+                model_type=ModelType.Chat,
+                config=chat_config,
+            )
+            # Wrap in a compatibility layer for generate() method
+            self.llm = OpenAILLMWrapper(self.llm_raw)
 
     def _compute_chunk_importance(self, chunks: List[str]) -> List[float]:
         """

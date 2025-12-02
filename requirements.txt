@@ -22,7 +22,7 @@ wandb>=0.15.0
 psutil>=5.9.0
 
 # Data processing
-pandas>=2.2.3
+pandas>=2.2.3  # Compatible with graphrag 2.7.0
 pyarrow>=17.0.0  # Compatible with graphrag 2.7.0
 faiss-cpu>=1.7.4  # For efficient similarity search
 # faiss-gpu  # Uncomment for GPU support if needed
@@ -46,8 +46,8 @@ safetensors>=0.3.0
 sentence-transformers>=2.2.0
 
 # Full baseline systems (GraphRAG, KET-RAG, Self-RAG)
-# Note: GraphRAG 2.7.0 should be installed via: pip install -e ./graphrag
-# This ensures compatibility with all dependencies below
+# Note: Install GraphRAG 2.7.0 from local directory: pip install -e ./graphrag
+# graphrag 2.7.0 installed from ./graphrag directory
 openai>=1.68.0  # Compatible with graphrag 2.7.0 and litellm
 tiktoken>=0.11.0  # Compatible with graphrag 2.7.0
 networkx>=3.4.2
@@ -72,3 +72,6 @@ spacy>=3.8.4
 
 # Download spaCy model after installation:
 # python -m spacy download en_core_web_sm
+
+# HippoRAG for baseline comparison
+hipporag>=0.1.0

@@ -1,5 +1,6 @@
 #!/bin/bash
 # Installation script for full baseline systems
+# Supports: Self-RAG, KET-RAG, Vanilla RAG, HippoRAG
 
 set -e  # Exit on error
 
@@ -107,20 +108,31 @@ poetry install --quiet
 cd - > /dev/null
 echo "✓ KET-RAG installed successfully"
 
-# Install scikit-learn for KET-RAG PageRank
-echo ""
-echo "------------------------------------------"
-echo "Installing scikit-learn for KET-RAG"
-echo "------------------------------------------"
-pip install scikit-learn --quiet
-echo "✓ scikit-learn installed successfully"
-
 # Install vllm for Self-RAG (if not already installed)
 echo ""
 echo "------------------------------------------"
 echo "Installing vllm for Self-RAG"
 echo "------------------------------------------"
 pip install vllm --quiet || echo "Warning: vllm installation may require CUDA. You may need to install manually."
+
+# Install HippoRAG
+echo ""
+echo "------------------------------------------"
+echo "Installing HippoRAG"
+echo "------------------------------------------"
+echo "Installing HippoRAG via pip..."
+pip install hipporag --quiet
+echo "✓ HippoRAG installed successfully"
+
+# Install additional dependencies for Vanilla RAG and HippoRAG
+echo ""
+echo "------------------------------------------"
+echo "Installing additional dependencies"
+echo "------------------------------------------"
+echo "Installing scikit-learn for Vanilla RAG and KET-RAG..."
+pip install scikit-learn --quiet || echo "✓ scikit-learn already installed"
+echo "Installing numpy and other ML dependencies..."
+pip install numpy scipy --quiet || echo "✓ numpy and scipy already installed"
 
 echo ""
 echo "=========================================="
@@ -129,12 +141,12 @@ echo "=========================================="
 echo ""
 echo "Next steps:"
 echo "1. Set environment variables:"
-echo "   export GRAPHRAG_API_KEY=<your_openai_key>  # For GraphRAG and KET-RAG"
-echo "   export HF_TOKEN=<your_hf_token>             # For Self-RAG model download"
+echo "   export OPENAI_API_KEY=<your_openai_key>  # For KET-RAG, Vanilla RAG, HippoRAG (if not using local LLM)"
+echo "   export HF_TOKEN=<your_hf_token>          # For Self-RAG model download"
 echo ""
 echo "2. Test installation:"
-echo "   python -c 'from baselines import FullGraphRAGAdapter, FullSelfRAGAdapter, FullKETRAGAdapter; print(\"✓ All adapters imported successfully\")'"
+echo "   python -c 'from baselines.full_selfrag_adapter import FullSelfRAGAdapter; from baselines.full_ketrag_adapter import FullKETRAGAdapter; from baselines.full_vanillarag_adapter import FullVanillaRAGAdapter; from baselines.full_hipporag_adapter import FullHippoRAGAdapter; print(\"✓ All adapters imported successfully\")'"
 echo ""
 echo "3. Run evaluation:"
-echo "   python eval_full_baselines.py --data_path data/hotpotqa_dev_shards/shard_0.jsonl --max_samples 10"
+echo "   python experiments/eval_full_baselines.py --data_path data/hotpotqa_dev_shards/shard_0.jsonl --max_samples 10 --baselines vanillarag ketrag selfrag hipporag"
 echo ""
