@@ -14,6 +14,7 @@ from baselines.full_baseline_interface import (
     LatencyTracker,
 )
 from baselines.local_llm_wrapper import LocalLLMWrapper
+from baselines.prompt_utils import build_trident_style_prompt, extract_trident_style_answer
 
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
@@ -264,24 +265,17 @@ class FullVanillaRAGAdapter(BaselineSystem):
             # Retrieve relevant chunks
             retrieval_results = self.retriever.retrieve(question, top_k=self.top_k)
 
-            # Format context for LLM
+            # Format retrieved chunks as passages for Trident-style prompt
+            passages = []
             if retrieval_results:
-                context_str = "\n\n".join([
-                    f"[{i+1}] {chunk_text[:500]}"
-                    for i, (_, _, chunk_text) in enumerate(retrieval_results)
-                ])
+                for idx, score, chunk_text in retrieval_results:
+                    passages.append({"text": chunk_text})
             else:
-                context_str = "(no relevant context found)"
+                # If no results, add empty passage
+                passages.append({"text": "(no relevant context found)"})
 
-            # Generate answer
-            answer_prompt = f"""Answer the following question based on the provided context.
-
-Question: {question}
-
-Context:
-{context_str}
-
-Answer with a single short phrase or sentence."""
+            # Generate answer using Trident's standardized prompt format
+            answer_prompt = build_trident_style_prompt(question, passages)
 
             response = self.llm.generate(
                 messages=[{"role": "user", "content": answer_prompt}],
@@ -300,6 +294,9 @@ Answer with a single short phrase or sentence."""
                 "answer_generation"
             )
 
+            # Extract answer using Trident's standardized extraction
+            answer = extract_trident_style_answer(response)
+
             # Prepare selected passages
             selected_passages = [
                 {
@@ -311,7 +308,7 @@ Answer with a single short phrase or sentence."""
             ]
 
             return BaselineResponse(
-                answer=response.strip(),
+                answer=answer,  # Use extracted answer with Trident's standardized extraction
                 tokens_used=token_tracker.total_tokens,
                 latency_ms=latency_tracker.get_total_latency(),
                 selected_passages=selected_passages,

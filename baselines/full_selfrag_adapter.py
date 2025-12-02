@@ -14,6 +14,7 @@ from baselines.full_baseline_interface import (
     TokenTracker,
     LatencyTracker,
 )
+from baselines.prompt_utils import extract_trident_style_answer
 
 try:
     from vllm import LLM, SamplingParams
@@ -151,13 +152,16 @@ class FullSelfRAGAdapter(BaselineSystem):
         """
         Extract final answer from Self-RAG generation with reflection tokens.
 
+        Uses Trident's standardized answer extraction after removing Self-RAG
+        specific reflection tokens.
+
         Args:
             generation: Raw generation from model (includes reflection tokens)
 
         Returns:
             Extracted answer text
         """
-        # Remove all reflection tokens
+        # Remove all Self-RAG specific reflection tokens
         answer = generation
 
         # Remove retrieval tokens
@@ -186,10 +190,9 @@ class FullSelfRAGAdapter(BaselineSystem):
         # Strip whitespace
         answer = answer.strip()
 
-        # Take first sentence or first line as answer
-        sentences = answer.split('.')
-        if sentences:
-            answer = sentences[0].strip()
+        # Use Trident's standardized answer extraction
+        # This looks for "Final answer:" format or falls back to prefix removal
+        answer = extract_trident_style_answer(answer)
 
         return answer
 
@@ -210,6 +213,11 @@ class FullSelfRAGAdapter(BaselineSystem):
     ) -> BaselineResponse:
         """
         Answer a question using Self-RAG (Aligned with Separated Metrics).
+
+        Note: Self-RAG uses its native prompt format ("### Instruction:", etc.)
+        which is required for the fine-tuned model to work correctly. Changing
+        the prompt format would break Self-RAG's core functionality. Only answer
+        extraction is standardized to match Trident for fair comparison.
 
         Metrics reported:
         - tokens_used, latency_ms: QUERY ONLY (Self-RAG has no indexing phase)
