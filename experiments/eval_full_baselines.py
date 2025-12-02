@@ -440,6 +440,7 @@ def main():
                     temperature=0.0,
                     provide_context=True,  # Provide dataset context
                     gpu_memory_utilization=args.selfrag_gpu_memory_utilization,
+                    device=args.local_llm_device,  # Use specified GPU device
                 )
             elif baseline_name == 'ketrag':
                 from baselines.full_ketrag_adapter import FullKETRAGAdapter
