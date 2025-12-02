@@ -25,6 +25,11 @@ Environment variables:
     HF_TOKEN: Required for Self-RAG model download
 """
 
+import multiprocessing
+# IMPORTANT: Set multiprocessing start method to 'spawn' before any CUDA operations
+# This fixes the "Cannot re-initialize CUDA in forked subprocess" error
+multiprocessing.set_start_method('spawn', force=True)
+
 import argparse
 import json
 import os
