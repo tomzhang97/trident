@@ -46,10 +46,14 @@ class FullSelfRAGAdapter(BaselineSystem):
     - [Utility:1-5]: Utility score
     """
 
-    # Self-RAG special tokens
-    RETRIEVAL_TOKENS = ["[Retrieval]", "[No Retrieval]"]
+    # Self-RAG special tokens (matching FlashRAG's implementation)
+    RETRIEVAL_TOKENS = ["[Retrieval]", "[No Retrieval]", "[Continue to Use Evidence]"]
     RELEVANCE_TOKENS = ["[Relevant]", "[Irrelevant]"]
-    SUPPORT_TOKENS = ["[Fully supported]", "[Partially supported]", "[No support]"]
+    SUPPORT_TOKENS = [
+        "[Fully supported]",
+        "[Partially supported]",
+        "[No support / Contradictory]"  # Correct token format with "/ Contradictory"!
+    ]
     UTILITY_TOKENS = [f"[Utility:{i}]" for i in range(1, 6)]
 
     def __init__(
