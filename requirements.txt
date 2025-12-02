@@ -24,8 +24,8 @@ psutil>=5.9.0
 # Data processing
 pandas>=2.2.3  # Compatible with graphrag 2.7.0
 pyarrow>=17.0.0  # Compatible with graphrag 2.7.0
-faiss-cpu>=1.7.4  # For efficient similarity search
-# faiss-gpu  # Uncomment for GPU support if needed
+# faiss-cpu>=1.7.4  # For efficient similarity search
+faiss-gpu  # Uncomment for GPU support if needed
 
 # Testing
 pytest>=8.3.4  # Compatible with graphrag 2.7.0 and pytest-asyncio 0.24.0
@@ -74,4 +74,5 @@ spacy>=3.8.4
 # python -m spacy download en_core_web_sm
 
 # HippoRAG for baseline comparison
-hipporag>=0.1.0
+
+hipporag
