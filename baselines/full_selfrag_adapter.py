@@ -60,6 +60,7 @@ class FullSelfRAGAdapter(BaselineSystem):
         top_p: float = 1.0,
         use_critic: bool = True,
         provide_context: bool = True,
+        gpu_memory_utilization: float = 0.5,
         **kwargs
     ):
         """
@@ -75,6 +76,7 @@ class FullSelfRAGAdapter(BaselineSystem):
             top_p: Top-p sampling
             use_critic: Whether to use critic tokens in generation
             provide_context: Whether to provide context to model (vs let it decide to retrieve)
+            gpu_memory_utilization: GPU memory fraction to use (default 0.5 = 50%)
             **kwargs: Additional config
         """
         super().__init__(name="selfrag", **kwargs)
@@ -100,6 +102,7 @@ class FullSelfRAGAdapter(BaselineSystem):
             download_dir=self.download_dir,
             dtype="half",  # Use FP16 for efficiency
             tensor_parallel_size=1,
+            gpu_memory_utilization=gpu_memory_utilization,  # Reduce from default 0.9
         )
 
         # Sampling params
