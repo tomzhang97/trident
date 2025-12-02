@@ -33,6 +33,7 @@ from baselines.full_baseline_interface import (
     LatencyTracker,
 )
 from baselines.local_llm_wrapper import LocalLLMWrapper
+from baselines.prompt_utils import build_trident_style_prompt, extract_trident_style_answer
 
 try:
     # KET-RAG uses GraphRAG as a base, so we import from graphrag 2.7.0
@@ -481,19 +482,23 @@ Relationships:"""
             keyword_chunk_indices = keyword_index.retrieve_chunks(question, self.max_keyword_chunks)
             keyword_chunks_text = [chunks[i] for i in keyword_chunk_indices if i < len(chunks)]
 
-            # 6. Answer Generation
-            combined_context = skeleton_context + "\n\nRelevant chunks:\n" + "\n\n".join(
-                f"[{i}] {text}" for i, text in enumerate(keyword_chunks_text)
-            )
+            # 6. Answer Generation using Trident's standardized prompt format
+            # Combine skeleton KG facts and retrieved chunks into passages
+            passages = []
 
-            answer_prompt = f"""You are a question answering assistant using knowledge from both a knowledge graph and text chunks.
+            # Add skeleton context as first passage if available
+            if relevant_triples:
+                skeleton_text = "Key facts from knowledge graph:\n" + "\n".join(
+                    f"- {s} {r} {o}" for s, r, o in relevant_triples
+                )
+                passages.append({"text": skeleton_text})
 
-Question: {question}
+            # Add retrieved chunks as additional passages
+            for chunk_text in keyword_chunks_text:
+                passages.append({"text": chunk_text})
 
-Knowledge:
-{combined_context}
-
-Answer with a single short phrase or sentence."""
+            # Build Trident-style prompt (matches Trident's format exactly)
+            answer_prompt = build_trident_style_prompt(question, passages)
 
             response = self.llm.generate(
                 messages=[{"role": "user", "content": answer_prompt}],
@@ -508,11 +513,14 @@ Answer with a single short phrase or sentence."""
             c_tok = len(response.split()) * 1.3
             query_token_tracker.add_call(int(p_tok), int(c_tok), "query_generation")
 
+            # Extract answer using Trident's standardized extraction
+            answer = extract_trident_style_answer(response)
+
             # Prepare passages
             selected_passages = [{"text": chunks[i][:200], "chunk_idx": i} for i in keyword_chunk_indices[:5]]
 
             return BaselineResponse(
-                answer=response.strip(),
+                answer=answer,  # Use extracted answer with Trident's standardized extraction
                 # PRIMARY METRICS: Query Only
                 tokens_used=query_token_tracker.total_tokens,
                 latency_ms=query_latency_tracker.get_total_latency(),

@@ -13,6 +13,7 @@ from baselines.full_baseline_interface import (
     TokenTracker,
     LatencyTracker,
 )
+from baselines.prompt_utils import extract_trident_style_answer
 
 try:
     from hipporag import HippoRAG
@@ -154,6 +155,10 @@ class FullHippoRAGAdapter(BaselineSystem):
         2. Retrieve relevant passages using personalized PageRank
         3. Generate answer conditioned on retrieved context
 
+        Note: HippoRAG uses its library's native prompt format (not modified)
+        to preserve the original system's behavior. Only answer extraction
+        is standardized to match Trident for fair comparison.
+
         Metrics Separation:
         - tokens_used, latency_ms: Query-only metrics (PRIMARY)
         - stats['indexing_*']: Offline indexing costs
@@ -239,7 +244,11 @@ class FullHippoRAGAdapter(BaselineSystem):
             # Extract answer from results
             if rag_results and len(rag_results) > 0:
                 result = rag_results[0]
-                answer = result.get("answer", "").strip()
+                raw_answer = result.get("answer", "").strip()
+
+                # Use Trident's standardized answer extraction
+                # HippoRAG uses its native prompt, but we standardize extraction
+                answer = extract_trident_style_answer(raw_answer)
 
                 # Get retrieved passages if available
                 retrieved_passages = result.get("retrieved_passages", [])
