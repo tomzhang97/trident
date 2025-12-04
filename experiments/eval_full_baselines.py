@@ -50,10 +50,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 
 from baselines.full_baseline_interface import compute_exact_match, compute_f1
-from baselines.full_selfrag_adapter import FullSelfRAGAdapter
-from baselines.full_ketrag_adapter import FullKETRAGAdapter
-from baselines.full_vanillarag_adapter import FullVanillaRAGAdapter
-from baselines.full_hipporag_adapter import FullHippoRAGAdapter
+
+# Note: Baseline adapters are imported lazily in the evaluation loop
+# to avoid loading heavy dependencies (like HippoRAG) when not needed.
+# This prevents multiprocessing conflicts with libraries that initialize
+# at import time.
 
 
 def load_hotpotqa_data(data_path: str, max_samples: int = None) -> List[Dict[str, Any]]:
@@ -429,16 +430,20 @@ def main():
         print(f"{'#'*80}\n")
 
         try:
-            # Initialize baseline system
+            # Initialize baseline system with lazy imports
+            # (avoids loading unused dependencies that may conflict with multiprocessing)
             if baseline_name == 'selfrag':
+                from baselines.full_selfrag_adapter import FullSelfRAGAdapter
                 baseline_system = FullSelfRAGAdapter(
                     model_name=args.selfrag_model,
                     max_tokens=args.selfrag_max_tokens,
                     temperature=0.0,
                     provide_context=True,  # Provide dataset context
                     gpu_memory_utilization=args.selfrag_gpu_memory_utilization,
+                    device=args.local_llm_device,  # Use specified GPU device
                 )
             elif baseline_name == 'ketrag':
+                from baselines.full_ketrag_adapter import FullKETRAGAdapter
                 baseline_system = FullKETRAGAdapter(
                     api_key=api_key,
                     model=args.ketrag_model,
@@ -454,6 +459,7 @@ def main():
                     load_in_4bit=args.load_in_4bit,
                 )
             elif baseline_name == 'vanillarag':
+                from baselines.full_vanillarag_adapter import FullVanillaRAGAdapter
                 baseline_system = FullVanillaRAGAdapter(
                     api_key=api_key,
                     model=args.vanillarag_model,
@@ -467,6 +473,7 @@ def main():
                     load_in_4bit=args.load_in_4bit,
                 )
             elif baseline_name == 'hipporag':
+                from baselines.full_hipporag_adapter import FullHippoRAGAdapter
                 baseline_system = FullHippoRAGAdapter(
                     api_key=api_key,
                     model=args.hipporag_model,

@@ -46,10 +46,14 @@ class FullSelfRAGAdapter(BaselineSystem):
     - [Utility:1-5]: Utility score
     """
 
-    # Self-RAG special tokens
-    RETRIEVAL_TOKENS = ["[Retrieval]", "[No Retrieval]"]
+    # Self-RAG special tokens (matching FlashRAG's implementation)
+    RETRIEVAL_TOKENS = ["[Retrieval]", "[No Retrieval]", "[Continue to Use Evidence]"]
     RELEVANCE_TOKENS = ["[Relevant]", "[Irrelevant]"]
-    SUPPORT_TOKENS = ["[Fully supported]", "[Partially supported]", "[No support]"]
+    SUPPORT_TOKENS = [
+        "[Fully supported]",
+        "[Partially supported]",
+        "[No support / Contradictory]"  # Correct token format with "/ Contradictory"!
+    ]
     UTILITY_TOKENS = [f"[Utility:{i}]" for i in range(1, 6)]
 
     def __init__(
@@ -62,6 +66,7 @@ class FullSelfRAGAdapter(BaselineSystem):
         use_critic: bool = True,
         provide_context: bool = True,
         gpu_memory_utilization: float = 0.5,
+        device: Optional[str] = None,
         **kwargs
     ):
         """
@@ -78,6 +83,8 @@ class FullSelfRAGAdapter(BaselineSystem):
             use_critic: Whether to use critic tokens in generation
             provide_context: Whether to provide context to model (vs let it decide to retrieve)
             gpu_memory_utilization: GPU memory fraction to use (default 0.5 = 50%)
+            device: GPU device to use (e.g., "cuda:0", "cuda:2", or "0", "2")
+                    If None, uses default CUDA device
             **kwargs: Additional config
         """
         super().__init__(name="selfrag", **kwargs)
@@ -96,6 +103,18 @@ class FullSelfRAGAdapter(BaselineSystem):
         self.use_critic = use_critic
         self.provide_context = provide_context
 
+        # Set CUDA device if specified
+        # vLLM uses CUDA_VISIBLE_DEVICES to control GPU selection
+        if device is not None:
+            # Normalize device format: "cuda:2" -> "2", "2" -> "2"
+            if device.startswith("cuda:"):
+                device_id = device.split(":")[-1]
+            else:
+                device_id = device
+
+            print(f"Setting CUDA_VISIBLE_DEVICES={device_id} for Self-RAG")
+            os.environ["CUDA_VISIBLE_DEVICES"] = device_id
+
         # Load model
         print(f"Loading Self-RAG model: {model_name}...")
         self.model = LLM(
@@ -103,7 +122,7 @@ class FullSelfRAGAdapter(BaselineSystem):
             download_dir=self.download_dir,
             dtype="half",  # Use FP16 for efficiency
             tensor_parallel_size=1,
-            gpu_memory_utilization=gpu_memory_utilization,  # Reduce from default 0.9
+            gpu_memory_utilization=gpu_memory_utilization,
         )
 
         # Sampling params
