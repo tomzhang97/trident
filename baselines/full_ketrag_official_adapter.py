@@ -264,16 +264,19 @@ class FullKETRAGAdapter(BaselineSystem):
             # Build primary prompt (default: Trident standardized)
             if self.prompt_style == "trident":
                 answer_prompt = build_trident_style_prompt(question, passages)
+                answer_messages = [{"role": "user", "content": answer_prompt}]
                 extract_answer_fn = extract_trident_style_answer
             elif self.prompt_style == "original":
-                answer_prompt = build_ketrag_original_prompt(question, ketrag_context)
+                answer_messages = build_ketrag_original_prompt(question, ketrag_context)
+                # For token accounting/logging, flatten the messages
+                answer_prompt = "\n\n".join(m.get("content", "") for m in answer_messages)
                 extract_answer_fn = extract_ketrag_original_answer
             else:
                 raise ValueError(f"Unknown prompt_style={self.prompt_style}. Choose 'trident' or 'original'.")
 
             # Generate with user-specified model
             response = self.llm.generate(
-                messages=[{"role": "user", "content": answer_prompt}],
+                messages=answer_messages,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
             )
@@ -297,15 +300,17 @@ class FullKETRAGAdapter(BaselineSystem):
                 alt_style = "original" if self.prompt_style == "trident" else "trident"
 
                 if alt_style == "original":
-                    comparison_prompt = build_ketrag_original_prompt(question, ketrag_context)
+                    comparison_messages = build_ketrag_original_prompt(question, ketrag_context)
+                    comparison_prompt = "\n\n".join(m.get("content", "") for m in comparison_messages)
                     comparison_extractor = extract_ketrag_original_answer
                 else:
                     comparison_prompt = build_trident_style_prompt(question, passages)
+                    comparison_messages = [{"role": "user", "content": comparison_prompt}]
                     comparison_extractor = extract_trident_style_answer
 
                 latency_tracker.start()
                 comparison_response = self.llm.generate(
-                    messages=[{"role": "user", "content": comparison_prompt}],
+                    messages=comparison_messages,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                 )

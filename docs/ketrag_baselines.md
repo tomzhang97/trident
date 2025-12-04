@@ -173,13 +173,13 @@ python experiments/eval_full_baselines.py \
   --ketrag_compare_original_prompt
 ```
 
-The default `--ketrag_prompt_style original` keeps the raw KET-RAG context and
-simply appends the question/`Answer:` cue without extra instructions. Add
+The default `--ketrag_prompt_style original` now mirrors the official
+KET-RAG chat setup: the system prompt is `LOCAL_SEARCH_EXACT_SYSTEM_PROMPT`
+with the retrieved tables injected, and the user turn is only the question. Add
 `--ketrag_prompt_style trident` only if you want to force the standardized
-Trident multi-hop prompt. Use
-`--ketrag_compare_original_prompt` to emit both generations (primary +
-alternate) in the stats so you can see whether the keyword 0.5 retrieval or the
-prompting is responsible for poor scores.
+Trident multi-hop prompt. Use `--ketrag_compare_original_prompt` to emit both
+generations (primary + alternate) in the stats so you can see whether the
+keyword 0.5 retrieval or the prompting is responsible for poor scores.
 
 ### Implementation Details
 
