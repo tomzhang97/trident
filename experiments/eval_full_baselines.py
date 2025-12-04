@@ -323,8 +323,8 @@ def main():
         "--ketrag_prompt_style",
         type=str,
         choices=["trident", "original"],
-        default="trident",
-        help="Prompt style for ketrag_official generation (trident=standardized, original=KET-RAG context)"
+        default="original",
+        help="Prompt style for ketrag_official generation (original=KET-RAG context, trident=standardized)"
     )
     parser.add_argument(
         "--ketrag_compare_original_prompt",

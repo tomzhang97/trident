@@ -170,15 +170,16 @@ python experiments/eval_full_baselines.py \
   --baselines ketrag_official \
   --ketrag_context_file KET-RAG/ragtest-hotpot/output/ragtest-hotpot-keyword-0.5.json \
   --ketrag_model gpt-4o-mini \
-  --ketrag_prompt_style trident \
   --ketrag_compare_original_prompt
 ```
 
-Use `--ketrag_prompt_style original` if you want the model to answer directly
-over the raw KET-RAG context string instead of the standardized Trident prompt.
-Add `--ketrag_compare_original_prompt` to emit both generations (primary +
-alternate) in the stats so you can see whether the keyword 0.5 retrieval or the
-prompting is responsible for poor scores.
+The default `--ketrag_prompt_style original` now mirrors the official
+KET-RAG chat setup: the system prompt is `LOCAL_SEARCH_EXACT_SYSTEM_PROMPT`
+with the retrieved tables injected, and the user turn is only the question. Add
+`--ketrag_prompt_style trident` only if you want to force the standardized
+Trident multi-hop prompt. Use `--ketrag_compare_original_prompt` to emit both
+generations (primary + alternate) in the stats so you can see whether the
+keyword 0.5 retrieval or the prompting is responsible for poor scores.
 
 ### Implementation Details
 
@@ -201,9 +202,9 @@ prompting is responsible for poor scores.
 - ✅ All text preprocessing
 
 **What's standardized** (for fair comparison):
-- Prompt format (Trident's multi-hop format)
+- Prompt format (Trident's multi-hop format when explicitly requested)
 - LLM model (user-specified)
-- Answer extraction (Trident's logic)
+ - Answer extraction (Trident's logic when standardized; minimal stripping for the original prompt)
 - Token/latency measurement
 
 ## Comparison Table

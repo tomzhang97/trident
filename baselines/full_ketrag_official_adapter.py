@@ -39,6 +39,7 @@ from baselines.local_llm_wrapper import LocalLLMWrapper
 from baselines.prompt_utils import (
     build_ketrag_original_prompt,
     build_trident_style_prompt,
+    extract_ketrag_original_answer,
     extract_trident_style_answer,
 )
 
@@ -60,16 +61,13 @@ class OpenAILLMWrapper:
 
     def generate(self, messages, temperature=0.0, max_tokens=500, **kwargs):
         """Generate a response using the chat model."""
-        if isinstance(messages, list) and len(messages) > 0:
-            if isinstance(messages[0], dict) and "content" in messages[0]:
-                prompt = messages[0]["content"]
-            else:
-                prompt = str(messages[0])
+        if isinstance(messages, list) and len(messages) > 0 and isinstance(messages[0], dict):
+            chat_messages = messages
         else:
-            prompt = str(messages)
+            chat_messages = [{"role": "user", "content": str(messages)}]
 
         response = self.chat_model.generate(
-            messages=prompt,
+            messages=chat_messages,
             temperature=temperature,
             max_tokens=max_tokens,
             **kwargs
@@ -108,7 +106,7 @@ class FullKETRAGAdapter(BaselineSystem):
         local_llm_device: str = "cuda:0",
         load_in_8bit: bool = False,
         load_in_4bit: bool = False,
-        prompt_style: str = "trident",
+        prompt_style: str = "original",
         compare_original_prompt: bool = False,
         **kwargs
     ):
@@ -263,14 +261,19 @@ class FullKETRAGAdapter(BaselineSystem):
             # Build primary prompt (default: Trident standardized)
             if self.prompt_style == "trident":
                 answer_prompt = build_trident_style_prompt(question, passages)
+                answer_messages = [{"role": "user", "content": answer_prompt}]
+                extract_answer_fn = extract_trident_style_answer
             elif self.prompt_style == "original":
-                answer_prompt = build_ketrag_original_prompt(question, ketrag_context)
+                answer_messages = build_ketrag_original_prompt(question, ketrag_context)
+                # For token accounting/logging, flatten the messages
+                answer_prompt = "\n\n".join(m.get("content", "") for m in answer_messages)
+                extract_answer_fn = extract_ketrag_original_answer
             else:
                 raise ValueError(f"Unknown prompt_style={self.prompt_style}. Choose 'trident' or 'original'.")
 
             # Generate with user-specified model
             response = self.llm.generate(
-                messages=[{"role": "user", "content": answer_prompt}],
+                messages=answer_messages,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
             )
@@ -287,7 +290,44 @@ class FullKETRAGAdapter(BaselineSystem):
             )
 
             # STANDARDIZED: Extract answer with Trident's logic
-            answer = extract_trident_style_answer(response)
+            answer = extract_answer_fn(response)
+
+            # Optional: generate using the alternate prompt to compare behavior
+            if self.compare_original_prompt:
+                alt_style = "original" if self.prompt_style == "trident" else "trident"
+
+                if alt_style == "original":
+                    comparison_messages = build_ketrag_original_prompt(question, ketrag_context)
+                    comparison_prompt = "\n\n".join(m.get("content", "") for m in comparison_messages)
+                    comparison_extractor = extract_ketrag_original_answer
+                else:
+                    comparison_prompt = build_trident_style_prompt(question, passages)
+                    comparison_messages = [{"role": "user", "content": comparison_prompt}]
+                    comparison_extractor = extract_trident_style_answer
+
+                latency_tracker.start()
+                comparison_response = self.llm.generate(
+                    messages=comparison_messages,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                )
+                comparison_latency = latency_tracker.stop("comparison_answer_generation")
+
+                comp_prompt_tokens = len(comparison_prompt.split()) * 1.3
+                comp_completion_tokens = len(comparison_response.split()) * 1.3
+                token_tracker.add_call(
+                    int(comp_prompt_tokens),
+                    int(comp_completion_tokens),
+                    "comparison_generation",
+                )
+
+                comparison_stats = {
+                    "style": alt_style,
+                    "prompt": comparison_prompt,
+                    "raw_response": comparison_response,
+                    "latency_ms": comparison_latency,
+                    "extracted_answer": comparison_extractor(comparison_response),
+                }
 
             # Optional: generate using the alternate prompt to compare behavior
             if self.compare_original_prompt:

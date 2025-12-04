@@ -64,29 +64,65 @@ def build_trident_style_prompt(
     return prompt
 
 
-def build_ketrag_original_prompt(question: str, raw_context: str) -> str:
-    """Mimic the original KET-RAG answering format.
+KETRAG_SYSTEM_PROMPT = """
+---Role---
 
-    KET-RAG provides a single context string that mixes graph triples and
-    keyword passages ("-----Entities and Relationships-----" and
-    "-----Text source that may be relevant-----"). This helper keeps the
-    structure intact and adds light instructions so we can compare model
-    behavior between the standardized Trident prompt and the original
-    KET-RAG-style context.
+You are a helpful assistant responding to questions about data in the tables and supplementary materials provided.
+
+
+---Goal---
+
+Answer the user's question directly by extracting correct information from the data tables provided. The answer will be either a word, a phrase or a short sentence; the answer is supposed to be as short as possible.
+
+If the answer can not be inferred from the data provided, say "Insufficient information." Do not make anything up.
+
+For example, suppose the question is: "What country does the political movement started at the Christmas Meeting of 1888 seek sovereignty from?", your answer should be: "Denmark".
+
+Do not include information where the supporting evidence for it is not provided in the data tables.
+
+---Data tables---
+
+{context_data}
+
+---Goal---
+
+Answer the user's question directly by extracting correct information from the data tables provided. The answer will be either a word, a phrase or a short sentence; the answer is supposed to be as short as possible.
+
+If the answer can not be inferred from the data provided, say "Insufficient information." Do not make anything up.
+
+For example, suppose the question is: "What country does the political movement started at the Christmas Meeting of 1888 seek sovereignty from?", your answer should be: "Denmark".
+
+Do not include information where the supporting evidence for it is not provided in the data tables.
+"""
+
+
+def build_ketrag_original_prompt(question: str, raw_context: str) -> List[Dict[str, str]]:
+    """Reproduce the official KET-RAG chat prompt structure.
+
+    The official pipeline sends a system prompt (``LOCAL_SEARCH_EXACT_SYSTEM_PROMPT``)
+    with the retrieved tables and a separate user turn containing only the
+    question. We mirror that layout so answers follow the exact KET-RAG
+    formatting rather than the simplified Question/Answer header.
     """
 
-    instructions = (
-        "Use the provided KET-RAG context (entities/relationships and text "
-        "chunks) to answer the question. If the context is insufficient, "
-        "reply with: I cannot answer based on the given context."
-    )
+    system_prompt = KETRAG_SYSTEM_PROMPT.format(context_data=raw_context)
 
-    return (
-        f"{instructions}\n\n"
-        f"Context:\n{raw_context}\n\n"
-        f"Question: {question}\n"
-        "Answer:"
-    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question},
+    ]
+
+
+def extract_ketrag_original_answer(generated_text: str) -> str:
+    """Lightweight extraction for the original KET-RAG-style generations."""
+
+    answer = generated_text.strip()
+
+    # Remove a leading "Answer:" prefix if the model echoes it
+    if answer.lower().startswith("answer:"):
+        answer = answer[len("answer:"):].strip()
+
+    return answer
 
 
 def extract_trident_style_answer(generated_text: str) -> str:
