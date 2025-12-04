@@ -329,6 +329,39 @@ class FullKETRAGAdapter(BaselineSystem):
                     "extracted_answer": comparison_extractor(comparison_response),
                 }
 
+            # Optional: generate using the alternate prompt to compare behavior
+            if self.compare_original_prompt:
+                alt_style = "original" if self.prompt_style == "trident" else "trident"
+
+                if alt_style == "original":
+                    comparison_prompt = build_ketrag_original_prompt(question, ketrag_context)
+                else:
+                    comparison_prompt = build_trident_style_prompt(question, passages)
+
+                latency_tracker.start()
+                comparison_response = self.llm.generate(
+                    messages=[{"role": "user", "content": comparison_prompt}],
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                )
+                comparison_latency = latency_tracker.stop("comparison_answer_generation")
+
+                comp_prompt_tokens = len(comparison_prompt.split()) * 1.3
+                comp_completion_tokens = len(comparison_response.split()) * 1.3
+                token_tracker.add_call(
+                    int(comp_prompt_tokens),
+                    int(comp_completion_tokens),
+                    "comparison_generation",
+                )
+
+                comparison_stats = {
+                    "style": alt_style,
+                    "prompt": comparison_prompt,
+                    "raw_response": comparison_response,
+                    "latency_ms": comparison_latency,
+                    "extracted_answer": extract_trident_style_answer(comparison_response),
+                }
+
             return BaselineResponse(
                 answer=answer,
                 tokens_used=token_tracker.total_tokens,
