@@ -43,7 +43,7 @@ LOCAL_LLM_URL="${3:-}"  # Optional
 # Get absolute paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-KETRAG_DIR="$PROJECT_ROOT/KET-RAG"
+KETRAG_DIR="$PROJECT_ROOT/external_baselines/KET-RAG"
 KETRAG_OUTPUT_DIR="$KETRAG_DIR/$OUTPUT_DIR"
 
 echo "=================================================="
