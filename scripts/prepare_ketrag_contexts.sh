@@ -74,6 +74,26 @@ if ! command -v poetry &> /dev/null; then
     exit 1
 fi
 
+# Ensure KET-RAG is a valid Poetry project
+if [ ! -f "$KETRAG_DIR/pyproject.toml" ]; then
+    echo "ERROR: pyproject.toml not found in $KETRAG_DIR"
+    echo "Please ensure the KET-RAG repository is complete"
+    exit 1
+fi
+
+# Install dependencies if the virtual environment is not set up
+echo "[Setup] Installing KET-RAG dependencies via poetry (if needed)..."
+cd "$KETRAG_DIR"
+poetry install --no-interaction --no-root >/dev/null
+# Ensure required NLTK resources are available for keyword indexing
+poetry run python - <<'PY'
+import nltk
+
+for resource in ("stopwords", "punkt", "punkt_tab"):
+    nltk.download(resource, quiet=True)
+PY
+cd "$PROJECT_ROOT"
+
 # Step 1: Convert HotpotQA to KET-RAG format
 echo "[Step 1/4] Converting HotpotQA data to KET-RAG format..."
 cd "$PROJECT_ROOT"
@@ -234,7 +254,46 @@ else
 fi
 
 cd "$KETRAG_DIR"
-poetry run graphrag index --root "$OUTPUT_DIR/"
+# Work around a Typer/Click flag parsing bug by calling the indexing function directly
+set +e
+poetry run python - <<PY
+from pathlib import Path
+
+from graphrag.cli.index import index_cli
+from graphrag.index.emit.types import TableEmitterType
+from graphrag.logging import ReporterType
+
+index_cli(
+    root_dir=Path("$OUTPUT_DIR"),
+    verbose=False,
+    resume=None,
+    memprofile=False,
+    cache=True,
+    reporter=ReporterType.RICH,
+    config_filepath=None,
+    emit=[TableEmitterType.Parquet],
+    dry_run=False,
+    skip_validation=False,
+    output_dir=None,
+)
+PY
+INDEX_EXIT_CODE=$?
+set -e
+
+LOG_FILE="$KETRAG_OUTPUT_DIR/logs/indexing-engine.log"
+if [ $INDEX_EXIT_CODE -ne 0 ]; then
+    echo ""
+    echo "[Error] GraphRAG indexing failed (exit code: $INDEX_EXIT_CODE)"
+    if [ -f "$LOG_FILE" ]; then
+        echo "Showing last 40 lines of the indexing log: $LOG_FILE"
+        echo "--------------------------------------------------"
+        tail -n 40 "$LOG_FILE"
+        echo "--------------------------------------------------"
+    else
+        echo "No indexing log found at $LOG_FILE"
+    fi
+    exit $INDEX_EXIT_CODE
+fi
 
 # Step 4: Create contexts with keyword strategy
 echo ""
