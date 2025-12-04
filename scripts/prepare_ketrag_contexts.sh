@@ -85,6 +85,13 @@ fi
 echo "[Setup] Installing KET-RAG dependencies via poetry (if needed)..."
 cd "$KETRAG_DIR"
 poetry install --no-interaction --no-root >/dev/null
+# Ensure NLTK stopwords are available for keyword indexing
+poetry run python - <<'PY'
+import nltk
+
+# Download quietly; will no-op if already present
+nltk.download('stopwords', quiet=True)
+PY
 cd "$PROJECT_ROOT"
 
 # Step 1: Convert HotpotQA to KET-RAG format
