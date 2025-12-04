@@ -74,6 +74,19 @@ if ! command -v poetry &> /dev/null; then
     exit 1
 fi
 
+# Ensure KET-RAG is a valid Poetry project
+if [ ! -f "$KETRAG_DIR/pyproject.toml" ]; then
+    echo "ERROR: pyproject.toml not found in $KETRAG_DIR"
+    echo "Please ensure the KET-RAG repository is complete"
+    exit 1
+fi
+
+# Install dependencies if the virtual environment is not set up
+echo "[Setup] Installing KET-RAG dependencies via poetry (if needed)..."
+cd "$KETRAG_DIR"
+poetry install --no-interaction --no-root >/dev/null
+cd "$PROJECT_ROOT"
+
 # Step 1: Convert HotpotQA to KET-RAG format
 echo "[Step 1/4] Converting HotpotQA data to KET-RAG format..."
 cd "$PROJECT_ROOT"
