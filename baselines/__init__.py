@@ -1,13 +1,21 @@
 """Baseline systems for comparison with TRIDENT."""
 
-# Simplified baseline implementations (lightweight, no external dependencies)
-from .self_rag_system import SelfRAGSystem
-from .graphrag_system import GraphRAGSystem, SimpleGraphIndex
-from .ketrag_system import KETRAGSystem
-from .trident_wrapper import TridentSystemWrapper
-
 # Full baseline interface (no heavy dependencies)
 from .full_baseline_interface import BaselineSystem, BaselineResponse, TokenTracker, LatencyTracker
+
+# Simplified baseline implementations (lightweight, may have dependencies)
+# These are imported conditionally to avoid breaking imports when dependencies are missing
+try:
+    from .self_rag_system import SelfRAGSystem
+    from .graphrag_system import GraphRAGSystem, SimpleGraphIndex
+    from .ketrag_system import KETRAGSystem
+    from .trident_wrapper import TridentSystemWrapper
+    SIMPLIFIED_BASELINES_AVAILABLE = True
+except ImportError as e:
+    # If dependencies are missing, simplified baselines won't be available
+    # but full adapters can still be imported
+    SIMPLIFIED_BASELINES_AVAILABLE = False
+    _import_error = str(e)
 
 # Note: Full baseline adapters (FullGraphRAGAdapter, FullSelfRAGAdapter,
 # FullKETRAGAdapter, FullVanillaRAGAdapter, FullHippoRAGAdapter) are NOT
@@ -18,16 +26,19 @@ from .full_baseline_interface import BaselineSystem, BaselineResponse, TokenTrac
 #   etc.
 
 __all__ = [
-    # Simplified baselines
-    'SelfRAGSystem',
-    'GraphRAGSystem',
-    'SimpleGraphIndex',
-    'KETRAGSystem',
-    'TridentSystemWrapper',
-    # Full baseline interface
+    # Full baseline interface (always available)
     'BaselineSystem',
     'BaselineResponse',
     'TokenTracker',
     'LatencyTracker',
-    # Note: Full adapters are not in __all__ - import them directly
 ]
+
+# Add simplified baselines to __all__ if they're available
+if SIMPLIFIED_BASELINES_AVAILABLE:
+    __all__.extend([
+        'SelfRAGSystem',
+        'GraphRAGSystem',
+        'SimpleGraphIndex',
+        'KETRAGSystem',
+        'TridentSystemWrapper',
+    ])
