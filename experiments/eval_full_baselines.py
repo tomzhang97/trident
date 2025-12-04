@@ -56,7 +56,7 @@ from tqdm import tqdm
 import numpy as np
 
 # Add project root to path
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from baselines.full_baseline_interface import compute_exact_match, compute_f1
 
