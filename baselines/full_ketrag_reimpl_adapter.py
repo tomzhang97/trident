@@ -141,16 +141,13 @@ class OpenAILLMWrapper:
 
     def generate(self, messages, temperature=0.0, max_tokens=500, **kwargs):
         """Generate a response using the chat model."""
-        if isinstance(messages, list) and len(messages) > 0:
-            if isinstance(messages[0], dict) and "content" in messages[0]:
-                prompt = messages[0]["content"]
-            else:
-                prompt = str(messages[0])
+        if isinstance(messages, list) and len(messages) > 0 and isinstance(messages[0], dict):
+            chat_messages = messages
         else:
-            prompt = str(messages)
+            chat_messages = [{"role": "user", "content": str(messages)}]
 
         response = self.chat_model.generate(
-            messages=prompt,
+            messages=chat_messages,
             temperature=temperature,
             max_tokens=max_tokens,
             **kwargs
