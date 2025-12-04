@@ -36,7 +36,12 @@ from baselines.full_baseline_interface import (
     LatencyTracker,
 )
 from baselines.local_llm_wrapper import LocalLLMWrapper
-from baselines.prompt_utils import build_trident_style_prompt, extract_trident_style_answer
+from baselines.prompt_utils import (
+    build_ketrag_original_prompt,
+    build_trident_style_prompt,
+    extract_ketrag_original_answer,
+    extract_trident_style_answer,
+)
 
 # Import GraphRAG for LLM wrapper (when using OpenAI)
 try:
@@ -104,6 +109,8 @@ class FullKETRAGAdapter(BaselineSystem):
         local_llm_device: str = "cuda:0",
         load_in_8bit: bool = False,
         load_in_4bit: bool = False,
+        prompt_style: str = "original",
+        compare_original_prompt: bool = False,
         **kwargs
     ):
         """
@@ -128,6 +135,8 @@ class FullKETRAGAdapter(BaselineSystem):
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.use_local_llm = use_local_llm
+        self.prompt_style = prompt_style
+        self.compare_original_prompt = compare_original_prompt
 
         # Load precomputed contexts from official KET-RAG
         self.context_by_qid = self._load_ketrag_contexts(context_file)
@@ -243,6 +252,8 @@ class FullKETRAGAdapter(BaselineSystem):
                 stats={"error": "context_not_found", "question_id": question_id},
             )
 
+        comparison_stats: Dict[str, Any] = {}
+
         try:
             latency_tracker.start()
 
@@ -250,10 +261,17 @@ class FullKETRAGAdapter(BaselineSystem):
             # Format: "-----Entities and Relationships-----\n...\n-----Text source that may be relevant-----\n..."
             passages = self._parse_ketrag_context(ketrag_context)
 
-            # STANDARDIZED: Use Trident's prompt format
-            answer_prompt = build_trident_style_prompt(question, passages)
+            # Build primary prompt (default: Trident standardized)
+            if self.prompt_style == "trident":
+                answer_prompt = build_trident_style_prompt(question, passages)
+                extract_answer_fn = extract_trident_style_answer
+            elif self.prompt_style == "original":
+                answer_prompt = build_ketrag_original_prompt(question, ketrag_context)
+                extract_answer_fn = extract_ketrag_original_answer
+            else:
+                raise ValueError(f"Unknown prompt_style={self.prompt_style}. Choose 'trident' or 'original'.")
 
-            # STANDARDIZED: Generate with user-specified model
+            # Generate with user-specified model
             response = self.llm.generate(
                 messages=[{"role": "user", "content": answer_prompt}],
                 temperature=self.temperature,
@@ -272,7 +290,42 @@ class FullKETRAGAdapter(BaselineSystem):
             )
 
             # STANDARDIZED: Extract answer with Trident's logic
-            answer = extract_trident_style_answer(response)
+            answer = extract_answer_fn(response)
+
+            # Optional: generate using the alternate prompt to compare behavior
+            if self.compare_original_prompt:
+                alt_style = "original" if self.prompt_style == "trident" else "trident"
+
+                if alt_style == "original":
+                    comparison_prompt = build_ketrag_original_prompt(question, ketrag_context)
+                    comparison_extractor = extract_ketrag_original_answer
+                else:
+                    comparison_prompt = build_trident_style_prompt(question, passages)
+                    comparison_extractor = extract_trident_style_answer
+
+                latency_tracker.start()
+                comparison_response = self.llm.generate(
+                    messages=[{"role": "user", "content": comparison_prompt}],
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                )
+                comparison_latency = latency_tracker.stop("comparison_answer_generation")
+
+                comp_prompt_tokens = len(comparison_prompt.split()) * 1.3
+                comp_completion_tokens = len(comparison_response.split()) * 1.3
+                token_tracker.add_call(
+                    int(comp_prompt_tokens),
+                    int(comp_completion_tokens),
+                    "comparison_generation",
+                )
+
+                comparison_stats = {
+                    "style": alt_style,
+                    "prompt": comparison_prompt,
+                    "raw_response": comparison_response,
+                    "latency_ms": comparison_latency,
+                    "extracted_answer": comparison_extractor(comparison_response),
+                }
 
             return BaselineResponse(
                 answer=answer,
@@ -283,11 +336,13 @@ class FullKETRAGAdapter(BaselineSystem):
                 mode="ketrag_official",
                 stats={
                     "retrieval_source": "official_ketrag_precomputed",
-                    "generation_approach": "standardized_trident",
+                    "generation_approach": f"{self.prompt_style}_prompt",
                     "num_passages": len(passages),
                     "indexing_tokens": 0,  # Indexing done offline
                     "indexing_latency_ms": 0.0,  # Indexing done offline
                     "total_cost_tokens": token_tracker.total_tokens,
+                    "prompt_style": self.prompt_style,
+                    "comparison_generation": comparison_stats if comparison_stats else None,
                 },
                 raw_answer=response,
                 extracted_answer=answer,
@@ -356,10 +411,11 @@ class FullKETRAGAdapter(BaselineSystem):
             "version": "faithful_wrapper_precomputed",
             "approach": "Official KET-RAG retrieval + Standardized generation",
             "retrieval": "Official KET-RAG (precomputed)",
-            "generation": "Trident-style (standardized)",
+            "generation": f"{self.prompt_style} (primary)",
             "model": self.model,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "use_local_llm": self.use_local_llm,
             "num_contexts_loaded": len(self.context_by_qid),
+            "compare_original_prompt": self.compare_original_prompt,
         }

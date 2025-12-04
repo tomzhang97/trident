@@ -64,6 +64,35 @@ def build_trident_style_prompt(
     return prompt
 
 
+def build_ketrag_original_prompt(question: str, raw_context: str) -> str:
+    """Mirror the simple KET-RAG prompt that keeps the raw context intact.
+
+    This avoids the Trident "Final answer:" format so generations follow the
+    original, more free-form style used by KET-RAG.
+    """
+
+    return (
+        "Use the KET-RAG context (entities/relationships plus keyword chunks) "
+        "as-is. If the context is insufficient, reply with: I cannot answer "
+        "based on the given context.\n\n"
+        f"Context:\n{raw_context}\n\n"
+        f"Question: {question}\n"
+        "Answer:"
+    )
+
+
+def extract_ketrag_original_answer(generated_text: str) -> str:
+    """Lightweight extraction for the original KET-RAG-style generations."""
+
+    answer = generated_text.strip()
+
+    # Remove a leading "Answer:" prefix if the model echoes it
+    if answer.lower().startswith("answer:"):
+        answer = answer[len("answer:"):].strip()
+
+    return answer
+
+
 def extract_trident_style_answer(generated_text: str) -> str:
     """
     Extract answer from generated text using Trident's extraction logic.
