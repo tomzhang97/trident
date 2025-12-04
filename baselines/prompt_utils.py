@@ -71,14 +71,7 @@ def build_ketrag_original_prompt(question: str, raw_context: str) -> str:
     original, more free-form style used by KET-RAG.
     """
 
-    return (
-        "Use the KET-RAG context (entities/relationships plus keyword chunks) "
-        "as-is. If the context is insufficient, reply with: I cannot answer "
-        "based on the given context.\n\n"
-        f"Context:\n{raw_context}\n\n"
-        f"Question: {question}\n"
-        "Answer:"
-    )
+    return f"{raw_context}\n\nQuestion: {question}\nAnswer:"
 
 
 def extract_ketrag_original_answer(generated_text: str) -> str:

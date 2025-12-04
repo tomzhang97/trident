@@ -174,8 +174,9 @@ python experiments/eval_full_baselines.py \
 ```
 
 The default `--ketrag_prompt_style original` keeps the raw KET-RAG context and
-answer format. Add `--ketrag_prompt_style trident` only if you want to force the
-standardized Trident multi-hop prompt. Use
+simply appends the question/`Answer:` cue without extra instructions. Add
+`--ketrag_prompt_style trident` only if you want to force the standardized
+Trident multi-hop prompt. Use
 `--ketrag_compare_original_prompt` to emit both generations (primary +
 alternate) in the stats so you can see whether the keyword 0.5 retrieval or the
 prompting is responsible for poor scores.
