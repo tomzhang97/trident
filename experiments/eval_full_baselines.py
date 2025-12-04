@@ -195,6 +195,8 @@ def evaluate_baseline(
                 'question': question,
                 'answer': answer,
                 'prediction': response.answer,
+                'raw_answer': response.raw_answer,
+                'extracted_answer': response.extracted_answer,
                 'em': em,
                 'f1': f1,
                 # Query-only (PRIMARY)

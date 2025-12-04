@@ -22,6 +22,10 @@ class BaselineResponse:
     # Detailed stats
     stats: Dict[str, Any]  # System-specific statistics
 
+    # Optional debugging information
+    raw_answer: Optional[str] = None  # Unprocessed model output
+    extracted_answer: Optional[str] = None  # Post-processed answer
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
@@ -32,6 +36,8 @@ class BaselineResponse:
             "abstained": self.abstained,
             "mode": self.mode,
             "stats": self.stats,
+            "raw_answer": self.raw_answer,
+            "extracted_answer": self.extracted_answer,
         }
 
 
