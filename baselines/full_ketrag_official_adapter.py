@@ -289,6 +289,8 @@ class FullKETRAGAdapter(BaselineSystem):
                     "indexing_latency_ms": 0.0,  # Indexing done offline
                     "total_cost_tokens": token_tracker.total_tokens,
                 },
+                raw_answer=response,
+                extracted_answer=answer,
             )
 
         except Exception as e:
