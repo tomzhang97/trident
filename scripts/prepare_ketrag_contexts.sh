@@ -247,7 +247,46 @@ else
 fi
 
 cd "$KETRAG_DIR"
-poetry run graphrag index --root "$OUTPUT_DIR/"
+# Work around a Typer/Click flag parsing bug by calling the indexing function directly
+set +e
+poetry run python - <<PY
+from pathlib import Path
+
+from graphrag.cli.index import index_cli
+from graphrag.index.emit.types import TableEmitterType
+from graphrag.logging import ReporterType
+
+index_cli(
+    root_dir=Path("$OUTPUT_DIR"),
+    verbose=False,
+    resume=None,
+    memprofile=False,
+    cache=True,
+    reporter=ReporterType.RICH,
+    config_filepath=None,
+    emit=[TableEmitterType.Parquet],
+    dry_run=False,
+    skip_validation=False,
+    output_dir=None,
+)
+PY
+INDEX_EXIT_CODE=$?
+set -e
+
+LOG_FILE="$KETRAG_OUTPUT_DIR/logs/indexing-engine.log"
+if [ $INDEX_EXIT_CODE -ne 0 ]; then
+    echo ""
+    echo "[Error] GraphRAG indexing failed (exit code: $INDEX_EXIT_CODE)"
+    if [ -f "$LOG_FILE" ]; then
+        echo "Showing last 40 lines of the indexing log: $LOG_FILE"
+        echo "--------------------------------------------------"
+        tail -n 40 "$LOG_FILE"
+        echo "--------------------------------------------------"
+    else
+        echo "No indexing log found at $LOG_FILE"
+    fi
+    exit $INDEX_EXIT_CODE
+fi
 
 # Step 4: Create contexts with keyword strategy
 echo ""
