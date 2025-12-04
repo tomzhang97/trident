@@ -74,6 +74,19 @@ if ! command -v poetry &> /dev/null; then
     exit 1
 fi
 
+# Ensure KET-RAG is a valid Poetry project
+if [ ! -f "$KETRAG_DIR/pyproject.toml" ]; then
+    echo "ERROR: pyproject.toml not found in $KETRAG_DIR"
+    echo "Please ensure the KET-RAG repository is complete"
+    exit 1
+fi
+
+# Install dependencies if the virtual environment is not set up
+echo "[Setup] Installing KET-RAG dependencies via poetry (if needed)..."
+cd "$KETRAG_DIR"
+poetry install --no-interaction --no-root >/dev/null
+cd "$PROJECT_ROOT"
+
 # Step 1: Convert HotpotQA to KET-RAG format
 echo "[Step 1/4] Converting HotpotQA data to KET-RAG format..."
 cd "$PROJECT_ROOT"
@@ -234,7 +247,28 @@ else
 fi
 
 cd "$KETRAG_DIR"
-poetry run graphrag index --root "$OUTPUT_DIR/"
+# Work around a Typer/Click flag parsing bug by calling the indexing function directly
+poetry run python - <<PY
+from pathlib import Path
+
+from graphrag.cli.index import index_cli
+from graphrag.index.emit.types import TableEmitterType
+from graphrag.logging import ReporterType
+
+index_cli(
+    root_dir=Path("$OUTPUT_DIR"),
+    verbose=False,
+    resume=None,
+    memprofile=False,
+    cache=True,
+    reporter=ReporterType.RICH,
+    config_filepath=None,
+    emit=[TableEmitterType.Parquet],
+    dry_run=False,
+    skip_validation=False,
+    output_dir=None,
+)
+PY
 
 # Step 4: Create contexts with keyword strategy
 echo ""
