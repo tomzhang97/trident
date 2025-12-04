@@ -43,7 +43,7 @@ LOCAL_LLM_URL="${3:-}"  # Optional
 # Get absolute paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-KETRAG_DIR="$PROJECT_ROOT/KET-RAG"
+KETRAG_DIR="$PROJECT_ROOT/external_baselines/KET-RAG"
 KETRAG_OUTPUT_DIR="$KETRAG_DIR/$OUTPUT_DIR"
 
 echo "=================================================="
@@ -247,28 +247,7 @@ else
 fi
 
 cd "$KETRAG_DIR"
-# Work around a Typer/Click flag parsing bug by calling the indexing function directly
-poetry run python - <<PY
-from pathlib import Path
-
-from graphrag.cli.index import index_cli
-from graphrag.index.emit.types import TableEmitterType
-from graphrag.logging import ReporterType
-
-index_cli(
-    root_dir=Path("$OUTPUT_DIR"),
-    verbose=False,
-    resume=None,
-    memprofile=False,
-    cache=True,
-    reporter=ReporterType.RICH,
-    config_filepath=None,
-    emit=[TableEmitterType.Parquet],
-    dry_run=False,
-    skip_validation=False,
-    output_dir=None,
-)
-PY
+poetry run graphrag index --root "$OUTPUT_DIR/"
 
 # Step 4: Create contexts with keyword strategy
 echo ""
