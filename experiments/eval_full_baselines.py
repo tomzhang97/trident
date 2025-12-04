@@ -7,21 +7,30 @@ Supports both OpenAI API and local LLMs via HuggingFace
 
 Baselines:
     - Self-RAG: Self-reflective retrieval-augmented generation
-    - KET-RAG: Knowledge graph enhanced RAG with dual-channel retrieval
+    - KET-RAG (reimpl): In-framework reimplementation of skeleton + keyword RAG
+    - KET-RAG (official): Faithful wrapper using precomputed contexts from official KET-RAG
     - Vanilla RAG: Simple TF-IDF retrieval + LLM generation (baseline)
     - HippoRAG: Memory-enhanced RAG with personalized PageRank
 
 Usage with OpenAI:
+    # KET-RAG reimplementation (runs per-query indexing)
     python eval_full_baselines.py \
         --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
         --output_dir results/full_baselines \
-        --baselines vanillarag ketrag selfrag hipporag
+        --baselines ketrag_reimpl selfrag vanillarag hipporag
+
+    # KET-RAG official (requires precomputed contexts)
+    python eval_full_baselines.py \
+        --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
+        --output_dir results/full_baselines \
+        --baselines ketrag_official \
+        --ketrag_context_file KET-RAG/ragtest-hotpot/output/ragtest-hotpot-keyword-0.5.json
 
 Usage with Local LLM:
     python eval_full_baselines.py \
         --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
         --output_dir results/full_baselines \
-        --baselines vanillarag ketrag selfrag \
+        --baselines ketrag_reimpl selfrag \
         --use_local_llm \
         --local_llm_model Qwen/Qwen2.5-7B-Instruct \
         --local_llm_device cuda:0
@@ -284,9 +293,9 @@ def main():
     parser.add_argument(
         "--baselines",
         nargs='+',
-        choices=['selfrag', 'ketrag', 'vanillarag', 'hipporag', 'all'],
+        choices=['selfrag', 'ketrag_reimpl', 'ketrag_official', 'vanillarag', 'hipporag', 'all'],
         default=['all'],
-        help="Which baselines to evaluate"
+        help="Which baselines to evaluate (ketrag_reimpl=in-framework reimpl, ketrag_official=faithful wrapper)"
     )
     parser.add_argument(
         "--max_samples",
@@ -301,6 +310,12 @@ def main():
         type=str,
         default="gpt-4o-mini",
         help="Model to use for KET-RAG (OpenAI model name)"
+    )
+    parser.add_argument(
+        "--ketrag_context_file",
+        type=str,
+        default=None,
+        help="Path to precomputed context JSON for ketrag_official (from official KET-RAG pipeline)"
     )
     parser.add_argument(
         "--use_local_llm",
@@ -404,7 +419,7 @@ def main():
 
     # Expand 'all' to all baselines
     if 'all' in args.baselines:
-        args.baselines = ['selfrag', 'ketrag', 'vanillarag', 'hipporag']
+        args.baselines = ['selfrag', 'ketrag_reimpl', 'ketrag_official', 'vanillarag', 'hipporag']
 
     # Load data
     print(f"Loading data from: {args.data_path}")
@@ -415,7 +430,7 @@ def main():
     api_key = None
     if not args.use_local_llm:
         api_key = os.getenv("OPENAI_API_KEY")
-        openai_baselines = {'ketrag', 'vanillarag', 'hipporag'}
+        openai_baselines = {'ketrag_reimpl', 'ketrag_official', 'vanillarag', 'hipporag'}
         needs_api_key = openai_baselines & set(args.baselines)
         if needs_api_key and not api_key:
             print(f"ERROR: {', '.join(needs_api_key)} require(s) OPENAI_API_KEY when not using --use_local_llm")
@@ -442,9 +457,9 @@ def main():
                     gpu_memory_utilization=args.selfrag_gpu_memory_utilization,
                     device=args.local_llm_device,  # Use specified GPU device
                 )
-            elif baseline_name == 'ketrag':
-                from baselines.full_ketrag_adapter import FullKETRAGAdapter
-                baseline_system = FullKETRAGAdapter(
+            elif baseline_name == 'ketrag_reimpl':
+                from baselines.full_ketrag_reimpl_adapter import FullKETRAGReimplAdapter
+                baseline_system = FullKETRAGReimplAdapter(
                     api_key=api_key,
                     model=args.ketrag_model,
                     temperature=0.0,
@@ -452,6 +467,29 @@ def main():
                     skeleton_ratio=0.3,
                     max_skeleton_triples=10,
                     max_keyword_chunks=5,
+                    use_local_llm=args.use_local_llm,
+                    local_llm_model=args.local_llm_model,
+                    local_llm_device=args.local_llm_device,
+                    load_in_8bit=args.load_in_8bit,
+                    load_in_4bit=args.load_in_4bit,
+                )
+            elif baseline_name == 'ketrag_official':
+                from baselines.full_ketrag_official_adapter import FullKETRAGAdapter
+                # For official KET-RAG, we need the precomputed context file
+                context_file = getattr(args, 'ketrag_context_file', None)
+                if not context_file:
+                    print("ERROR: ketrag_official requires --ketrag_context_file")
+                    print("  Run the official KET-RAG pipeline first:")
+                    print("    cd KET-RAG")
+                    print("    poetry run graphrag index --root ragtest-hotpot/")
+                    print("    poetry run python indexing_sket/create_context.py ragtest-hotpot/ keyword 0.5")
+                    continue
+                baseline_system = FullKETRAGAdapter(
+                    context_file=context_file,
+                    api_key=api_key,
+                    model=args.ketrag_model,
+                    temperature=0.0,
+                    max_tokens=500,
                     use_local_llm=args.use_local_llm,
                     local_llm_model=args.local_llm_model,
                     local_llm_device=args.local_llm_device,
