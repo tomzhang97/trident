@@ -64,6 +64,31 @@ def build_trident_style_prompt(
     return prompt
 
 
+def build_ketrag_original_prompt(question: str, raw_context: str) -> str:
+    """Mimic the original KET-RAG answering format.
+
+    KET-RAG provides a single context string that mixes graph triples and
+    keyword passages ("-----Entities and Relationships-----" and
+    "-----Text source that may be relevant-----"). This helper keeps the
+    structure intact and adds light instructions so we can compare model
+    behavior between the standardized Trident prompt and the original
+    KET-RAG-style context.
+    """
+
+    instructions = (
+        "Use the provided KET-RAG context (entities/relationships and text "
+        "chunks) to answer the question. If the context is insufficient, "
+        "reply with: I cannot answer based on the given context."
+    )
+
+    return (
+        f"{instructions}\n\n"
+        f"Context:\n{raw_context}\n\n"
+        f"Question: {question}\n"
+        "Answer:"
+    )
+
+
 def extract_trident_style_answer(generated_text: str) -> str:
     """
     Extract answer from generated text using Trident's extraction logic.

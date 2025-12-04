@@ -320,6 +320,18 @@ def main():
         help="Path to precomputed context JSON for ketrag_official (from official KET-RAG pipeline)"
     )
     parser.add_argument(
+        "--ketrag_prompt_style",
+        type=str,
+        choices=["trident", "original"],
+        default="trident",
+        help="Prompt style for ketrag_official generation (trident=standardized, original=KET-RAG context)"
+    )
+    parser.add_argument(
+        "--ketrag_compare_original_prompt",
+        action="store_true",
+        help="Also generate using the alternate prompt style for debugging (stores in stats)"
+    )
+    parser.add_argument(
         "--use_local_llm",
         action="store_true",
         help="Use local LLM instead of OpenAI for GraphRAG/KET-RAG"
@@ -497,6 +509,8 @@ def main():
                     local_llm_device=args.local_llm_device,
                     load_in_8bit=args.load_in_8bit,
                     load_in_4bit=args.load_in_4bit,
+                    prompt_style=args.ketrag_prompt_style,
+                    compare_original_prompt=args.ketrag_compare_original_prompt,
                 )
             elif baseline_name == 'vanillarag':
                 from baselines.full_vanillarag_adapter import FullVanillaRAGAdapter
