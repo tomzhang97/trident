@@ -169,8 +169,16 @@ python experiments/eval_full_baselines.py \
   --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
   --baselines ketrag_official \
   --ketrag_context_file KET-RAG/ragtest-hotpot/output/ragtest-hotpot-keyword-0.5.json \
-  --ketrag_model gpt-4o-mini
+  --ketrag_model gpt-4o-mini \
+  --ketrag_prompt_style trident \
+  --ketrag_compare_original_prompt
 ```
+
+Use `--ketrag_prompt_style original` if you want the model to answer directly
+over the raw KET-RAG context string instead of the standardized Trident prompt.
+Add `--ketrag_compare_original_prompt` to emit both generations (primary +
+alternate) in the stats so you can see whether the keyword 0.5 retrieval or the
+prompting is responsible for poor scores.
 
 ### Implementation Details
 
