@@ -1,30 +1,16 @@
-"""Full KET-RAG adapter for multi-dataset evaluation using the official KET-RAG library."""
+"""Full KET-RAG adapter for multi-dataset evaluation.
+
+This is a standalone implementation of the KET-RAG algorithm that doesn't
+require the original KET-RAG repository. It uses graphrag 2.7.0 for LLM
+integration and implements the KET-RAG algorithm (SkeletonRAG + KeywordRAG).
+"""
 
 from __future__ import annotations
 
-import sys
 import os
-from pathlib import Path
-from typing import Dict, Any, List, Optional, Set, Tuple, Union
+from typing import Dict, Any, List, Optional, Set, Tuple
 from collections import defaultdict, Counter
 import re
-
-# Add KET-RAG source to path (supports both external_baselines/ and repo root layouts)
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-KETRAG_PATHS = [
-    PROJECT_ROOT / "external_baselines" / "KET-RAG",
-    PROJECT_ROOT / "KET-RAG",
-]
-ketrag_path = None
-for candidate in KETRAG_PATHS:
-    if candidate.exists():
-        sys.path.insert(0, str(candidate))
-        ketrag_path = candidate
-        break
-if ketrag_path is None:
-    raise ImportError(
-        "KET-RAG source not found. Clone KET-RAG into external_baselines/ or repository root."
-    )
 
 from baselines.full_baseline_interface import (
     BaselineSystem,
@@ -36,7 +22,7 @@ from baselines.local_llm_wrapper import LocalLLMWrapper
 from baselines.prompt_utils import build_trident_style_prompt, extract_trident_style_answer
 
 try:
-    # KET-RAG uses GraphRAG as a base, so we import from graphrag 2.7.0
+    # KET-RAG uses GraphRAG 2.7.0 for LLM integration
     from graphrag.config.enums import ModelType
     from graphrag.config.models.language_model_config import LanguageModelConfig
     from graphrag.language_model.manager import ModelManager
@@ -207,9 +193,8 @@ class FullKETRAGAdapter(BaselineSystem):
 
         if not KETRAG_AVAILABLE:
             raise ImportError(
-                "KET-RAG library not available. Install with: "
-                "pip install poetry && poetry install inside <path_to_KET-RAG> "
-                "(clone into external_baselines/ or repo root). "
+                "KET-RAG dependencies not available. Install with: "
+                "pip install graphrag networkx scikit-learn\n"
                 f"Error: {KETRAG_IMPORT_ERROR}"
             )
 
