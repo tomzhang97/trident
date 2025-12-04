@@ -38,15 +38,27 @@ def convert_hotpot_to_ketrag(hotpot_jsonl: str, output_dir: str):
     input_dir.mkdir(parents=True, exist_ok=True)
     qa_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load HotpotQA data
+    # Load HotpotQA data (supports both JSONL and JSON array formats)
     print(f"Loading HotpotQA data from: {hotpot_jsonl}")
     data = []
+
     with open(hotpot_jsonl, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            data.append(json.loads(line))
+        # Peek at first character to determine format
+        first_char = f.read(1)
+        f.seek(0)
+
+        if first_char == '[':
+            # JSON array format
+            print("  Detected JSON array format")
+            data = json.load(f)
+        else:
+            # JSONL format (one JSON object per line)
+            print("  Detected JSONL format")
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                data.append(json.loads(line))
 
     print(f"Loaded {len(data)} questions")
 
