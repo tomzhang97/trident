@@ -1,19 +1,21 @@
-"""Full KET-RAG adapter - faithful wrapper around official KET-RAG code.
+"""KET-RAG Reimplementation - in-framework implementation of KET-RAG ideas.
 
-This adapter uses the official KET-RAG implementation for indexing and retrieval,
-but standardizes the final generation step (prompt, model, answer extraction)
-for fair comparison with Trident.
+This adapter is a REIMPLEMENTATION of KET-RAG's approach within the Trident framework.
+It implements the skeleton + keyword RAG idea but is NOT a wrapper around official code.
 
-What's preserved from original KET-RAG:
+What's implemented (inspired by KET-RAG):
 - SkeletonRAG: PageRank-based key chunk selection + entity extraction
 - KeywordRAG: Keyword-chunk bipartite graph
 - Dual-channel retrieval logic
-- All hyperparameters and graph construction
+- Similar hyperparameters and graph construction
 
-What's standardized for fair comparison:
-- Final QA prompt (matches Trident's multi-hop format)
-- LLM model (uses specified model, not hardcoded)
-- Answer extraction (matches Trident's logic)
+What's different from official KET-RAG:
+- All code is reimplemented in this file (not using official KET-RAG repo)
+- Indexing happens per-query (not using GraphRAG's global indexing)
+- Runs entirely within Trident framework
+- Good for studying the idea and doing ablations
+
+For a TRUE faithful wrapper around official KET-RAG, use FullKETRAGAdapter instead.
 """
 
 from __future__ import annotations
@@ -162,20 +164,22 @@ class OpenAILLMWrapper:
             return str(response)
 
 
-class FullKETRAGAdapter(BaselineSystem):
+class FullKETRAGReimplAdapter(BaselineSystem):
     """
-    Faithful wrapper around official KET-RAG implementation.
+    KET-RAG Reimplementation within Trident framework.
 
-    Preserves original KET-RAG's:
+    Implements the KET-RAG approach (skeleton + keyword RAG) but does NOT
+    use the official KET-RAG repository code. This is useful for:
+    - Studying the KET-RAG idea under our control
+    - Running without external dependencies
+    - Doing ablations on hyperparameters
+
+    For a TRUE faithful wrapper around official KET-RAG, use FullKETRAGAdapter.
+
+    Implemented components:
     - SkeletonRAG (PageRank + entity extraction)
     - KeywordRAG (keyword-chunk graph)
     - Dual-channel retrieval
-    - Hyperparameters
-
-    Standardizes for fair comparison:
-    - Final QA prompt (Trident's format)
-    - LLM model (user-specified)
-    - Answer extraction (Trident's logic)
     """
 
     def __init__(
@@ -212,7 +216,7 @@ class FullKETRAGAdapter(BaselineSystem):
             load_in_4bit: Use 4-bit quantization for local LLM
             **kwargs: Additional config
         """
-        super().__init__(name="ketrag", **kwargs)
+        super().__init__(name="ketrag_reimpl", **kwargs)
 
         if not DEPENDENCIES_AVAILABLE:
             raise ImportError(
@@ -407,7 +411,7 @@ Relationships:"""
                 latency_ms=0,
                 selected_passages=[],
                 abstained=True,
-                mode="ketrag",
+                mode="ketrag_reimpl",
                 stats={},
             )
 
@@ -505,7 +509,7 @@ Relationships:"""
                 latency_ms=query_latency_tracker.get_total_latency(),
                 selected_passages=selected_passages,
                 abstained=False,
-                mode="ketrag",
+                mode="ketrag_reimpl",
                 stats={
                     "indexing_latency_ms": indexing_time_ms,
                     "indexing_tokens": indexing_cost_tokens,
@@ -522,7 +526,7 @@ Relationships:"""
             )
 
         except Exception as e:
-            print(f"Error in KET-RAG processing: {e}")
+            print(f"Error in KET-RAG reimpl processing: {e}")
             import traceback
             traceback.print_exc()
 
@@ -532,16 +536,16 @@ Relationships:"""
                 latency_ms=0,
                 selected_passages=[],
                 abstained=True,
-                mode="ketrag",
+                mode="ketrag_reimpl",
                 stats={"error": str(e)},
             )
 
     def get_system_info(self) -> Dict[str, Any]:
         """Get system information."""
         return {
-            "name": "KET-RAG",
-            "version": "faithful_wrapper",
-            "approach": "Original retrieval/indexing + Standardized generation",
+            "name": "KET-RAG (Reimpl)",
+            "version": "in_framework_reimplementation",
+            "approach": "Reimplemented skeleton+keyword RAG (not official wrapper)",
             "model": self.model,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
