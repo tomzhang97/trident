@@ -3,7 +3,20 @@
 This adapter is a TRUE faithful wrapper around official KET-RAG:
 - Uses official KET-RAG CLI for indexing and context retrieval
 - Reads precomputed contexts from JSON files
-- Only standardizes: prompt format, LLM model, answer extraction
+- Supports TWO modes:
+
+  MODE 1: Original KET-RAG (100% unchanged)
+    prompt_style="original", clean_context=False
+    - Uses KET-RAG's original prompt format
+    - Uses KET-RAG's original context as-is (no modifications)
+    - Uses KET-RAG's original answer extraction
+    - This is the TRUE original KET-RAG behavior
+
+  MODE 2: Trident-style (for fair comparison)
+    prompt_style="trident", clean_context=True
+    - Uses Trident's prompt format
+    - Cleans KET-RAG context (removes noise, filters entities)
+    - Uses Trident's answer extraction logic
 
 Architecture:
     1. OFFLINE (manual step): Run official KET-RAG pipeline
@@ -13,13 +26,13 @@ Architecture:
 
     2. ONLINE (this adapter): Load precomputed contexts and generate answers
        - Reads contexts from JSON: {question_id: context_string}
-       - Formats into Trident prompt
+       - Formats prompt based on mode (original or trident)
        - Calls user-specified LLM
-       - Extracts answer with Trident logic
+       - Extracts answer based on mode
 
 This ensures:
 - ALL retrieval logic is 100% original KET-RAG
-- ONLY generation is standardized for fair comparison
+- User can choose between original KET-RAG or Trident-style generation
 """
 
 from __future__ import annotations
@@ -107,6 +120,7 @@ class FullKETRAGAdapter(BaselineSystem):
         load_in_8bit: bool = False,
         load_in_4bit: bool = False,
         prompt_style: str = "original",
+        clean_context: bool = False,
         compare_original_prompt: bool = False,
         **kwargs
     ):
@@ -125,6 +139,10 @@ class FullKETRAGAdapter(BaselineSystem):
             local_llm_device: Device for local LLM
             load_in_8bit: Use 8-bit quantization
             load_in_4bit: Use 4-bit quantization
+            prompt_style: "original" for KET-RAG prompt, "trident" for Trident prompt
+            clean_context: If True, apply post-processing to clean KET-RAG context
+                          If False, use original KET-RAG context as-is (default: False)
+            compare_original_prompt: Generate with both prompts for comparison
         """
         super().__init__(name="ketrag_official", **kwargs)
 
@@ -133,6 +151,7 @@ class FullKETRAGAdapter(BaselineSystem):
         self.max_tokens = max_tokens
         self.use_local_llm = use_local_llm
         self.prompt_style = prompt_style
+        self.clean_context = clean_context
         self.compare_original_prompt = compare_original_prompt
 
         # Load precomputed contexts from official KET-RAG
@@ -322,9 +341,11 @@ class FullKETRAGAdapter(BaselineSystem):
                 stats={"error": "context_not_found", "question_id": question_id},
             )
 
-        # Clean context to remove noise (e.g., empty "[]", irrelevant entities)
+        # Optionally clean context to remove noise (e.g., empty "[]", irrelevant entities)
         # This is post-processing on KET-RAG output, not modifying KET-RAG itself
-        ketrag_context = self._clean_ketrag_context(ketrag_context, question)
+        # When clean_context=False, we preserve original KET-RAG output completely
+        if self.clean_context:
+            ketrag_context = self._clean_ketrag_context(ketrag_context, question)
 
         comparison_stats: Dict[str, Any] = {}
 
@@ -421,6 +442,7 @@ class FullKETRAGAdapter(BaselineSystem):
                     "indexing_latency_ms": 0.0,  # Indexing done offline
                     "total_cost_tokens": token_tracker.total_tokens,
                     "prompt_style": self.prompt_style,
+                    "clean_context": self.clean_context,
                     "comparison_generation": comparison_stats if comparison_stats else None,
                 },
                 raw_answer=response,
@@ -496,5 +518,6 @@ class FullKETRAGAdapter(BaselineSystem):
             "max_tokens": self.max_tokens,
             "use_local_llm": self.use_local_llm,
             "num_contexts_loaded": len(self.context_by_qid),
+            "clean_context": self.clean_context,
             "compare_original_prompt": self.compare_original_prompt,
         }
