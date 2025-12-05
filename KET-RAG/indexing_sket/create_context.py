@@ -322,7 +322,7 @@ def generate_text_unit_context(
             "community_prop": 0.0,
             "conversation_history_max_turns": 10,
             "conversation_history_user_turns_only": True,
-            "top_k_mapped_entities": 10,
+            "top_k_mapped_entities": 5,  # Reduced from 10 to reduce noise from irrelevant entities
             "top_k_relationships": 10,
             "include_entity_rank": True,
             "include_relationship_weight": True,
