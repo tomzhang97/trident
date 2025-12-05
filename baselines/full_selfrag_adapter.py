@@ -361,6 +361,8 @@ class FullSelfRAGAdapter(BaselineSystem):
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                 },
+                raw_answer=raw_generation,
+                extracted_answer=answer,
             )
 
         except Exception as e:
