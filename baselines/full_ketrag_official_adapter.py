@@ -206,6 +206,79 @@ class FullKETRAGAdapter(BaselineSystem):
 
         return context_dict
 
+    def _clean_ketrag_context(self, context: str, question: str) -> str:
+        """
+        Clean and optimize KET-RAG context to reduce noise.
+
+        Fixes:
+        1. Remove empty "[]" prefix that confuses the LLM
+        2. Filter out irrelevant entities based on question keywords
+        3. Keep only the most relevant entities to reduce noise
+
+        This is a post-processing step on KET-RAG's output, not a modification
+        to KET-RAG itself.
+        """
+        if not context:
+            return context
+
+        # Fix 1: Remove empty "[]" prefix
+        cleaned = context.strip()
+        if cleaned.startswith("[]"):
+            cleaned = cleaned[2:].lstrip()
+
+        # Fix 2: Filter irrelevant entities
+        # Extract question keywords (simple approach: words in question)
+        question_words = set(question.lower().split())
+        # Remove common stopwords
+        stopwords = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+                    'of', 'with', 'by', 'from', 'is', 'was', 'were', 'are', 'be', 'been',
+                    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+                    'should', 'may', 'might', 'must', 'can', 'same', 'as', 'than', 'that',
+                    'this', 'these', 'those', 'what', 'which', 'who', 'when', 'where', 'why',
+                    'how', 'their', 'them', 'they'}
+        question_keywords = question_words - stopwords
+
+        # Parse sections
+        if "-----Entities-----" not in cleaned:
+            return cleaned
+
+        sections = cleaned.split("-----")
+        filtered_sections = []
+
+        for i, section in enumerate(sections):
+            # Keep all non-entity sections as-is
+            if not section.strip().startswith("Entities"):
+                filtered_sections.append(section)
+                continue
+
+            # Filter entity section
+            lines = section.split("\n")
+            header_lines = lines[:2] if len(lines) >= 2 else lines  # Keep header
+            entity_lines = lines[2:] if len(lines) > 2 else []
+
+            # Keep entities that match question keywords
+            relevant_entities = []
+            for line in entity_lines:
+                if not line.strip():
+                    continue
+                # Check if entity name or description contains question keywords
+                line_lower = line.lower()
+                if any(keyword in line_lower for keyword in question_keywords):
+                    relevant_entities.append(line)
+
+            # If we filtered too aggressively (< 2 entities), keep top 5
+            if len(relevant_entities) < 2 and len(entity_lines) > 0:
+                relevant_entities = entity_lines[:5]
+            elif len(relevant_entities) > 10:
+                # Cap at 10 entities to reduce noise
+                relevant_entities = relevant_entities[:10]
+
+            # Reconstruct entity section
+            filtered_section = "\n".join(header_lines + relevant_entities)
+            filtered_sections.append(filtered_section)
+
+        return "-----".join(filtered_sections)
+
     def answer(
         self,
         question: str,
@@ -248,6 +321,10 @@ class FullKETRAGAdapter(BaselineSystem):
                 mode="ketrag_official",
                 stats={"error": "context_not_found", "question_id": question_id},
             )
+
+        # Clean context to remove noise (e.g., empty "[]", irrelevant entities)
+        # This is post-processing on KET-RAG output, not modifying KET-RAG itself
+        ketrag_context = self._clean_ketrag_context(ketrag_context, question)
 
         comparison_stats: Dict[str, Any] = {}
 
