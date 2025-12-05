@@ -19,12 +19,22 @@ Usage with OpenAI:
         --output_dir results/full_baselines \
         --baselines ketrag_reimpl selfrag vanillarag hipporag
 
-    # KET-RAG official (requires precomputed contexts)
+    # KET-RAG official - Mode 1: 100% original KET-RAG (no modifications)
     python eval_full_baselines.py \
         --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
         --output_dir results/full_baselines \
         --baselines ketrag_official \
-        --ketrag_context_file KET-RAG/ragtest-hotpot/output/ragtest-hotpot-keyword-0.5.json
+        --ketrag_context_file KET-RAG/ragtest-hotpot/output/ragtest-hotpot-keyword-0.5.json \
+        --ketrag_prompt_style original
+
+    # KET-RAG official - Mode 2: Trident-style (with context cleaning and Trident prompt)
+    python eval_full_baselines.py \
+        --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
+        --output_dir results/full_baselines \
+        --baselines ketrag_official \
+        --ketrag_context_file KET-RAG/ragtest-hotpot/output/ragtest-hotpot-keyword-0.5.json \
+        --ketrag_prompt_style trident \
+        --ketrag_clean_context
 
 Usage with Local LLM:
     python eval_full_baselines.py \
@@ -332,6 +342,12 @@ def main():
         help="Also generate using the alternate prompt style for debugging (stores in stats)"
     )
     parser.add_argument(
+        "--ketrag_clean_context",
+        action="store_true",
+        help="Apply post-processing to clean KET-RAG context (remove noise, filter entities). "
+             "Use False for 100%% original KET-RAG, True for Trident-style comparison."
+    )
+    parser.add_argument(
         "--use_local_llm",
         action="store_true",
         help="Use local LLM instead of OpenAI for GraphRAG/KET-RAG"
@@ -510,6 +526,7 @@ def main():
                     load_in_8bit=args.load_in_8bit,
                     load_in_4bit=args.load_in_4bit,
                     prompt_style=args.ketrag_prompt_style,
+                    clean_context=args.ketrag_clean_context,
                     compare_original_prompt=args.ketrag_compare_original_prompt,
                 )
             elif baseline_name == 'vanillarag':
