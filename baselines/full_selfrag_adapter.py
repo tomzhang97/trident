@@ -14,7 +14,10 @@ from baselines.full_baseline_interface import (
     TokenTracker,
     LatencyTracker,
 )
-from baselines.prompt_utils import extract_trident_style_answer
+from baselines.prompt_utils import (
+    extract_trident_style_answer,
+    build_trident_style_prompt,
+)
 
 try:
     from vllm import LLM, SamplingParams
@@ -65,6 +68,7 @@ class FullSelfRAGAdapter(BaselineSystem):
         top_p: float = 1.0,
         use_critic: bool = True,
         provide_context: bool = True,
+        use_trident_prompt: bool = False,
         gpu_memory_utilization: float = 0.5,
         device: Optional[str] = None,
         **kwargs
@@ -82,6 +86,9 @@ class FullSelfRAGAdapter(BaselineSystem):
             top_p: Top-p sampling
             use_critic: Whether to use critic tokens in generation
             provide_context: Whether to provide context to model (vs let it decide to retrieve)
+            use_trident_prompt: If True, use Trident's prompt format instead of Self-RAG's native format
+                               WARNING: Self-RAG is fine-tuned on its native prompt format. Using Trident's
+                               format may reduce effectiveness of reflection tokens. (default: False)
             gpu_memory_utilization: GPU memory fraction to use (default 0.5 = 50%)
             device: GPU device to use (e.g., "cuda:0", "cuda:2", or "0", "2")
                     If None, uses default CUDA device
@@ -102,6 +109,8 @@ class FullSelfRAGAdapter(BaselineSystem):
         self.top_p = top_p
         self.use_critic = use_critic
         self.provide_context = provide_context
+        self.use_trident_prompt = use_trident_prompt
+        self.gpu_memory_utilization = gpu_memory_utilization
 
         # Set CUDA device if specified
         # vLLM uses CUDA_VISIBLE_DEVICES to control GPU selection
@@ -141,7 +150,7 @@ class FullSelfRAGAdapter(BaselineSystem):
 
     def _format_prompt(self, question: str, context: Optional[List[List[str]]] = None) -> str:
         """
-        Format prompt in Self-RAG style.
+        Format prompt in Self-RAG or Trident style.
 
         Args:
             question: The question
@@ -150,20 +159,36 @@ class FullSelfRAGAdapter(BaselineSystem):
         Returns:
             Formatted prompt string
         """
-        prompt = f"### Instruction:\n{question}\n\n### Response:\n"
+        if self.use_trident_prompt:
+            # Use Trident's prompt format
+            if self.provide_context and context:
+                # Convert context to passages for Trident format
+                passages = []
+                for title, sentences in context:
+                    text = " ".join(sentences) if isinstance(sentences, list) else sentences
+                    passages.append({"text": text, "title": title})
 
-        if self.provide_context and context:
-            # Format context as paragraphs
-            paragraphs = []
-            for title, sentences in context:
-                text = " ".join(sentences) if isinstance(sentences, list) else sentences
-                paragraphs.append(text)
+                # Build Trident-style prompt
+                prompt = build_trident_style_prompt(question, passages)
+            else:
+                # No context provided
+                prompt = build_trident_style_prompt(question, [])
+        else:
+            # Use Self-RAG's native format
+            prompt = f"### Instruction:\n{question}\n\n### Response:\n"
 
-            # Combine paragraphs
-            combined_context = " ".join(paragraphs)
+            if self.provide_context and context:
+                # Format context as paragraphs
+                paragraphs = []
+                for title, sentences in context:
+                    text = " ".join(sentences) if isinstance(sentences, list) else sentences
+                    paragraphs.append(text)
 
-            # Add retrieval marker and context
-            prompt += f"[Retrieval]<paragraph>{combined_context}</paragraph>"
+                # Combine paragraphs
+                combined_context = " ".join(paragraphs)
+
+                # Add retrieval marker and context
+                prompt += f"[Retrieval]<paragraph>{combined_context}</paragraph>"
 
         return prompt
 
@@ -233,10 +258,14 @@ class FullSelfRAGAdapter(BaselineSystem):
         """
         Answer a question using Self-RAG (Aligned with Separated Metrics).
 
-        Note: Self-RAG uses its native prompt format ("### Instruction:", etc.)
-        which is required for the fine-tuned model to work correctly. Changing
-        the prompt format would break Self-RAG's core functionality. Only answer
-        extraction is standardized to match Trident for fair comparison.
+        Prompt Format:
+        - By default, uses Self-RAG's native format ("### Instruction:", etc.)
+          which is required for the fine-tuned model to work optimally
+        - If use_trident_prompt=True, uses Trident's prompt format instead
+          (WARNING: may reduce effectiveness of reflection tokens)
+
+        Answer Extraction:
+        - Always uses Trident's standardized extraction for fair comparison
 
         Metrics reported:
         - tokens_used, latency_ms: QUERY ONLY (Self-RAG has no indexing phase)
@@ -366,4 +395,6 @@ class FullSelfRAGAdapter(BaselineSystem):
             "top_p": self.top_p,
             "use_critic": self.use_critic,
             "provide_context": self.provide_context,
+            "use_trident_prompt": self.use_trident_prompt,
+            "prompt_format": "trident" if self.use_trident_prompt else "selfrag_native",
         }

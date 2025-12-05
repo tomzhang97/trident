@@ -54,6 +54,15 @@ Usage with Local LLM:
         --local_llm_model Qwen/Qwen2.5-7B-Instruct \
         --local_llm_device cuda:0
 
+    # Self-RAG with Trident's prompt format
+    python eval_full_baselines.py \
+        --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
+        --output_dir results/full_baselines \
+        --baselines selfrag \
+        --local_llm_device cuda:0 \
+        --selfrag_use_trident_prompt \
+        --selfrag_gpu_memory_utilization 0.9
+
 Environment variables:
     OPENAI_API_KEY: Required for KET-RAG, Vanilla RAG, HippoRAG when not using local LLM
     HF_TOKEN: Required for Self-RAG model download
@@ -403,6 +412,11 @@ def main():
         default=0.5,
         help="GPU memory utilization fraction for Self-RAG (default 0.5)"
     )
+    parser.add_argument(
+        "--selfrag_use_trident_prompt",
+        action="store_true",
+        help="Use Trident's prompt format instead of Self-RAG's native format (may reduce reflection effectiveness)"
+    )
 
     # Vanilla RAG options
     parser.add_argument(
@@ -493,6 +507,7 @@ def main():
                     max_tokens=args.selfrag_max_tokens,
                     temperature=0.0,
                     provide_context=True,  # Provide dataset context
+                    use_trident_prompt=args.selfrag_use_trident_prompt,
                     gpu_memory_utilization=args.selfrag_gpu_memory_utilization,
                     device=args.local_llm_device,  # Use specified GPU device
                 )
