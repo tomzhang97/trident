@@ -334,6 +334,11 @@ def generate_text_unit_context(
         }
         context_result = search_engine.context_builder.build_context(question, **context_params)
         graph_context = context_result.context_chunks
+
+        # Fix: Remove empty list representation "[]" that sometimes appears
+        # when context_chunks is empty or improperly formatted
+        if isinstance(graph_context, str) and graph_context.strip().startswith("[]"):
+            graph_context = graph_context.strip()[2:].lstrip()
     else:
         graph_context = ""
     return graph_context + text_content

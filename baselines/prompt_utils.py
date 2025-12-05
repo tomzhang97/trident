@@ -80,9 +80,18 @@ For example, suppose the question is: "What country does the political movement 
 
 Do not include information where the supporting evidence for it is not provided in the data tables.
 
+
 ---Data tables---
 
 {context_data}
+
+---Important Instructions---
+
+1. Pay special attention to the "Entities" table - entity descriptions often contain key attributes needed to answer the question
+2. Use the "Relationships" table to understand connections between entities
+3. Cross-reference information across all sections (Entities, Relationships, Sources, Text sources) to find the answer
+4. If multiple sources contain the same information, that increases confidence in the answer
+
 
 ---Goal---
 
