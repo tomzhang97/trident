@@ -18,6 +18,12 @@ This adapter is a TRUE faithful wrapper around official KET-RAG:
     - Cleans KET-RAG context (removes noise, filters entities)
     - Uses Trident's answer extraction logic
 
+  MODE 3: Standard RAG prompt (research paper format)
+    prompt_style="standard", clean_context=True
+    - Uses standard RAG prompt: "Answer the question based on the given passage..."
+    - Format: "Doc 1 (Title: {title}) {content}"
+    - Short answer extraction (no reasoning)
+
 Architecture:
     1. OFFLINE (manual step): Run official KET-RAG pipeline
        $ cd KET-RAG
@@ -52,8 +58,10 @@ from baselines.local_llm_wrapper import LocalLLMWrapper
 from baselines.prompt_utils import (
     build_ketrag_original_prompt,
     build_trident_style_prompt,
+    build_standard_rag_prompt,
     extract_ketrag_original_answer,
     extract_trident_style_answer,
+    extract_standard_rag_answer,
 )
 
 # Import GraphRAG for LLM wrapper (when using OpenAI)
@@ -139,7 +147,8 @@ class FullKETRAGAdapter(BaselineSystem):
             local_llm_device: Device for local LLM
             load_in_8bit: Use 8-bit quantization
             load_in_4bit: Use 4-bit quantization
-            prompt_style: "original" for KET-RAG prompt, "trident" for Trident prompt
+            prompt_style: "original" for KET-RAG prompt, "trident" for Trident prompt,
+                         "standard" for standard RAG format (default: "original")
             clean_context: If True, apply post-processing to clean KET-RAG context
                           If False, use original KET-RAG context as-is (default: False)
             compare_original_prompt: Generate with both prompts for comparison
@@ -356,7 +365,7 @@ class FullKETRAGAdapter(BaselineSystem):
             # Format: "-----Entities and Relationships-----\n...\n-----Text source that may be relevant-----\n..."
             passages = self._parse_ketrag_context(ketrag_context)
 
-            # Build primary prompt (default: Trident standardized)
+            # Build primary prompt
             if self.prompt_style == "trident":
                 answer_prompt = build_trident_style_prompt(question, passages)
                 answer_messages = [{"role": "user", "content": answer_prompt}]
@@ -366,8 +375,12 @@ class FullKETRAGAdapter(BaselineSystem):
                 # For token accounting/logging, flatten the messages
                 answer_prompt = "\n\n".join(m.get("content", "") for m in answer_messages)
                 extract_answer_fn = extract_ketrag_original_answer
+            elif self.prompt_style == "standard":
+                answer_prompt = build_standard_rag_prompt(question, passages)
+                answer_messages = [{"role": "user", "content": answer_prompt}]
+                extract_answer_fn = extract_standard_rag_answer
             else:
-                raise ValueError(f"Unknown prompt_style={self.prompt_style}. Choose 'trident' or 'original'.")
+                raise ValueError(f"Unknown prompt_style={self.prompt_style}. Choose 'trident', 'original', or 'standard'.")
 
             # Generate with user-specified model
             response = self.llm.generate(

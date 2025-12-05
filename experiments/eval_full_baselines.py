@@ -11,7 +11,6 @@ Baselines:
     - KET-RAG (official): Faithful wrapper using precomputed contexts from official KET-RAG
     - Vanilla RAG: Simple TF-IDF retrieval + LLM generation (baseline)
     - HippoRAG: Memory-enhanced RAG with personalized PageRank
-    - E5-RAG: Standard RAG with E5-base-v2 retriever + vLLM generator
 
 Usage with OpenAI:
     # KET-RAG reimplementation (runs per-query indexing)
@@ -37,6 +36,15 @@ Usage with OpenAI:
         --ketrag_prompt_style trident \
         --ketrag_clean_context
 
+    # KET-RAG official - Mode 3: Standard RAG prompt (research paper format)
+    python eval_full_baselines.py \
+        --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
+        --output_dir results/full_baselines \
+        --baselines ketrag_official \
+        --ketrag_context_file KET-RAG/ragtest-hotpot/output/ragtest-hotpot-keyword-0.5.json \
+        --ketrag_prompt_style standard \
+        --ketrag_clean_context
+
 Usage with Local LLM:
     python eval_full_baselines.py \
         --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
@@ -45,15 +53,6 @@ Usage with Local LLM:
         --use_local_llm \
         --local_llm_model Qwen/Qwen2.5-7B-Instruct \
         --local_llm_device cuda:0
-
-    # E5-RAG (standard experimental setup with E5-base-v2 + LLaMA-3-8B)
-    python eval_full_baselines.py \
-        --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
-        --output_dir results/full_baselines \
-        --baselines e5rag \
-        --local_llm_device cuda:0 \
-        --e5rag_generator_model meta-llama/Meta-Llama-3-8B-Instruct \
-        --e5rag_gpu_memory_utilization 0.9
 
 Environment variables:
     OPENAI_API_KEY: Required for KET-RAG, Vanilla RAG, HippoRAG when not using local LLM
@@ -315,9 +314,9 @@ def main():
     parser.add_argument(
         "--baselines",
         nargs='+',
-        choices=['selfrag', 'ketrag_reimpl', 'ketrag_official', 'vanillarag', 'hipporag', 'e5rag', 'all'],
+        choices=['selfrag', 'ketrag_reimpl', 'ketrag_official', 'vanillarag', 'hipporag', 'all'],
         default=['all'],
-        help="Which baselines to evaluate (ketrag_reimpl=in-framework reimpl, ketrag_official=faithful wrapper, e5rag=E5-base-v2 retriever)"
+        help="Which baselines to evaluate (ketrag_reimpl=in-framework reimpl, ketrag_official=faithful wrapper)"
     )
     parser.add_argument(
         "--max_samples",
@@ -342,9 +341,9 @@ def main():
     parser.add_argument(
         "--ketrag_prompt_style",
         type=str,
-        choices=["trident", "original"],
+        choices=["trident", "original", "standard"],
         default="original",
-        help="Prompt style for ketrag_official generation (original=KET-RAG context, trident=standardized)"
+        help="Prompt style for ketrag_official: original=KET-RAG, trident=multi-hop, standard=research paper format"
     )
     parser.add_argument(
         "--ketrag_compare_original_prompt",
@@ -451,44 +450,6 @@ def main():
         help="Base URL for local vLLM server (e.g., http://localhost:8000/v1)"
     )
 
-    # E5-RAG options (standard experimental setup)
-    parser.add_argument(
-        "--e5rag_retriever_model",
-        type=str,
-        default="intfloat/e5-base-v2",
-        help="E5 model for retrieval (default: intfloat/e5-base-v2)"
-    )
-    parser.add_argument(
-        "--e5rag_generator_model",
-        type=str,
-        default="meta-llama/Meta-Llama-3-8B-Instruct",
-        help="Generator model for E5-RAG (default: Meta-Llama-3-8B-Instruct, alternative: Qwen/Qwen1.5-14B)"
-    )
-    parser.add_argument(
-        "--e5rag_top_k",
-        type=int,
-        default=5,
-        help="Number of passages to retrieve for E5-RAG (default: 5)"
-    )
-    parser.add_argument(
-        "--e5rag_max_input_length",
-        type=int,
-        default=2048,
-        help="Maximum input length for E5-RAG generator (default: 2048)"
-    )
-    parser.add_argument(
-        "--e5rag_max_output_length",
-        type=int,
-        default=32,
-        help="Maximum output length for E5-RAG (default: 32)"
-    )
-    parser.add_argument(
-        "--e5rag_gpu_memory_utilization",
-        type=float,
-        default=0.5,
-        help="GPU memory utilization for E5-RAG vLLM (default: 0.5)"
-    )
-
     args = parser.parse_args()
 
     # Normalize device format (handle both "3" and "cuda:3")
@@ -497,7 +458,7 @@ def main():
 
     # Expand 'all' to all baselines
     if 'all' in args.baselines:
-        args.baselines = ['selfrag', 'ketrag_reimpl', 'ketrag_official', 'vanillarag', 'hipporag', 'e5rag']
+        args.baselines = ['selfrag', 'ketrag_reimpl', 'ketrag_official', 'vanillarag', 'hipporag']
 
     # Load data
     print(f"Loading data from: {args.data_path}")
@@ -604,20 +565,6 @@ def main():
                     use_local_llm=args.use_local_llm,
                     local_llm_base_url=args.hipporag_local_base_url,
                     local_llm_model=args.local_llm_model,
-                )
-            elif baseline_name == 'e5rag':
-                from baselines.full_e5rag_adapter import FullE5RAGAdapter
-                baseline_system = FullE5RAGAdapter(
-                    retriever_model=args.e5rag_retriever_model,
-                    generator_model=args.e5rag_generator_model,
-                    top_k=args.e5rag_top_k,
-                    max_input_length=args.e5rag_max_input_length,
-                    max_output_length=args.e5rag_max_output_length,
-                    temperature=0.0,  # Greedy decoding
-                    gpu_memory_utilization=args.e5rag_gpu_memory_utilization,
-                    device=args.local_llm_device,
-                    retriever_batch_size=1024,
-                    use_fp16=True,
                 )
             else:
                 print(f"Unknown baseline: {baseline_name}")
