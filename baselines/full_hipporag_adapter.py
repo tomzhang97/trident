@@ -13,7 +13,6 @@ from baselines.full_baseline_interface import (
     TokenTracker,
     LatencyTracker,
 )
-from baselines.prompt_utils import extract_trident_style_answer
 
 try:
     from hipporag import HippoRAG
@@ -189,6 +188,8 @@ class FullHippoRAGAdapter(BaselineSystem):
                 abstained=True,
                 mode="hipporag",
                 stats={},
+                raw_answer=None,
+                extracted_answer=None,
             )
 
         try:
@@ -246,13 +247,13 @@ class FullHippoRAGAdapter(BaselineSystem):
                 result = rag_results[0]
                 raw_answer = result.get("answer", "").strip()
 
-                # Use Trident's standardized answer extraction
-                # HippoRAG uses its native prompt, but we standardize extraction
-                answer = extract_trident_style_answer(raw_answer)
+                # Use original HippoRAG answer without Trident-style post-processing
+                answer = raw_answer
 
                 # Get retrieved passages if available
                 retrieved_passages = result.get("retrieved_passages", [])
             else:
+                raw_answer = ""
                 answer = "Unable to generate answer."
                 retrieved_passages = []
 
@@ -296,6 +297,9 @@ class FullHippoRAGAdapter(BaselineSystem):
                     "num_docs": len(docs),
                     "num_retrieved": len(retrieved_passages),
                 },
+                # Debugging fields
+                raw_answer=raw_answer,
+                extracted_answer=answer,
             )
 
         except Exception as e:
@@ -311,6 +315,8 @@ class FullHippoRAGAdapter(BaselineSystem):
                 abstained=True,
                 mode="hipporag",
                 stats={"error": str(e)},
+                raw_answer=None,
+                extracted_answer=None,
             )
 
     def get_system_info(self) -> Dict[str, Any]:

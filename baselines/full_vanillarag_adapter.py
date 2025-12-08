@@ -14,7 +14,6 @@ from baselines.full_baseline_interface import (
     LatencyTracker,
 )
 from baselines.local_llm_wrapper import LocalLLMWrapper
-from baselines.prompt_utils import build_trident_style_prompt, extract_trident_style_answer
 
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
@@ -243,6 +242,8 @@ class FullVanillaRAGAdapter(BaselineSystem):
                 abstained=True,
                 mode="vanillarag",
                 stats={},
+                raw_answer=None,
+                extracted_answer=None,
             )
 
         try:
@@ -262,19 +263,25 @@ class FullVanillaRAGAdapter(BaselineSystem):
             # Retrieve relevant chunks
             retrieval_results = self.retriever.retrieve(question, top_k=self.top_k)
 
-            # Format retrieved chunks as passages for Trident-style prompt
-            passages = []
+            # Format retrieved chunks for simple vanilla prompt
+            context_parts = []
             if retrieval_results:
-                for idx, score, chunk_text in retrieval_results:
-                    passages.append({"text": chunk_text})
+                for i, (idx, score, chunk_text) in enumerate(retrieval_results, 1):
+                    context_parts.append(f"[{i}] {chunk_text}")
             else:
-                # If no results, add empty passage
-                passages.append({"text": "(no relevant context found)"})
+                context_parts.append("(no relevant context found)")
 
-            # Generate answer using Trident's standardized prompt format
-            answer_prompt = build_trident_style_prompt(question, passages)
+            context_str = "\n\n".join(context_parts)
 
-            response = self.llm.generate(
+            # Use simple vanilla RAG prompt (no Trident-style formatting)
+            answer_prompt = (
+                f"Based on the following context, answer the question concisely.\n\n"
+                f"Context:\n{context_str}\n\n"
+                f"Question: {question}\n\n"
+                f"Answer:"
+            )
+
+            raw_response = self.llm.generate(
                 messages=[{"role": "user", "content": answer_prompt}],
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
@@ -284,15 +291,15 @@ class FullVanillaRAGAdapter(BaselineSystem):
 
             # Count tokens (rough estimate)
             prompt_tokens = len(answer_prompt.split()) * 1.3
-            completion_tokens = len(response.split()) * 1.3
+            completion_tokens = len(raw_response.split()) * 1.3
             token_tracker.add_call(
                 int(prompt_tokens),
                 int(completion_tokens),
                 "answer_generation"
             )
 
-            # Extract answer using Trident's standardized extraction
-            answer = extract_trident_style_answer(response)
+            # Use original response without Trident-style post-processing
+            answer = raw_response.strip()
 
             # Prepare selected passages
             selected_passages = [
@@ -305,7 +312,7 @@ class FullVanillaRAGAdapter(BaselineSystem):
             ]
 
             return BaselineResponse(
-                answer=answer,  # Use extracted answer with Trident's standardized extraction
+                answer=answer,  # Use original response without post-processing
                 tokens_used=token_tracker.total_tokens,
                 latency_ms=latency_tracker.get_total_latency(),
                 selected_passages=selected_passages,
@@ -316,6 +323,9 @@ class FullVanillaRAGAdapter(BaselineSystem):
                     "num_retrieved": len(retrieval_results),
                     "retrieval_scores": [float(score) for _, score, _ in retrieval_results],
                 },
+                # Debugging fields
+                raw_answer=raw_response,
+                extracted_answer=answer,
             )
 
         except Exception as e:
@@ -331,6 +341,8 @@ class FullVanillaRAGAdapter(BaselineSystem):
                 abstained=True,
                 mode="vanillarag",
                 stats={"error": str(e)},
+                raw_answer=None,
+                extracted_answer=None,
             )
 
     def get_system_info(self) -> Dict[str, Any]:
