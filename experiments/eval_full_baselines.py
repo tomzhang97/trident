@@ -13,28 +13,18 @@ Baselines:
     - HippoRAG: Memory-enhanced RAG with personalized PageRank
 
 Usage with OpenAI:
-    # KET-RAG reimplementation (runs per-query indexing)
+    # Run all baselines
     python eval_full_baselines.py \
         --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
         --output_dir results/full_baselines \
         --baselines ketrag_reimpl selfrag vanillarag hipporag
 
-    # KET-RAG official - Mode 1: 100% original KET-RAG (no modifications)
+    # KET-RAG official (uses original KET-RAG prompts and outputs)
     python eval_full_baselines.py \
         --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
         --output_dir results/full_baselines \
         --baselines ketrag_official \
-        --ketrag_context_file KET-RAG/ragtest-hotpot/output/ragtest-hotpot-keyword-0.5.json \
-        --ketrag_prompt_style original
-
-    # KET-RAG official - Mode 2: Trident-style (with context cleaning and Trident prompt)
-    python eval_full_baselines.py \
-        --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
-        --output_dir results/full_baselines \
-        --baselines ketrag_official \
-        --ketrag_context_file KET-RAG/ragtest-hotpot/output/ragtest-hotpot-keyword-0.5.json \
-        --ketrag_prompt_style trident \
-        --ketrag_clean_context
+        --ketrag_context_file KET-RAG/ragtest-hotpot/output/ragtest-hotpot-keyword-0.5.json
 
 Usage with Local LLM:
     python eval_full_baselines.py \
@@ -305,9 +295,9 @@ def main():
     parser.add_argument(
         "--baselines",
         nargs='+',
-        choices=['selfrag', 'ketrag_reimpl', 'ketrag_official', 'vanillarag', 'hipporag', 'all'],
+        choices=['selfrag', 'ketrag_reimpl', 'ketrag_official', 'vanillarag', 'hipporag', 'graphrag', 'all'],
         default=['all'],
-        help="Which baselines to evaluate (ketrag_reimpl=in-framework reimpl, ketrag_official=faithful wrapper)"
+        help="Which baselines to evaluate (ketrag_reimpl=in-framework reimpl, ketrag_official=faithful wrapper, graphrag=vanilla GraphRAG)"
     )
     parser.add_argument(
         "--max_samples",
@@ -328,24 +318,6 @@ def main():
         type=str,
         default=None,
         help="Path to precomputed context JSON for ketrag_official (from official KET-RAG pipeline)"
-    )
-    parser.add_argument(
-        "--ketrag_prompt_style",
-        type=str,
-        choices=["trident", "original"],
-        default="original",
-        help="Prompt style for ketrag_official generation (original=KET-RAG context, trident=standardized)"
-    )
-    parser.add_argument(
-        "--ketrag_compare_original_prompt",
-        action="store_true",
-        help="Also generate using the alternate prompt style for debugging (stores in stats)"
-    )
-    parser.add_argument(
-        "--ketrag_clean_context",
-        action="store_true",
-        help="Apply post-processing to clean KET-RAG context (remove noise, filter entities). "
-             "Use False for 100%% original KET-RAG, True for Trident-style comparison."
     )
     parser.add_argument(
         "--use_local_llm",
@@ -477,6 +449,27 @@ def main():
         help="Base URL for local vLLM server (e.g., http://localhost:8000/v1)"
     )
 
+    # GraphRAG options
+    parser.add_argument(
+        "--graphrag_index_dir",
+        type=str,
+        default=None,
+        help="Path to GraphRAG index output directory (from graphrag index command)"
+    )
+    parser.add_argument(
+        "--graphrag_search_method",
+        type=str,
+        choices=["local", "global"],
+        default="local",
+        help="GraphRAG search method (default: local)"
+    )
+    parser.add_argument(
+        "--graphrag_community_level",
+        type=int,
+        default=2,
+        help="GraphRAG community hierarchy level (default: 2)"
+    )
+
     args = parser.parse_args()
 
     # Normalize device format (handle both "3" and "cuda:3")
@@ -485,7 +478,7 @@ def main():
 
     # Expand 'all' to all baselines
     if 'all' in args.baselines:
-        args.baselines = ['selfrag', 'ketrag_reimpl', 'ketrag_official', 'vanillarag', 'hipporag']
+        args.baselines = ['selfrag', 'ketrag_reimpl', 'ketrag_official', 'vanillarag', 'hipporag', 'graphrag']
 
     # Load data
     print(f"Loading data from: {args.data_path}")
@@ -567,9 +560,6 @@ def main():
                     local_llm_device=args.local_llm_device,
                     load_in_8bit=args.load_in_8bit,
                     load_in_4bit=args.load_in_4bit,
-                    prompt_style=args.ketrag_prompt_style,
-                    clean_context=args.ketrag_clean_context,
-                    compare_original_prompt=args.ketrag_compare_original_prompt,
                 )
             elif baseline_name == 'vanillarag':
                 from baselines.full_vanillarag_adapter import FullVanillaRAGAdapter
@@ -598,6 +588,22 @@ def main():
                     use_local_llm=args.use_local_llm,
                     local_llm_base_url=args.hipporag_local_base_url,
                     local_llm_model=args.local_llm_model,
+                )
+            elif baseline_name == 'graphrag':
+                from baselines.full_graphrag_adapter import FullGraphRAGAdapter
+                # For GraphRAG, we need the precomputed index directory
+                index_dir = getattr(args, 'graphrag_index_dir', None)
+                if not index_dir:
+                    print("ERROR: graphrag requires --graphrag_index_dir")
+                    print("  Run the GraphRAG indexing pipeline first:")
+                    print("    cd graphrag")
+                    print("    graphrag index --root <project_root>")
+                    continue
+                baseline_system = FullGraphRAGAdapter(
+                    index_dir=index_dir,
+                    search_method=args.graphrag_search_method,
+                    community_level=args.graphrag_community_level,
+                    api_key=api_key,
                 )
             else:
                 print(f"Unknown baseline: {baseline_name}")
