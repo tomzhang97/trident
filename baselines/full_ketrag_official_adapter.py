@@ -86,6 +86,24 @@ class GraphRAGCompatibleLLM(BaseLLM):
                 base_url=self.api_base,
             )
 
+    def _do_generate(self, messages, **kwargs) -> str:
+        """Internal generation method."""
+        if self.use_local_llm and self.local_llm:
+            response = self.local_llm.generate(
+                messages=messages,
+                temperature=kwargs.get("temperature", self.temperature),
+                max_tokens=kwargs.get("max_tokens", self.max_tokens),
+            )
+            return response
+        else:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=kwargs.get("temperature", self.temperature),
+                max_tokens=kwargs.get("max_tokens", self.max_tokens),
+            )
+            return response.choices[0].message.content
+
     def generate(
         self,
         messages: list[dict[str, str]],
@@ -94,7 +112,17 @@ class GraphRAGCompatibleLLM(BaseLLM):
         **kwargs
     ) -> str:
         """Synchronous generation."""
-        return asyncio.run(self.agenerate(messages, streaming, callbacks, **kwargs))
+        return self._do_generate(messages, **kwargs)
+
+    def stream_generate(
+        self,
+        messages: list[dict[str, str]],
+        callbacks: list = None,
+        **kwargs
+    ):
+        """Synchronous streaming generation - yields full response (no true streaming)."""
+        response = self._do_generate(messages, **kwargs)
+        yield response
 
     async def agenerate(
         self,
@@ -104,23 +132,17 @@ class GraphRAGCompatibleLLM(BaseLLM):
         **kwargs
     ) -> str:
         """Async generation - required by GraphRAG."""
-        if self.use_local_llm and self.local_llm:
-            # Use local LLM
-            response = self.local_llm.generate(
-                messages=messages,
-                temperature=kwargs.get("temperature", self.temperature),
-                max_tokens=kwargs.get("max_tokens", self.max_tokens),
-            )
-            return response
-        else:
-            # Use OpenAI-compatible API
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=kwargs.get("temperature", self.temperature),
-                max_tokens=kwargs.get("max_tokens", self.max_tokens),
-            )
-            return response.choices[0].message.content
+        return self._do_generate(messages, **kwargs)
+
+    async def astream_generate(
+        self,
+        messages: list[dict[str, str]],
+        callbacks: list = None,
+        **kwargs
+    ):
+        """Async streaming generation - yields full response (no true streaming)."""
+        response = self._do_generate(messages, **kwargs)
+        yield response
 
 
 class FullKETRAGAdapter(BaselineSystem):
