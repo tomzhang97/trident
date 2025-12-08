@@ -14,7 +14,6 @@ from baselines.full_baseline_interface import (
     TokenTracker,
     LatencyTracker,
 )
-from baselines.prompt_utils import extract_trident_style_answer
 
 try:
     from vllm import LLM, SamplingParams
@@ -171,14 +170,14 @@ class FullSelfRAGAdapter(BaselineSystem):
         """
         Extract final answer from Self-RAG generation with reflection tokens.
 
-        Uses Trident's standardized answer extraction after removing Self-RAG
-        specific reflection tokens.
+        Only removes Self-RAG specific reflection tokens to get the original
+        model output. Does NOT apply any Trident-style prompt post-processing.
 
         Args:
             generation: Raw generation from model (includes reflection tokens)
 
         Returns:
-            Extracted answer text
+            Extracted answer text (original Self-RAG output)
         """
         # Remove all Self-RAG specific reflection tokens
         answer = generation
@@ -209,10 +208,7 @@ class FullSelfRAGAdapter(BaselineSystem):
         # Strip whitespace
         answer = answer.strip()
 
-        # Use Trident's standardized answer extraction
-        # This looks for "Final answer:" format or falls back to prefix removal
-        answer = extract_trident_style_answer(answer)
-
+        # Return original Self-RAG answer without further processing
         return answer
 
     def _count_tokens(self, text: str) -> int:
@@ -332,6 +328,9 @@ class FullSelfRAGAdapter(BaselineSystem):
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                 },
+                # Debugging fields
+                raw_answer=raw_generation,
+                extracted_answer=answer,
             )
 
         except Exception as e:
@@ -353,6 +352,8 @@ class FullSelfRAGAdapter(BaselineSystem):
                     "total_cost_tokens": query_token_tracker.total_tokens,
                     "error": str(e),
                 },
+                raw_answer=None,
+                extracted_answer=None,
             )
 
     def get_system_info(self) -> Dict[str, Any]:
