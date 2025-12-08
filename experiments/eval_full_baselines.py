@@ -404,8 +404,8 @@ def main():
     parser.add_argument(
         "--selfrag_threshold",
         type=float,
-        default=0.2,
-        help="Probability threshold for adaptive retrieval (default 0.2)"
+        default=None,
+        help="Probability threshold for adaptive retrieval. None = check generated text for [Retrieval] token (recommended)"
     )
     parser.add_argument(
         "--selfrag_use_groundness",

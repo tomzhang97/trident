@@ -54,8 +54,10 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
                                      w_rel=1.0, w_sup=1.0, w_use=0.5, mode="adaptive_retrieval", closed=False):
     results = {}
     if mode != "always_retrieve":
+        # Note: vLLM limits logprobs to 20, but Self-RAG reflection tokens may not be in top 20
+        # We handle missing tokens with -100 fallback in scoring
         sampling_params = SamplingParams(
-            temperature=0.0, top_p=1.0, max_tokens=max_new_tokens, logprobs=32016)
+            temperature=0.0, top_p=1.0, max_tokens=max_new_tokens, logprobs=20)
         preds = model.generate([prompt], sampling_params)
         pred_token_ids = preds[0].outputs[0].token_ids
         pred_text = preds[0].outputs[0].text
@@ -85,8 +87,10 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
     if do_retrieve is True:
         evidence_augmented_inputs = [prompt + "[Retrieval]<paragraph>{0}\n{1}</paragraph>".format(
             para["title"], para["text"]) for para in evidences]
+        # Note: vLLM limits logprobs to 20, but Self-RAG reflection tokens may not be in top 20
+        # We handle missing tokens with -100 fallback in scoring
         sampling_params = SamplingParams(
-            temperature=0.0, top_p=1.0, max_tokens=max_new_tokens, logprobs=5000)
+            temperature=0.0, top_p=1.0, max_tokens=max_new_tokens, logprobs=20)
         preds = model.generate(evidence_augmented_inputs, sampling_params)
 
         relevance_score_dict = {}
