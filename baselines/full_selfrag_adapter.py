@@ -75,7 +75,7 @@ class FullSelfRAGAdapter(BaselineSystem):
         use_groundness: bool = True,
         use_utility: bool = True,
         use_seqscore: bool = False,
-        threshold: float = 0.2,
+        threshold: Optional[float] = None,  # None = check generated text for [Retrieval] token
         w_rel: float = 1.0,
         w_sup: float = 1.0,
         w_use: float = 0.5,
@@ -99,7 +99,9 @@ class FullSelfRAGAdapter(BaselineSystem):
             use_groundness: Use groundedness/support tokens for scoring
             use_utility: Use utility tokens for scoring
             use_seqscore: Include sequence probability in scoring
-            threshold: Probability threshold for adaptive retrieval (default 0.2)
+            threshold: Probability threshold for adaptive retrieval. Set to None to check
+                      generated text for [Retrieval] token (recommended for newer vLLM versions
+                      which limit logprobs to 20)
             w_rel: Weight for relevance scores (default 1.0)
             w_sup: Weight for support/groundness scores (default 1.0)
             w_use: Weight for utility scores (default 0.5)
