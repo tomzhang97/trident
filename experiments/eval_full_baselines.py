@@ -394,6 +394,42 @@ def main():
         default=0.5,
         help="GPU memory utilization fraction for Self-RAG (default 0.5)"
     )
+    parser.add_argument(
+        "--selfrag_mode",
+        type=str,
+        default="adaptive_retrieval",
+        choices=["adaptive_retrieval", "no_retrieval", "always_retrieve"],
+        help="Self-RAG retrieval mode (default: adaptive_retrieval)"
+    )
+    parser.add_argument(
+        "--selfrag_threshold",
+        type=float,
+        default=0.2,
+        help="Probability threshold for adaptive retrieval (default 0.2)"
+    )
+    parser.add_argument(
+        "--selfrag_use_groundness",
+        action="store_true",
+        default=True,
+        help="Use groundedness/support tokens for scoring (default: True)"
+    )
+    parser.add_argument(
+        "--selfrag_use_utility",
+        action="store_true",
+        default=True,
+        help="Use utility tokens for scoring (default: True)"
+    )
+    parser.add_argument(
+        "--selfrag_use_seqscore",
+        action="store_true",
+        help="Include sequence probability in scoring"
+    )
+    parser.add_argument(
+        "--selfrag_ndocs",
+        type=int,
+        default=10,
+        help="Number of documents for retrieval scoring (default: 10)"
+    )
 
     # Vanilla RAG options
     parser.add_argument(
@@ -483,9 +519,15 @@ def main():
                     model_name=args.selfrag_model,
                     max_tokens=args.selfrag_max_tokens,
                     temperature=0.0,
-                    provide_context=True,  # Provide dataset context
                     gpu_memory_utilization=args.selfrag_gpu_memory_utilization,
-                    device=args.local_llm_device,  # Use specified GPU device
+                    device=args.local_llm_device,
+                    # Vanilla Self-RAG settings
+                    mode=args.selfrag_mode,
+                    threshold=args.selfrag_threshold,
+                    use_groundness=args.selfrag_use_groundness,
+                    use_utility=args.selfrag_use_utility,
+                    use_seqscore=args.selfrag_use_seqscore,
+                    ndocs=args.selfrag_ndocs,
                 )
             elif baseline_name == 'ketrag_reimpl':
                 from baselines.full_ketrag_reimpl_adapter import FullKETRAGReimplAdapter

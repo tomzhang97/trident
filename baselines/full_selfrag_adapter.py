@@ -1,4 +1,8 @@
-"""Full Self-RAG adapter for HotpotQA evaluation using the official Self-RAG model."""
+"""Full Self-RAG adapter using the vanilla Self-RAG implementation.
+
+This adapter uses the original Self-RAG code from self-rag/retrieval_lm/
+to run inference exactly as the original paper intended.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +10,6 @@ import sys
 import os
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-import re
 
 from baselines.full_baseline_interface import (
     BaselineSystem,
@@ -15,45 +18,52 @@ from baselines.full_baseline_interface import (
     LatencyTracker,
 )
 
+# Add the self-rag folder to path for imports
+SELFRAG_PATH = Path(__file__).parent.parent / "self-rag" / "retrieval_lm"
+if str(SELFRAG_PATH) not in sys.path:
+    sys.path.insert(0, str(SELFRAG_PATH))
+
 try:
     from vllm import LLM, SamplingParams
-    import tiktoken
+    from transformers import AutoTokenizer
     VLLM_AVAILABLE = True
 except ImportError as e:
     VLLM_AVAILABLE = False
     VLLM_IMPORT_ERROR = str(e)
 
+# Import from vanilla Self-RAG
+try:
+    from utils import (
+        PROMPT_DICT,
+        load_special_tokens,
+        postprocess,
+        control_tokens,
+    )
+    from run_short_form import call_model_rerank_w_scores_batch
+    from metrics import qa_f1_score, normalize_answer
+    SELFRAG_IMPORTS_AVAILABLE = True
+except ImportError as e:
+    SELFRAG_IMPORTS_AVAILABLE = False
+    SELFRAG_IMPORT_ERROR = str(e)
+
 
 class FullSelfRAGAdapter(BaselineSystem):
     """
-    Full Self-RAG adapter using the official Self-RAG model from HuggingFace.
+    Full Self-RAG adapter using the vanilla Self-RAG implementation.
 
-    This adapter:
-    1. Loads the Self-RAG fine-tuned model (7B or 13B)
-    2. Formats HotpotQA context with Self-RAG's special token syntax
-    3. Generates answers with reflection tokens ([Retrieval], [Relevant], etc.)
-    4. Extracts final answer and tracks all tokens
+    This adapter uses the original Self-RAG code from self-rag/retrieval_lm/
+    including:
+    - call_model_rerank_w_scores_batch() for inference with reflection token scoring
+    - postprocess() for cleaning output
+    - load_special_tokens() for reflection token IDs
+    - Original prompt format from PROMPT_DICT
 
-    Self-RAG uses special reflection tokens:
-    - [Retrieval]: Decides whether to retrieve
-    - [No Retrieval]: Decides not to retrieve
-    - [Relevant]: Retrieved content is relevant
-    - [Irrelevant]: Retrieved content is not relevant
-    - [Fully supported]: Answer is fully supported by evidence
-    - [Partially supported]: Answer is partially supported
-    - [No support]: Answer has no support
+    Self-RAG reflection tokens:
+    - [Retrieval] / [No Retrieval]: Retrieval decision
+    - [Relevant] / [Irrelevant]: Context relevance
+    - [Fully supported] / [Partially supported] / [No support / Contradictory]: Groundedness
     - [Utility:1-5]: Utility score
     """
-
-    # Self-RAG special tokens (matching FlashRAG's implementation)
-    RETRIEVAL_TOKENS = ["[Retrieval]", "[No Retrieval]", "[Continue to Use Evidence]"]
-    RELEVANCE_TOKENS = ["[Relevant]", "[Irrelevant]"]
-    SUPPORT_TOKENS = [
-        "[Fully supported]",
-        "[Partially supported]",
-        "[No support / Contradictory]"  # Correct token format with "/ Contradictory"!
-    ]
-    UTILITY_TOKENS = [f"[Utility:{i}]" for i in range(1, 6)]
 
     def __init__(
         self,
@@ -62,14 +72,21 @@ class FullSelfRAGAdapter(BaselineSystem):
         max_tokens: int = 100,
         temperature: float = 0.0,
         top_p: float = 1.0,
-        use_critic: bool = True,
-        provide_context: bool = True,
+        use_groundness: bool = True,
+        use_utility: bool = True,
+        use_seqscore: bool = False,
+        threshold: float = 0.2,
+        w_rel: float = 1.0,
+        w_sup: float = 1.0,
+        w_use: float = 0.5,
+        mode: str = "adaptive_retrieval",
+        ndocs: int = 10,
         gpu_memory_utilization: float = 0.5,
         device: Optional[str] = None,
         **kwargs
     ):
         """
-        Initialize Self-RAG adapter.
+        Initialize Self-RAG adapter with vanilla Self-RAG settings.
 
         Args:
             model_name: HuggingFace model name
@@ -79,11 +96,17 @@ class FullSelfRAGAdapter(BaselineSystem):
             max_tokens: Max tokens to generate
             temperature: Sampling temperature (0.0 for greedy)
             top_p: Top-p sampling
-            use_critic: Whether to use critic tokens in generation
-            provide_context: Whether to provide context to model (vs let it decide to retrieve)
-            gpu_memory_utilization: GPU memory fraction to use (default 0.5 = 50%)
+            use_groundness: Use groundedness/support tokens for scoring
+            use_utility: Use utility tokens for scoring
+            use_seqscore: Include sequence probability in scoring
+            threshold: Probability threshold for adaptive retrieval (default 0.2)
+            w_rel: Weight for relevance scores (default 1.0)
+            w_sup: Weight for support/groundness scores (default 1.0)
+            w_use: Weight for utility scores (default 0.5)
+            mode: Retrieval mode - "adaptive_retrieval", "no_retrieval", "always_retrieve"
+            ndocs: Number of documents to use for retrieval scoring
+            gpu_memory_utilization: GPU memory fraction to use (default 0.5)
             device: GPU device to use (e.g., "cuda:0", "cuda:2", or "0", "2")
-                    If None, uses default CUDA device
             **kwargs: Additional config
         """
         super().__init__(name="selfrag", **kwargs)
@@ -94,130 +117,80 @@ class FullSelfRAGAdapter(BaselineSystem):
                 f"Error: {VLLM_IMPORT_ERROR}"
             )
 
+        if not SELFRAG_IMPORTS_AVAILABLE:
+            raise ImportError(
+                f"Self-RAG imports not available. Check self-rag/retrieval_lm/ folder.\n"
+                f"Error: {SELFRAG_IMPORT_ERROR}"
+            )
+
         self.model_name = model_name
         self.download_dir = download_dir or os.getenv("HF_CACHE_DIR")
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p
-        self.use_critic = use_critic
-        self.provide_context = provide_context
+
+        # Self-RAG specific settings (from vanilla implementation)
+        self.use_groundness = use_groundness
+        self.use_utility = use_utility
+        self.use_seqscore = use_seqscore
+        self.threshold = threshold
+        self.w_rel = w_rel
+        self.w_sup = w_sup
+        self.w_use = w_use
+        self.mode = mode
+        self.ndocs = ndocs
 
         # Set CUDA device if specified
-        # vLLM uses CUDA_VISIBLE_DEVICES to control GPU selection
         if device is not None:
-            # Normalize device format: "cuda:2" -> "2", "2" -> "2"
             if device.startswith("cuda:"):
                 device_id = device.split(":")[-1]
             else:
                 device_id = device
-
             print(f"Setting CUDA_VISIBLE_DEVICES={device_id} for Self-RAG")
             os.environ["CUDA_VISIBLE_DEVICES"] = device_id
 
-        # Load model
+        # Load model using vLLM (same as vanilla Self-RAG)
         print(f"Loading Self-RAG model: {model_name}...")
         self.model = LLM(
             model_name,
             download_dir=self.download_dir,
-            dtype="half",  # Use FP16 for efficiency
+            dtype="half",
             tensor_parallel_size=1,
             gpu_memory_utilization=gpu_memory_utilization,
         )
 
-        # Sampling params
-        self.sampling_params = SamplingParams(
-            temperature=self.temperature,
-            top_p=self.top_p,
-            max_tokens=self.max_tokens,
-            skip_special_tokens=False,  # Important: keep reflection tokens
+        # Load tokenizer for special token IDs
+        print(f"Loading tokenizer for reflection tokens...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
+
+        # Get reflection token IDs using vanilla Self-RAG function
+        self.ret_tokens, self.rel_tokens, self.grd_tokens, self.ut_tokens = load_special_tokens(
+            self.tokenizer,
+            use_grounding=self.use_groundness,
+            use_utility=self.use_utility
         )
 
-        # Tokenizer for token counting
-        try:
-            self.tokenizer = tiktoken.get_encoding("cl100k_base")  # GPT-4 tokenizer as approximation
-        except:
-            self.tokenizer = None
+        print(f"Self-RAG initialized with mode={mode}, threshold={threshold}")
 
-    def _format_prompt(self, question: str, context: Optional[List[List[str]]] = None) -> str:
+    def _format_evidences(self, context: List[List[str]]) -> List[Dict[str, str]]:
         """
-        Format prompt in Self-RAG style.
+        Format HotpotQA context into Self-RAG evidence format.
 
         Args:
-            question: The question
-            context: Optional HotpotQA context
+            context: HotpotQA context (list of [title, sentences] pairs)
 
         Returns:
-            Formatted prompt string
+            List of evidence dicts with 'title' and 'text' keys
         """
-        prompt = f"### Instruction:\n{question}\n\n### Response:\n"
-
-        if self.provide_context and context:
-            # Format context as paragraphs
-            paragraphs = []
-            for title, sentences in context:
-                text = " ".join(sentences) if isinstance(sentences, list) else sentences
-                paragraphs.append(text)
-
-            # Combine paragraphs
-            combined_context = " ".join(paragraphs)
-
-            # Add retrieval marker and context
-            prompt += f"[Retrieval]<paragraph>{combined_context}</paragraph>"
-
-        return prompt
-
-    def _extract_answer(self, generation: str) -> str:
-        """
-        Extract final answer from Self-RAG generation with reflection tokens.
-
-        Only removes Self-RAG specific reflection tokens to get the original
-        model output. Does NOT apply any Trident-style prompt post-processing.
-
-        Args:
-            generation: Raw generation from model (includes reflection tokens)
-
-        Returns:
-            Extracted answer text (original Self-RAG output)
-        """
-        # Remove all Self-RAG specific reflection tokens
-        answer = generation
-
-        # Remove retrieval tokens
-        for token in self.RETRIEVAL_TOKENS:
-            answer = answer.replace(token, "")
-
-        # Remove relevance tokens
-        for token in self.RELEVANCE_TOKENS:
-            answer = answer.replace(token, "")
-
-        # Remove support tokens
-        for token in self.SUPPORT_TOKENS:
-            answer = answer.replace(token, "")
-
-        # Remove utility tokens
-        for token in self.UTILITY_TOKENS:
-            answer = answer.replace(token, "")
-
-        # Remove paragraph tags
-        answer = re.sub(r'</?paragraph>', '', answer)
-
-        # Remove special tokens
-        answer = answer.replace('</s>', '')
-        answer = answer.replace('<s>', '')
-
-        # Strip whitespace
-        answer = answer.strip()
-
-        # Return original Self-RAG answer without further processing
-        return answer
+        evidences = []
+        for title, sentences in context:
+            text = " ".join(sentences) if isinstance(sentences, list) else sentences
+            evidences.append({"title": title, "text": text})
+        return evidences
 
     def _count_tokens(self, text: str) -> int:
-        """Count tokens in text."""
-        if self.tokenizer:
-            return len(self.tokenizer.encode(text))
-        else:
-            # Fallback: approximate as ~1.3 tokens per word
-            return int(len(text.split()) * 1.3)
+        """Count tokens in text using the model's tokenizer."""
+        return len(self.tokenizer.encode(text))
 
     def answer(
         self,
@@ -227,17 +200,10 @@ class FullSelfRAGAdapter(BaselineSystem):
         metadata: Optional[Dict[str, Any]] = None
     ) -> BaselineResponse:
         """
-        Answer a question using Self-RAG (Aligned with Separated Metrics).
+        Answer a question using vanilla Self-RAG implementation.
 
-        Note: Self-RAG uses its native prompt format ("### Instruction:", etc.)
-        which is required for the fine-tuned model to work correctly. Changing
-        the prompt format would break Self-RAG's core functionality. Only answer
-        extraction is standardized to match Trident for fair comparison.
-
-        Metrics reported:
-        - tokens_used, latency_ms: QUERY ONLY (Self-RAG has no indexing phase)
-        - stats['indexing_*']: Zero (Self-RAG uses pre-trained model, no per-query indexing)
-        - stats['total_cost_tokens']: Same as query_tokens (no offline costs)
+        Uses call_model_rerank_w_scores_batch() from the original Self-RAG code
+        for inference with full reflection token scoring.
 
         Args:
             question: The question to answer
@@ -248,54 +214,59 @@ class FullSelfRAGAdapter(BaselineSystem):
         Returns:
             BaselineResponse with answer and metrics
         """
-        # Self-RAG has NO indexing phase (uses pre-trained fine-tuned model)
-        # All costs are in the query phase
         query_token_tracker = TokenTracker()
         query_latency_tracker = LatencyTracker()
 
         try:
-            # Format prompt
-            prompt = self._format_prompt(question, context)
+            # Format prompt using vanilla Self-RAG format
+            prompt = PROMPT_DICT["prompt_no_input"].format_map({"instruction": question})
 
-            # Generate with Self-RAG (Query Phase)
+            # Format evidences from context
+            evidences = self._format_evidences(context) if context else []
+
+            # Limit evidences to ndocs
+            evidences = evidences[:self.ndocs]
+
+            # Generate using vanilla Self-RAG function
             query_latency_tracker.start()
-            outputs = self.model.generate([prompt], self.sampling_params)
+            pred, results, do_retrieve = call_model_rerank_w_scores_batch(
+                prompt=prompt,
+                evidences=evidences,
+                model=self.model,
+                max_new_tokens=self.max_tokens,
+                ret_tokens=self.ret_tokens,
+                rel_tokens=self.rel_tokens,
+                grd_tokens=self.grd_tokens,
+                ut_tokens=self.ut_tokens,
+                use_seqscore=self.use_seqscore,
+                threshold=self.threshold,
+                w_rel=self.w_rel,
+                w_sup=self.w_sup,
+                w_use=self.w_use,
+                mode=self.mode,
+                closed=False,  # HotpotQA is open-domain QA
+            )
             query_latency_tracker.stop("generation")
 
-            # Extract generation
-            if not outputs or not outputs[0].outputs:
-                raise ValueError("No output generated")
+            # pred is already postprocessed by call_model_rerank_w_scores_batch
+            # Use the vanilla postprocess function to ensure clean output
+            answer = postprocess(pred) if pred else pred
 
-            raw_generation = outputs[0].outputs[0].text
-
-            # Extract answer
-            answer = self._extract_answer(raw_generation)
+            # Get raw generation from results for debugging
+            raw_generation = None
+            if "no_retrieval" in results:
+                raw_generation = results["no_retrieval"]
+            elif results:
+                # Get the best retrieval result
+                for key in results:
+                    if key.startswith("retrieval_"):
+                        raw_generation = results[key].get("pred", "")
+                        break
 
             # Count tokens
             prompt_tokens = self._count_tokens(prompt)
-            completion_tokens = self._count_tokens(raw_generation)
+            completion_tokens = self._count_tokens(answer) if answer else 0
             query_token_tracker.add_call(prompt_tokens, completion_tokens, purpose="generation")
-
-            # Parse reflection tokens for stats
-            used_retrieval = "[Retrieval]" in raw_generation
-            relevance_label = None
-            for token in self.RELEVANCE_TOKENS:
-                if token in raw_generation:
-                    relevance_label = token
-                    break
-
-            support_label = None
-            for token in self.SUPPORT_TOKENS:
-                if token in raw_generation:
-                    support_label = token
-                    break
-
-            utility_score = None
-            for i in range(5, 0, -1):
-                token = f"[Utility:{i}]"
-                if token in raw_generation:
-                    utility_score = i
-                    break
 
             # Prepare selected passages
             selected_passages = []
@@ -306,29 +277,29 @@ class FullSelfRAGAdapter(BaselineSystem):
 
             return BaselineResponse(
                 answer=answer,
-                # PRIMARY METRICS: Only Query costs (matches original Self-RAG paper)
                 tokens_used=query_token_tracker.total_tokens,
                 latency_ms=query_latency_tracker.get_total_latency(),
                 selected_passages=selected_passages,
                 abstained=False,
                 mode="selfrag",
                 stats={
-                    # Aligned with GraphRAG/KET-RAG format
-                    "indexing_latency_ms": 0.0,  # Zero for Self-RAG (no indexing phase)
+                    "indexing_latency_ms": 0.0,
                     "indexing_tokens": 0,
                     "query_tokens": query_token_tracker.total_tokens,
                     "total_cost_tokens": query_token_tracker.total_tokens,
                     # Self-RAG specific stats
                     "raw_generation": raw_generation,
-                    "used_retrieval": used_retrieval,
-                    "relevance_label": relevance_label,
-                    "support_label": support_label,
-                    "utility_score": utility_score,
+                    "do_retrieve": do_retrieve,
+                    "all_results": results,
                     "num_context_docs": len(context) if context else 0,
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
+                    # Vanilla Self-RAG settings
+                    "mode": self.mode,
+                    "threshold": self.threshold,
+                    "use_groundness": self.use_groundness,
+                    "use_utility": self.use_utility,
                 },
-                # Debugging fields
                 raw_answer=raw_generation,
                 extracted_answer=answer,
             )
@@ -359,12 +330,19 @@ class FullSelfRAGAdapter(BaselineSystem):
     def get_system_info(self) -> Dict[str, Any]:
         """Get system information."""
         return {
-            "name": "Self-RAG",
-            "version": "full",
+            "name": "Self-RAG (Vanilla)",
+            "version": "vanilla",
             "model": self.model_name,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "top_p": self.top_p,
-            "use_critic": self.use_critic,
-            "provide_context": self.provide_context,
+            "mode": self.mode,
+            "threshold": self.threshold,
+            "use_groundness": self.use_groundness,
+            "use_utility": self.use_utility,
+            "use_seqscore": self.use_seqscore,
+            "w_rel": self.w_rel,
+            "w_sup": self.w_sup,
+            "w_use": self.w_use,
+            "ndocs": self.ndocs,
         }
