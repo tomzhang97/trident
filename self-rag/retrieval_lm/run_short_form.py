@@ -48,14 +48,26 @@ def postprocess_answer_option_conditioned(answer):
     return answer
 
 
+def get_logprob_value(logprob):
+    """Extract float value from vLLM Logprob object (handles both old and new API)."""
+    if hasattr(logprob, 'logprob'):
+        # New vLLM API: Logprob object with .logprob attribute
+        return float(logprob.logprob)
+    else:
+        # Old vLLM API: direct float value
+        return float(logprob)
+
+
 def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15,
                                      ret_tokens=None, rel_tokens=None, grd_tokens=None, ut_tokens=None,
                                      use_seqscore=False, threshold=0.5,
                                      w_rel=1.0, w_sup=1.0, w_use=0.5, mode="adaptive_retrieval", closed=False):
     results = {}
     if mode != "always_retrieve":
+        # Note: vLLM limits logprobs to 20, but Self-RAG reflection tokens may not be in top 20
+        # We handle missing tokens with -100 fallback in scoring
         sampling_params = SamplingParams(
-            temperature=0.0, top_p=1.0, max_tokens=max_new_tokens, logprobs=32016)
+            temperature=0.0, top_p=1.0, max_tokens=max_new_tokens, logprobs=20)
         preds = model.generate([prompt], sampling_params)
         pred_token_ids = preds[0].outputs[0].token_ids
         pred_text = preds[0].outputs[0].text
@@ -75,18 +87,21 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
             for tok, id in ret_tokens.items():
                 if id not in pred_log_probs[0]:
                     score_dict[tok] = -100
-                prob = pred_log_probs[0][id]
-                score_dict[tok] = float(prob)
+                else:
+                    prob = pred_log_probs[0][id]
+                    score_dict[tok] = get_logprob_value(prob)
             do_retrieve = score_dict["[Retrieval]"] / (
                 score_dict["[Retrieval]"] + score_dict["[No Retrieval]"]) > threshold
         else:
-            do_retrieve = "[Retrieval]" in pred
+            do_retrieve = "[Retrieval]" in pred_text
 
     if do_retrieve is True:
         evidence_augmented_inputs = [prompt + "[Retrieval]<paragraph>{0}\n{1}</paragraph>".format(
             para["title"], para["text"]) for para in evidences]
+        # Note: vLLM limits logprobs to 20, but Self-RAG reflection tokens may not be in top 20
+        # We handle missing tokens with -100 fallback in scoring
         sampling_params = SamplingParams(
-            temperature=0.0, top_p=1.0, max_tokens=max_new_tokens, logprobs=5000)
+            temperature=0.0, top_p=1.0, max_tokens=max_new_tokens, logprobs=20)
         preds = model.generate(evidence_augmented_inputs, sampling_params)
 
         relevance_score_dict = {}
@@ -105,8 +120,11 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
             ut_score_dict.setdefault(p_idx, {})
             # Compute reward scores
             for tok, id in rel_tokens.items():
-                prob = pred_log_probs[0][id] if id in pred_log_probs[0] else -100
-                relevance_score_dict[p_idx][tok] = np.exp(float(prob))
+                if id in pred_log_probs[0]:
+                    prob = get_logprob_value(pred_log_probs[0][id])
+                else:
+                    prob = -100
+                relevance_score_dict[p_idx][tok] = np.exp(prob)
 
             if grd_tokens is not None:
                 groundness_token_appear_indices = []
@@ -117,8 +135,11 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
                 if len(groundness_token_appear_indices) > 0:
                     idx = groundness_token_appear_indices[0]
                     for token, token_id in grd_tokens.items():
-                        prob = pred_log_probs[idx][token_id] if token_id in pred_log_probs[idx] else -100
-                        grd_score_dict[p_idx][token] = np.exp(float(prob))
+                        if token_id in pred_log_probs[idx]:
+                            prob = get_logprob_value(pred_log_probs[idx][token_id])
+                        else:
+                            prob = -100
+                        grd_score_dict[p_idx][token] = np.exp(prob)
 
             if ut_tokens is not None:
                 utility_token_appear_indices = []
@@ -128,8 +149,11 @@ def call_model_rerank_w_scores_batch(prompt, evidences, model, max_new_tokens=15
                 if len(utility_token_appear_indices) > 0:
                     idx = utility_token_appear_indices[0]
                     for token, token_id in ut_tokens.items():
-                        prob = pred_log_probs[idx][token_id] if token_id in pred_log_probs[idx] else -100
-                        ut_score_dict[p_idx][token] = np.exp(float(prob))
+                        if token_id in pred_log_probs[idx]:
+                            prob = get_logprob_value(pred_log_probs[idx][token_id])
+                        else:
+                            prob = -100
+                        ut_score_dict[p_idx][token] = np.exp(prob)
 
             relevance_score = relevance_score_dict[p_idx]["[Relevant]"] / (
                 np.sum(list(relevance_score_dict[p_idx].values())))
