@@ -94,17 +94,16 @@ python scripts/prompt_tune_ketrag.py ragtest-musique/ \
 ### Step 5: Build the Index
 
 ```bash
-# Make sure you're using KET-RAG's graphrag (not the newer version)
-cd external_baselines/KET-RAG
-python -m graphrag index --root ../../ragtest-musique/
+# Use standalone script (recommended - avoids typer CLI issues)
+python scripts/run_ketrag_index.py ragtest-musique/
 
-# Or set PYTHONPATH explicitly
-PYTHONPATH=external_baselines/KET-RAG python -m graphrag index --root ragtest-musique/
+# With verbose logging
+python scripts/run_ketrag_index.py ragtest-musique/ --verbose
 ```
 
 This creates parquet files in `ragtest-musique/output/`.
 
-**Note**: If you have both KET-RAG and the newer graphrag installed, ensure you're using the correct version. KET-RAG uses graphrag 0.4.1.
+**Note**: The standalone script bypasses the typer CLI version incompatibility in KET-RAG's graphrag (v0.4.1).
 
 ### Step 6: Generate Context
 
