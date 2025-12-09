@@ -78,20 +78,33 @@ ragtest-musique/
 
 ### Step 4: Tune Prompts (Optional)
 
+**Note**: This step is optional. Default prompts work well for most use cases.
+
 ```bash
-python -m graphrag prompt-tune \
-    --root ragtest-musique/ \
-    --config ragtest-musique/settings.yaml \
-    --discover-entity-types
+# Use the standalone script (recommended - avoids typer CLI issues)
+python scripts/prompt_tune_ketrag.py ragtest-musique/
+
+# Or with options
+python scripts/prompt_tune_ketrag.py ragtest-musique/ \
+    --domain "multi-hop question answering" \
+    --selection-method random \
+    --limit 15
 ```
 
 ### Step 5: Build the Index
 
 ```bash
-python -m graphrag index --root ragtest-musique/
+# Make sure you're using KET-RAG's graphrag (not the newer version)
+cd external_baselines/KET-RAG
+python -m graphrag index --root ../../ragtest-musique/
+
+# Or set PYTHONPATH explicitly
+PYTHONPATH=external_baselines/KET-RAG python -m graphrag index --root ragtest-musique/
 ```
 
 This creates parquet files in `ragtest-musique/output/`.
+
+**Note**: If you have both KET-RAG and the newer graphrag installed, ensure you're using the correct version. KET-RAG uses graphrag 0.4.1.
 
 ### Step 6: Generate Context
 
