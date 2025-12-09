@@ -1,46 +1,17 @@
-"""Faithful KET-RAG adapter - uses precomputed contexts from official KET-RAG pipeline.
+"""Vanilla KET-RAG adapter using the original KET-RAG implementation.
 
-This adapter is a TRUE faithful wrapper around official KET-RAG:
-- Uses official KET-RAG CLI for indexing and context retrieval
-- Reads precomputed contexts from JSON files
-- Supports TWO modes:
-
-  MODE 1: Original KET-RAG (100% unchanged)
-    prompt_style="original", clean_context=False
-    - Uses KET-RAG's original prompt format
-    - Uses KET-RAG's original context as-is (no modifications)
-    - Uses KET-RAG's original answer extraction
-    - This is the TRUE original KET-RAG behavior
-
-  MODE 2: Trident-style (for fair comparison)
-    prompt_style="trident", clean_context=True
-    - Uses Trident's prompt format
-    - Cleans KET-RAG context (removes noise, filters entities)
-    - Uses Trident's answer extraction logic
-
-Architecture:
-    1. OFFLINE (manual step): Run official KET-RAG pipeline
-       $ cd KET-RAG
-       $ poetry run graphrag index --root ragtest-hotpot/
-       $ poetry run python indexing_sket/create_context.py ragtest-hotpot/ keyword 0.5
-
-    2. ONLINE (this adapter): Load precomputed contexts and generate answers
-       - Reads contexts from JSON: {question_id: context_string}
-       - Formats prompt based on mode (original or trident)
-       - Calls user-specified LLM
-       - Extracts answer based on mode
-
-This ensures:
-- ALL retrieval logic is 100% original KET-RAG
-- User can choose between original KET-RAG or Trident-style generation
+This adapter uses the original KET-RAG code from KET-RAG/indexing_sket/
+to run queries exactly as the original paper intended.
 """
 
 from __future__ import annotations
 
-import json
+import sys
 import os
+import asyncio
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+import json
 
 from baselines.full_baseline_interface import (
     BaselineSystem,
@@ -48,67 +19,150 @@ from baselines.full_baseline_interface import (
     TokenTracker,
     LatencyTracker,
 )
-from baselines.local_llm_wrapper import LocalLLMWrapper
-from baselines.prompt_utils import (
-    build_ketrag_original_prompt,
-    extract_ketrag_original_answer,
-)
 
-# Import GraphRAG for LLM wrapper (when using OpenAI)
+# Add the KET-RAG folder to path for imports
+KETRAG_PATH = Path(__file__).parent.parent / "KET-RAG"
+KETRAG_SKET_PATH = KETRAG_PATH / "indexing_sket"
+if str(KETRAG_SKET_PATH) not in sys.path:
+    sys.path.insert(0, str(KETRAG_SKET_PATH))
+if str(KETRAG_PATH) not in sys.path:
+    sys.path.insert(0, str(KETRAG_PATH))
+
 try:
-    from graphrag.config.enums import ModelType
-    from graphrag.config.models.language_model_config import LanguageModelConfig
-    from graphrag.language_model.manager import ModelManager
-    GRAPHRAG_AVAILABLE = True
+    import tiktoken
+    import numpy as np
+    from util_v1 import MyLocalSearch, LOCAL_SEARCH_EXACT_SYSTEM_PROMPT, f1_score, exact_match_score
+    from graphrag.query.llm.base import BaseLLM
+    from graphrag.query.llm.text_utils import num_tokens
+    from graphrag.query.structured_search.local_search.mixed_context import LocalSearchMixedContext
+    from graphrag.query.context_builder.entity_extraction import EntityVectorStoreKey
+    KETRAG_AVAILABLE = True
+except ImportError as e:
+    KETRAG_AVAILABLE = False
+    KETRAG_IMPORT_ERROR = str(e)
+
+# Import local LLM wrapper
+try:
+    from baselines.local_llm_wrapper import LocalLLMWrapper
+    LOCAL_LLM_AVAILABLE = True
 except ImportError:
-    GRAPHRAG_AVAILABLE = False
+    LOCAL_LLM_AVAILABLE = False
+
+# Import OpenAI
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
 
 
-class OpenAILLMWrapper:
-    """Wrapper for GraphRAG chat model to provide compatible generate() method."""
+class GraphRAGCompatibleLLM(BaseLLM):
+    """
+    LLM wrapper that conforms to GraphRAG's BaseLLM interface.
+    Allows using custom LLMs (local or OpenAI-compatible) with KET-RAG.
+    """
 
-    def __init__(self, chat_model):
-        self.chat_model = chat_model
+    def __init__(
+        self,
+        model: str = "gpt-4o-mini",
+        api_key: Optional[str] = None,
+        api_base: Optional[str] = None,
+        use_local_llm: bool = False,
+        local_llm_wrapper: Optional[Any] = None,
+        temperature: float = 0.0,
+        max_tokens: int = 500,
+    ):
+        self.model = model
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.api_base = api_base
+        self.use_local_llm = use_local_llm
+        self.local_llm = local_llm_wrapper
+        self.temperature = temperature
+        self.max_tokens = max_tokens
 
-    def generate(self, messages, temperature=0.0, max_tokens=500, **kwargs):
-        """Generate a response using the chat model."""
-        if isinstance(messages, list) and len(messages) > 0 and isinstance(messages[0], dict):
-            chat_messages = messages
+        if not use_local_llm and OPENAI_AVAILABLE:
+            self.client = openai.OpenAI(
+                api_key=self.api_key,
+                base_url=self.api_base,
+            )
+
+    def _do_generate(self, messages, **kwargs) -> str:
+        """Internal generation method."""
+        if self.use_local_llm and self.local_llm:
+            response = self.local_llm.generate(
+                messages=messages,
+                temperature=kwargs.get("temperature", self.temperature),
+                max_tokens=kwargs.get("max_tokens", self.max_tokens),
+            )
+            return response
         else:
-            chat_messages = [{"role": "user", "content": str(messages)}]
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=kwargs.get("temperature", self.temperature),
+                max_tokens=kwargs.get("max_tokens", self.max_tokens),
+            )
+            return response.choices[0].message.content
 
-        response = self.chat_model.generate(
-            messages=chat_messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            **kwargs
-        )
+    def generate(
+        self,
+        messages: list[dict[str, str]],
+        streaming: bool = False,
+        callbacks: list = None,
+        **kwargs
+    ) -> str:
+        """Synchronous generation."""
+        return self._do_generate(messages, **kwargs)
 
-        if hasattr(response, 'text'):
-            return response.text
-        elif hasattr(response, 'content'):
-            return response.content
-        else:
-            return str(response)
+    def stream_generate(
+        self,
+        messages: list[dict[str, str]],
+        callbacks: list = None,
+        **kwargs
+    ):
+        """Synchronous streaming generation - yields full response (no true streaming)."""
+        response = self._do_generate(messages, **kwargs)
+        yield response
+
+    async def agenerate(
+        self,
+        messages: list[dict[str, str]],
+        streaming: bool = False,
+        callbacks: list = None,
+        **kwargs
+    ) -> str:
+        """Async generation - required by GraphRAG."""
+        return self._do_generate(messages, **kwargs)
+
+    async def astream_generate(
+        self,
+        messages: list[dict[str, str]],
+        callbacks: list = None,
+        **kwargs
+    ):
+        """Async streaming generation - yields full response (no true streaming)."""
+        response = self._do_generate(messages, **kwargs)
+        yield response
 
 
 class FullKETRAGAdapter(BaselineSystem):
     """
-    Faithful wrapper around official KET-RAG implementation.
+    Vanilla KET-RAG adapter using the original KET-RAG implementation.
 
-    Uses precomputed contexts from the official KET-RAG pipeline.
-    Only standardizes the final generation step for fair comparison.
+    This adapter uses the original KET-RAG code from KET-RAG/indexing_sket/
+    including:
+    - MyLocalSearch for answer generation with precomputed context
+    - LOCAL_SEARCH_EXACT_SYSTEM_PROMPT for the system prompt
+    - Original KET-RAG context format
 
-    This is what you asked for:
-    - "faithful original ket-rag" ✓
-    - "change the prompt and llm model to my own" ✓
-    - "have it run like it did originally" ✓
+    The LLM can be swapped to use local models or OpenAI-compatible APIs.
     """
 
     def __init__(
         self,
         context_file: str,
         api_key: Optional[str] = None,
+        api_base: Optional[str] = None,
         model: str = "gpt-4o-mini",
         temperature: float = 0.0,
         max_tokens: int = 500,
@@ -120,41 +174,48 @@ class FullKETRAGAdapter(BaselineSystem):
         **kwargs
     ):
         """
-        Initialize faithful KET-RAG adapter using vanilla KET-RAG prompts and outputs.
-
-        This adapter uses:
-        - Official KET-RAG precomputed contexts (from create_context.py)
-        - Original KET-RAG prompt format
-        - Original KET-RAG answer extraction (no Trident post-processing)
+        Initialize vanilla KET-RAG adapter.
 
         Args:
-            context_file: Path to precomputed context JSON from official KET-RAG
-                         (e.g., KET-RAG/ragtest-hotpot/output/ragtest-hotpot-keyword-0.5.json)
+            context_file: Path to precomputed context JSON from KET-RAG create_context.py
             api_key: OpenAI API key (if using OpenAI)
+            api_base: OpenAI API base URL (for OpenAI-compatible servers)
             model: LLM model name
             temperature: Sampling temperature
             max_tokens: Max tokens for generation
             use_local_llm: Use local LLM instead of OpenAI
-            local_llm_model: HuggingFace model name
+            local_llm_model: HuggingFace model name for local LLM
             local_llm_device: Device for local LLM
             load_in_8bit: Use 8-bit quantization
             load_in_4bit: Use 4-bit quantization
         """
-        super().__init__(name="ketrag_official", **kwargs)
+        super().__init__(name="ketrag", **kwargs)
+
+        if not KETRAG_AVAILABLE:
+            raise ImportError(
+                f"KET-RAG imports not available. Check KET-RAG folder.\n"
+                f"Error: {KETRAG_IMPORT_ERROR}"
+            )
 
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.use_local_llm = use_local_llm
 
-        # Load precomputed contexts from official KET-RAG
-        self.context_by_qid = self._load_ketrag_contexts(context_file)
-        print(f"  [KET-RAG Official] Loaded {len(self.context_by_qid)} precomputed contexts")
+        # Load precomputed contexts
+        self.context_by_qid = self._load_contexts(context_file)
+        print(f"  [KET-RAG Vanilla] Loaded {len(self.context_by_qid)} precomputed contexts")
 
-        # Initialize LLM (standardized for fair comparison)
+        # Initialize token encoder
+        self.token_encoder = tiktoken.get_encoding("cl100k_base")
+
+        # Initialize LLM
+        local_llm_wrapper = None
         if use_local_llm:
-            print(f"  [KET-RAG Official] Using local LLM: {local_llm_model}")
-            self.llm = LocalLLMWrapper(
+            if not LOCAL_LLM_AVAILABLE:
+                raise ImportError("LocalLLMWrapper not available")
+            print(f"  [KET-RAG Vanilla] Using local LLM: {local_llm_model}")
+            local_llm_wrapper = LocalLLMWrapper(
                 model_name=local_llm_model,
                 device=local_llm_device,
                 temperature=temperature,
@@ -163,52 +224,63 @@ class FullKETRAGAdapter(BaselineSystem):
                 load_in_4bit=load_in_4bit,
             )
         else:
-            if not GRAPHRAG_AVAILABLE:
-                raise ImportError("GraphRAG not available. Install with: pip install graphrag")
+            print(f"  [KET-RAG Vanilla] Using OpenAI: {model}")
 
-            self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-            if not self.api_key:
-                raise ValueError("OPENAI_API_KEY required when not using local LLM")
+        # Create GraphRAG-compatible LLM wrapper
+        self.llm = GraphRAGCompatibleLLM(
+            model=model,
+            api_key=api_key,
+            api_base=api_base,
+            use_local_llm=use_local_llm,
+            local_llm_wrapper=local_llm_wrapper,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
 
-            print(f"  [KET-RAG Official] Using OpenAI: {model}")
-            chat_config = LanguageModelConfig(
-                api_key=self.api_key,
-                type=ModelType.Chat,
-                model_provider="openai",
-                model=self.model,
-                max_retries=3,
-            )
-            self.llm_raw = ModelManager().get_or_create_chat_model(
-                name="ketrag_official",
-                model_type=ModelType.Chat,
-                config=chat_config,
-            )
-            self.llm = OpenAILLMWrapper(self.llm_raw)
+        # Create a minimal context builder (we use precomputed contexts)
+        self.context_builder = LocalSearchMixedContext(
+            community_reports=None,
+            text_units=None,
+            entities=[],
+            relationships=None,
+            covariates=None,
+            entity_text_embeddings=None,
+            embedding_vectorstore_key=EntityVectorStoreKey.ID,
+            text_embedder=None,
+            token_encoder=self.token_encoder,
+        )
 
-    def _load_ketrag_contexts(self, context_file: str) -> Dict[str, str]:
-        """
-        Load precomputed contexts from official KET-RAG output.
+        # LLM params matching original KET-RAG
+        self.llm_params = {
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
 
-        Expected format from create_context.py:
-        [
-            {"id": "question_id", "context": "graph_context + text_context"},
-            ...
-        ]
-        """
+        # Create search engine using original KET-RAG's MyLocalSearch
+        self.search_engine = MyLocalSearch(
+            llm=self.llm,
+            context_builder=self.context_builder,
+            token_encoder=self.token_encoder,
+            llm_params=self.llm_params,
+            context_builder_params={},
+        )
+
+        print(f"  [KET-RAG Vanilla] Initialized with original KET-RAG search engine")
+
+    def _load_contexts(self, context_file: str) -> Dict[str, str]:
+        """Load precomputed contexts from KET-RAG output."""
         context_path = Path(context_file)
         if not context_path.exists():
             raise FileNotFoundError(
                 f"KET-RAG context file not found: {context_file}\n"
-                f"You must run the official KET-RAG pipeline first:\n"
-                f"  1. cd KET-RAG\n"
-                f"  2. poetry run graphrag index --root ragtest-hotpot/\n"
-                f"  3. poetry run python indexing_sket/create_context.py ragtest-hotpot/ keyword 0.5"
+                f"Run the KET-RAG context creation first:\n"
+                f"  cd KET-RAG\n"
+                f"  python indexing_sket/create_context.py <root_path> keyword 0.5"
             )
 
         with open(context_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
-        # Build lookup: question_id -> context
         context_dict = {}
         for entry in data:
             qid = entry.get('id')
@@ -218,78 +290,9 @@ class FullKETRAGAdapter(BaselineSystem):
 
         return context_dict
 
-    def _clean_ketrag_context(self, context: str, question: str) -> str:
-        """
-        Clean and optimize KET-RAG context to reduce noise.
-
-        Fixes:
-        1. Remove empty "[]" prefix that confuses the LLM
-        2. Filter out irrelevant entities based on question keywords
-        3. Keep only the most relevant entities to reduce noise
-
-        This is a post-processing step on KET-RAG's output, not a modification
-        to KET-RAG itself.
-        """
-        if not context:
-            return context
-
-        # Fix 1: Remove empty "[]" prefix
-        cleaned = context.strip()
-        if cleaned.startswith("[]"):
-            cleaned = cleaned[2:].lstrip()
-
-        # Fix 2: Filter irrelevant entities
-        # Extract question keywords (simple approach: words in question)
-        question_words = set(question.lower().split())
-        # Remove common stopwords
-        stopwords = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-                    'of', 'with', 'by', 'from', 'is', 'was', 'were', 'are', 'be', 'been',
-                    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-                    'should', 'may', 'might', 'must', 'can', 'same', 'as', 'than', 'that',
-                    'this', 'these', 'those', 'what', 'which', 'who', 'when', 'where', 'why',
-                    'how', 'their', 'them', 'they'}
-        question_keywords = question_words - stopwords
-
-        # Parse sections
-        if "-----Entities-----" not in cleaned:
-            return cleaned
-
-        sections = cleaned.split("-----")
-        filtered_sections = []
-
-        for i, section in enumerate(sections):
-            # Keep all non-entity sections as-is
-            if not section.strip().startswith("Entities"):
-                filtered_sections.append(section)
-                continue
-
-            # Filter entity section
-            lines = section.split("\n")
-            header_lines = lines[:2] if len(lines) >= 2 else lines  # Keep header
-            entity_lines = lines[2:] if len(lines) > 2 else []
-
-            # Keep entities that match question keywords
-            relevant_entities = []
-            for line in entity_lines:
-                if not line.strip():
-                    continue
-                # Check if entity name or description contains question keywords
-                line_lower = line.lower()
-                if any(keyword in line_lower for keyword in question_keywords):
-                    relevant_entities.append(line)
-
-            # If we filtered too aggressively (< 2 entities), keep top 5
-            if len(relevant_entities) < 2 and len(entity_lines) > 0:
-                relevant_entities = entity_lines[:5]
-            elif len(relevant_entities) > 10:
-                # Cap at 10 entities to reduce noise
-                relevant_entities = relevant_entities[:10]
-
-            # Reconstruct entity section
-            filtered_section = "\n".join(header_lines + relevant_entities)
-            filtered_sections.append(filtered_section)
-
-        return "-----".join(filtered_sections)
+    def _count_tokens(self, text: str) -> int:
+        """Count tokens using tiktoken."""
+        return len(self.token_encoder.encode(text))
 
     def answer(
         self,
@@ -299,12 +302,19 @@ class FullKETRAGAdapter(BaselineSystem):
         metadata: Optional[Dict[str, Any]] = None
     ) -> BaselineResponse:
         """
-        Answer using official KET-RAG's precomputed context with vanilla prompts.
+        Answer using vanilla KET-RAG with original search engine.
 
-        Uses:
-        - Retrieval: 100% official KET-RAG (precomputed)
-        - Generation: Original KET-RAG prompt format
-        - Answer extraction: Original KET-RAG extraction (no Trident post-processing)
+        Uses MyLocalSearch.asearch_with_context() from the original KET-RAG code
+        with LOCAL_SEARCH_EXACT_SYSTEM_PROMPT for answer generation.
+
+        Args:
+            question: The question to answer
+            context: Ignored (uses precomputed KET-RAG contexts)
+            supporting_facts: Ignored
+            metadata: Must contain 'question_id' to look up precomputed context
+
+        Returns:
+            BaselineResponse with answer and metrics
         """
         token_tracker = TokenTracker()
         latency_tracker = LatencyTracker()
@@ -318,22 +328,22 @@ class FullKETRAGAdapter(BaselineSystem):
                 latency_ms=0,
                 selected_passages=[],
                 abstained=True,
-                mode="ketrag_official",
+                mode="ketrag",
                 stats={"error": "missing_question_id"},
                 raw_answer=None,
                 extracted_answer=None,
             )
 
-        # Load official KET-RAG's retrieved context
+        # Get precomputed context
         ketrag_context = self.context_by_qid.get(question_id)
         if not ketrag_context:
             return BaselineResponse(
-                answer="No precomputed context found for this question",
+                answer="No precomputed context found",
                 tokens_used=0,
                 latency_ms=0,
                 selected_passages=[],
                 abstained=True,
-                mode="ketrag_official",
+                mode="ketrag",
                 stats={"error": "context_not_found", "question_id": question_id},
                 raw_answer=None,
                 extracted_answer=None,
@@ -342,120 +352,65 @@ class FullKETRAGAdapter(BaselineSystem):
         try:
             latency_tracker.start()
 
-            # Parse KET-RAG context into passages for stats
-            passages = self._parse_ketrag_context(ketrag_context)
-
-            # Build original KET-RAG prompt (no Trident-style modifications)
-            answer_messages = build_ketrag_original_prompt(question, ketrag_context)
-            # For token accounting, flatten the messages
-            answer_prompt = "\n\n".join(m.get("content", "") for m in answer_messages)
-
-            # Generate with user-specified model
-            response = self.llm.generate(
-                messages=answer_messages,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
+            # Use original KET-RAG search engine to generate answer
+            result = asyncio.run(
+                self.search_engine.asearch_with_context(question, ketrag_context)
             )
 
-            latency_tracker.stop("answer_generation")
+            latency_tracker.stop("query")
 
-            # Count tokens
-            prompt_tokens = len(answer_prompt.split()) * 1.3
-            completion_tokens = len(response.split()) * 1.3
-            token_tracker.add_call(
-                int(prompt_tokens),
-                int(completion_tokens),
-                "query_generation"
-            )
+            # Get answer from result
+            answer = result.response
+            raw_answer = answer
 
-            # Use original KET-RAG answer extraction (no Trident post-processing)
-            answer = extract_ketrag_original_answer(response)
+            # Track tokens
+            prompt_tokens = result.prompt_tokens
+            completion_tokens = result.output_tokens
+            token_tracker.add_call(prompt_tokens, completion_tokens, "query")
 
             return BaselineResponse(
                 answer=answer,
                 tokens_used=token_tracker.total_tokens,
                 latency_ms=latency_tracker.get_total_latency(),
-                selected_passages=passages[:5],
+                selected_passages=[{"text": ketrag_context[:500]}],
                 abstained=False,
-                mode="ketrag_official",
+                mode="ketrag",
                 stats={
-                    "retrieval_source": "official_ketrag_precomputed",
-                    "generation_approach": "original_ketrag_prompt",
-                    "num_passages": len(passages),
-                    "indexing_tokens": 0,
                     "indexing_latency_ms": 0.0,
+                    "indexing_tokens": 0,
+                    "query_tokens": token_tracker.total_tokens,
                     "total_cost_tokens": token_tracker.total_tokens,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "llm_calls": result.llm_calls,
+                    "completion_time": result.completion_time,
                 },
-                raw_answer=response,
+                raw_answer=raw_answer,
                 extracted_answer=answer,
             )
 
         except Exception as e:
-            print(f"Error in KET-RAG official processing: {e}")
+            print(f"Error in KET-RAG processing: {e}")
             import traceback
             traceback.print_exc()
 
             return BaselineResponse(
                 answer="Error processing question.",
-                tokens_used=0,
-                latency_ms=0,
+                tokens_used=token_tracker.total_tokens,
+                latency_ms=latency_tracker.get_total_latency(),
                 selected_passages=[],
                 abstained=True,
-                mode="ketrag_official",
+                mode="ketrag",
                 stats={"error": str(e)},
                 raw_answer=None,
                 extracted_answer=None,
             )
 
-    def _parse_ketrag_context(self, context_str: str) -> List[Dict[str, str]]:
-        """
-        Parse KET-RAG context string into passages for Trident prompt.
-
-        KET-RAG context format:
-        -----Entities and Relationships-----
-        <graph facts>
-        -----Text source that may be relevant-----
-        id|text
-        chunk_1|<text>
-        chunk_2|<text>
-        ...
-        """
-        passages = []
-
-        # Split by sections
-        if "-----Entities and Relationships-----" in context_str:
-            parts = context_str.split("-----Text source that may be relevant-----")
-
-            # Graph section
-            if len(parts) > 0:
-                graph_section = parts[0].replace("-----Entities and Relationships-----", "").strip()
-                if graph_section and graph_section != "N/A":
-                    passages.append({"text": f"Knowledge Graph:\n{graph_section}"})
-
-            # Text chunks section
-            if len(parts) > 1:
-                text_section = parts[1].strip()
-                lines = text_section.split('\n')
-                for line in lines:
-                    if '|' in line and not line.startswith('id|'):
-                        # Format: chunk_N|text
-                        _, text = line.split('|', 1)
-                        passages.append({"text": text.strip()})
-
-        # Fallback: treat whole context as one passage
-        if not passages:
-            passages.append({"text": context_str})
-
-        return passages
-
     def get_system_info(self) -> Dict[str, Any]:
         """Get system information."""
         return {
             "name": "KET-RAG (Vanilla)",
-            "version": "vanilla_official",
-            "approach": "Official KET-RAG retrieval + Original KET-RAG prompts",
-            "retrieval": "Official KET-RAG (precomputed)",
-            "generation": "original_ketrag_prompt",
+            "version": "vanilla",
             "model": self.model,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
