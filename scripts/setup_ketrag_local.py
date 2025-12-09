@@ -299,18 +299,12 @@ Next steps:
        --port 8000
 
 4. (Optional) Tune prompts:
-   python -m graphrag prompt-tune \\
-       --root {root_path} \\
-       --config {root_path}/settings.yaml \\
-       --discover-entity-types
+   python scripts/prompt_tune_ketrag.py {root_path}
 
 5. Build the index:
-   python -m graphrag index --root {root_path}
+   python scripts/run_ketrag_index.py {root_path}
 
 6. Generate context:
-   python KET-RAG/indexing_sket/create_context.py {root_path} keyword 0.5
-
-   Or use local embeddings:
    python scripts/create_ketrag_context_local.py \\
        --root_path {root_path} \\
        --strategy keyword \\
