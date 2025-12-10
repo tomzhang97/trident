@@ -298,16 +298,44 @@ def main():
     # Build index
     candidate_units_dict = {unit.id: unit for unit in split_text_units}
 
-    if args.strategy == "keyword":
-        word_embeddings = {row['word']: row['embedding'] for _, row in keyword_df.iterrows()}
-        word_chunks = {row['word']: row['chunk_ids'] for _, row in keyword_df.iterrows()}
-        words = list(word_embeddings.keys())
-        chunk_vecs = np.array([word_embeddings[w] for w in words], dtype=np.float32)
+    # Check embedding dimensions and re-embed if needed
+    sample_embedding = keyword_df.iloc[0]['embedding'] if len(keyword_df) > 0 else None
+    index_dim = len(sample_embedding) if sample_embedding is not None else 0
+    local_dim = embedder.model.get_sentence_embedding_dimension()
 
-        index = faiss.IndexFlatIP(chunk_vecs.shape[1])
-        index.add(chunk_vecs)
+    print(f"  Index embedding dim: {index_dim}, Local model dim: {local_dim}")
+
+    need_reembed = (index_dim != local_dim)
+    if need_reembed:
+        print(f"  ⚠️  Dimension mismatch! Re-embedding with local model...")
+
+    if args.strategy == "keyword":
+        word_chunks = {row['word']: row['chunk_ids'] for _, row in keyword_df.iterrows()}
+        words = list(word_chunks.keys())
+
+        if need_reembed:
+            # Re-embed keywords with local model
+            print(f"  Re-embedding {len(words)} keywords...")
+            word_vecs = np.array(embedder.embed_batch(words), dtype=np.float32)
+        else:
+            word_embeddings = {row['word']: row['embedding'] for _, row in keyword_df.iterrows()}
+            word_vecs = np.array([word_embeddings[w] for w in words], dtype=np.float32)
+
+        index = faiss.IndexFlatIP(word_vecs.shape[1])
+        index.add(word_vecs)
 
         token_counts = {unit.id: num_tokens(unit.text, token_encoder) for unit in split_text_units}
+
+        # Pre-compute chunk embeddings
+        if need_reembed:
+            # Re-embed all chunks with local model
+            all_chunk_ids = list(candidate_units_dict.keys())
+            all_chunk_texts = [candidate_units_dict[cid].text for cid in all_chunk_ids]
+            print(f"  Re-embedding {len(all_chunk_texts)} chunks...")
+            all_chunk_embs = np.array(embedder.embed_batch(all_chunk_texts), dtype=np.float32)
+            chunk_embedding_map = {cid: all_chunk_embs[i] for i, cid in enumerate(all_chunk_ids)}
+        else:
+            chunk_embedding_map = {unit.id: unit.text_embedding for unit in split_text_units}
 
         # Pre-compute chunk data for each word
         word_chunk_data = {}
@@ -315,7 +343,7 @@ def main():
             chunk_ids = list(word_chunks.get(w, []))
             if not chunk_ids:
                 continue
-            chunk_embs = np.stack([candidate_units_dict[cid].text_embedding for cid in chunk_ids]).astype(np.float32)
+            chunk_embs = np.stack([chunk_embedding_map[cid] for cid in chunk_ids]).astype(np.float32)
             chunk_token_counts = [token_counts[cid] for cid in chunk_ids]
             word_chunk_data[w] = (chunk_ids, chunk_embs, chunk_token_counts)
 
@@ -330,7 +358,15 @@ def main():
         }
     elif args.strategy == "text":
         chunk_ids = list(candidate_units_dict.keys())
-        chunk_vecs = np.array([unit.text_embedding for unit in candidate_units_dict.values()], dtype=np.float32)
+
+        if need_reembed:
+            # Re-embed all chunks with local model
+            all_chunk_texts = [candidate_units_dict[cid].text for cid in chunk_ids]
+            print(f"  Re-embedding {len(all_chunk_texts)} chunks...")
+            chunk_vecs = np.array(embedder.embed_batch(all_chunk_texts), dtype=np.float32)
+        else:
+            chunk_vecs = np.array([unit.text_embedding for unit in candidate_units_dict.values()], dtype=np.float32)
+
         index = faiss.IndexFlatIP(chunk_vecs.shape[1])
         index.add(chunk_vecs)
 

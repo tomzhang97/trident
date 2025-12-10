@@ -119,8 +119,13 @@ class LocalLLMWrapper:
         yield response
 
     async def agenerate(self, messages, streaming=False, callbacks=None, **kwargs) -> str:
-        """Async generation."""
-        return self._do_generate(messages, **kwargs)
+        """Async generation - wraps blocking call in thread for local LLM."""
+        if self.use_local_llm:
+            # Local LLM is blocking, run in thread pool
+            return await asyncio.to_thread(self._do_generate, messages, **kwargs)
+        else:
+            # API calls are already non-blocking via httpx
+            return self._do_generate(messages, **kwargs)
 
     async def astream_generate(self, messages, callbacks=None, **kwargs):
         """Async streaming generation."""
@@ -176,6 +181,10 @@ async def main(args):
     print("Initializing LLM...")
     if args.use_local_llm:
         print(f"  Using local LLM: {args.local_llm_model}")
+        # Auto-adjust concurrency for local LLM (model can only handle 1 request at a time)
+        if args.max_concurrent > 1:
+            print(f"  ⚠️  Local LLM: reducing max_concurrent from {args.max_concurrent} to 1")
+            args.max_concurrent = 1
         llm = LocalLLMWrapper(
             use_local_llm=True,
             local_llm_model=args.local_llm_model,
