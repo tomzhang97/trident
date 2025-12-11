@@ -273,9 +273,13 @@ def run_official_evaluation(
     print("STEP 4: Running official MuSiQue evaluation")
     print(f"{'='*60}")
 
-    # Import MuSiQue evaluation
-    sys.path.insert(0, str(Path(__file__).parent.parent / "musique"))
-    from evaluate_v1 import evaluate
+    # Import MuSiQue evaluation (using importlib for module with dot in name)
+    import importlib.util
+    eval_path = Path(__file__).parent.parent / "musique" / "evaluate_v1.0.py"
+    spec = importlib.util.spec_from_file_location("evaluate_v1_0", eval_path)
+    evaluate_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(evaluate_module)
+    evaluate = evaluate_module.evaluate
 
     try:
         metrics = evaluate(predictions_path, ground_truth_path)
