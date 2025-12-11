@@ -226,16 +226,16 @@ musique/
 │   ├── musique_full_v1.0_dev.jsonl
 │   ├── musique_full_v1.0_test.jsonl
 │   └── dev_test_singlehop_questions_v1.0.json
-├── metrics/                        # Evaluation metrics
-│   ├── __init__.py
-│   ├── answer.py
-│   ├── support.py
-│   ├── group_answer_sufficiency.py
-│   └── group_support_sufficiency.py
 ├── data_loader.py                  # Data loading and conversion
-├── evaluate_v1.0.py               # Official MuSiQue evaluator
-├── evaluate_v1.py                 # Evaluator (importable)
+├── evaluate_v1.0.py               # MuSiQue evaluator (self-contained, supports TRIDENT)
 └── README.md                      # This file
+
+experiments/
+├── run_musique_experiment.py      # End-to-end experiment runner
+└── evaluate_musique.py            # Evaluation wrapper for TRIDENT results
+
+configs/
+└── musique.json                   # MuSiQue experiment configuration
 ```
 
 ## References
