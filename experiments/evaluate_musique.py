@@ -19,12 +19,16 @@ Usage:
 import argparse
 import json
 import sys
+import importlib.util
 from pathlib import Path
 
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from musique.evaluate_v1 import evaluate_trident, evaluate
+# Import evaluate_v1.0.py (using importlib for module with dot in name)
+eval_path = Path(__file__).parent.parent / "musique" / "evaluate_v1.0.py"
+spec = importlib.util.spec_from_file_location("evaluate_v1_0", eval_path)
+evaluate_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(evaluate_module)
+evaluate_trident = evaluate_module.evaluate_trident
+evaluate = evaluate_module.evaluate
 
 
 # Ground truth file mapping
