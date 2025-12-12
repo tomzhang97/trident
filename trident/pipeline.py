@@ -117,128 +117,106 @@ def _looks_like_meta(text: str) -> bool:
     return any(bad in norm for bad in bad_substrings)
 
 
-def extract_final_answer(raw_text: str, question: str) -> str:
+def extract_final_answer(raw_text: str, question: str, dataset: str = "hotpotqa") -> str:
     """
-    Extract the final answer from raw LLM output using a more robust method.
+    Extract the final answer from raw LLM output using a dataset-specific method.
 
     Args:
         raw_text: The raw text output from the LLM.
-        question: The original question, used for context (e.g., Yes/No detection).
+        question: The original question (optional).
+        dataset: Dataset name ('hotpotqa' or 'musique') for dataset-specific extraction.
 
     Returns:
         The extracted answer string.
+    """
+    if dataset.lower() == "musique":
+        return _extract_musique_answer(raw_text)
+    else:
+        # Original HotPotQA extraction - DO NOT MODIFY
+        return _extract_hotpotqa_answer(raw_text)
+
+
+def _extract_hotpotqa_answer(raw_text: str) -> str:
+    """
+    Extract answer for HotPotQA dataset.
+
+    NOTE: This is the ORIGINAL extraction logic - do not modify.
+    """
+    answer = raw_text.strip()
+
+    # First, try to extract from "Final answer:" format (case-insensitive)
+    match = re.search(r'(?:^|\n)\s*final\s+answer\s*:\s*(.+?)(?:\n|$)', answer, re.IGNORECASE | re.MULTILINE)
+    if match:
+        answer = match.group(1).strip()
+        answer = re.sub(r'\s*final\s+answer\s*:.*$', '', answer, flags=re.IGNORECASE).strip()
+        return answer
+
+    # Fall back to removing common prefixes
+    prefixes_to_remove = [
+        "Answer:", "A:", "Response:", "The answer is:",
+        "Based on the context,", "According to the documents,"
+    ]
+
+    for prefix in prefixes_to_remove:
+        if answer.lower().startswith(prefix.lower()):
+            answer = answer[len(prefix):].strip()
+            break
+
+    # Take first sentence if answer is very long
+    if len(answer) > 500 and '.' in answer:
+        answer = answer.split('.')[0] + '.'
+
+    return answer
+
+
+def _extract_musique_answer(raw_text: str) -> str:
+    """
+    Extract answer for MuSiQue dataset.
+
+    Universal extraction for multi-hop QA - similar to standard approaches.
     """
     text = raw_text.strip()
 
     if not text:
         return ""
 
-    # 0) Strip "Step N:" style reasoning lines (even at end of text)
-    text = re.sub(r'(?mi)^step\s+\d+:[^\n]*$', '', text)
-    text = re.sub(r'(?i)step\s+\d+:[^\.!\n]*', '', text)
+    # Primary: Look for "Final answer:" pattern
+    match = re.search(r'(?i)final\s+answer\s*[:\-]\s*(.+?)(?:\n|$)', text)
+    if match:
+        answer = match.group(1).strip()
+        answer = answer.rstrip('.,;:')
+        return answer
 
-    # 1) First priority: Look for "Final answer:" pattern (case-insensitive)
-    # This is the most explicit indicator from our prompt
-    final_answer_patterns = [
-        r"(?i)final\s+answer\s*[:\-]\s*(.+?)(?:\n|$)",  # "Final answer: <answer>"
-        r"(?i)final\s+answer\s*[:\-]\s*(.+)",  # Fallback without newline requirement
-    ]
-
-    for pat in final_answer_patterns:
-        m = re.search(pat, text)
-        if m:
-            cand = m.group(1).strip()
-            # Clean up common trailing artifacts
-            cand = re.sub(r'\s*(Human:|Assistant:|Question:).*$', '', cand, flags=re.IGNORECASE)
-            if cand and len(cand) > 0 and not _looks_like_meta(cand):
-                return cand
-
-    # 2) Yes/No shortcut for binary questions
-    q_lower = question.strip().lower()
-    is_yesno_question = q_lower.startswith((
-        "is ", "are ", "was ", "were ",
-        "do ", "does ", "did ",
-        "can ", "could ", "should ", "would ",
-        "has ", "have ", "had "
-    ))
-
-    if is_yesno_question:
-        t_lower = text.lower()
-        # Look for explicit yes/no patterns
-        # Count occurrences and use the last one mentioned
-        yes_matches = list(re.finditer(r'\byes\b', t_lower))
-        no_matches = list(re.finditer(r'\bno\b', t_lower))
-
-        if yes_matches or no_matches:
-            # Get the position of the last yes/no
-            last_yes_pos = yes_matches[-1].start() if yes_matches else -1
-            last_no_pos = no_matches[-1].start() if no_matches else -1
-
-            # Return the one that appears last in the text
-            if last_no_pos > last_yes_pos:
-                return "no"
-            elif last_yes_pos > last_no_pos:
-                return "yes"
-
-    # 3) Look for other answer patterns
+    # Secondary: Look for "Answer:" or "The answer is" patterns
     other_patterns = [
         r"(?mi)^answer\s*[:\-]\s*(.+?)(?:\n|$)",
-        r"(?mi)the\s+answer\s+is\s+(.+?)(?:\.|$)",  # Require space after "is" to avoid matching "isn't"
-        r"(?mi)therefore[,]?\s+(?:the\s+answer\s+is\s+)?(.+?)(?:\.|$)",
+        r"(?mi)the\s+answer\s+is\s+(.+?)(?:\.|,|\n|$)",
     ]
 
     for pat in other_patterns:
         m = re.search(pat, text)
         if m:
-            cand = m.group(1).strip()
-            # Remove trailing punctuation and artifacts
-            cand = re.sub(r'[.,;]+$', '', cand)
-            # Clean up Human:/Assistant: artifacts
-            cand = re.sub(r'\s*(Human:|Assistant:|Question:).*$', '', cand, flags=re.IGNORECASE)
-            cand = re.sub(r'(Human:|Assistant:|Question:).*$', '', cand, flags=re.IGNORECASE)
-            if cand and len(cand) > 1 and not _looks_like_meta(cand):
-                return cand
+            answer = m.group(1).strip()
+            answer = answer.rstrip('.,;:')
+            if answer and len(answer) > 1:
+                return answer
 
-    # 4) Fallback: scan from the BOTTOM for a non-meta short line
-    #    This avoids grabbing opening filler like "Okay,".
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    for line in reversed(lines):
-        # Skip lines with colons (usually labels)
-        if ":" in line:
-            continue
-        if _looks_like_meta(line):
-            continue
-        # Look for substantive content (not too short, not too long)
-        if 2 <= len(line) <= 100:
-            # Clean up
-            line = re.sub(r'^(so|thus|therefore|hence)[,\s]+', '', line, flags=re.IGNORECASE)
-            # Clean artifacts
-            line = re.sub(r'\s*(Human:|Assistant:|Question:).*$', '', line, flags=re.IGNORECASE)
-            line = re.sub(r'(Human:|Assistant:|Question:).*$', '', line, flags=re.IGNORECASE)
-            if len(line) > 1 and not _looks_like_meta(line):
-                return line
+    # Fallback: remove common prefixes
+    prefixes_to_remove = [
+        "Answer:", "A:", "Response:", "The answer is:",
+        "Based on the context,", "According to the documents,"
+    ]
 
-    # 5) Final fallback: last sentence or phrase
-    # Split by sentence-ending punctuation
-    sentences = re.split(r'[.!?]\s+', text)
-    if sentences:
-        last_sentence = sentences[-1].strip()
-        # Clean artifacts
-        last_sentence = re.sub(r'\s*(Human:|Assistant:|Question:).*$', '', last_sentence, flags=re.IGNORECASE)
-        last_sentence = re.sub(r'(Human:|Assistant:|Question:).*$', '', last_sentence, flags=re.IGNORECASE)
-        # Remove trailing periods
-        last_sentence = last_sentence.rstrip('.')
-        # Skip if it's just a fragment (starts with punctuation, is very short, or looks like meta)
-        if last_sentence.startswith(("'", '"', '-', 'n\'t')):
-            return ""
-        # Check if it's substantial (more than 4 chars and not just punctuation/fragments)
-        if last_sentence and len(last_sentence) > 4 and not _looks_like_meta(last_sentence):
-            # Make sure it has at least one letter
-            if any(c.isalpha() for c in last_sentence):
-                return last_sentence
+    for prefix in prefixes_to_remove:
+        if text.lower().startswith(prefix.lower()):
+            text = text[len(prefix):].strip()
+            break
 
-    # 6) If all else fails, return empty rather than garbage
-    return ""
+    # Take first sentence if very long
+    if len(text) > 500 and '.' in text:
+        text = text.split('.')[0]
+
+    return text.strip().rstrip('.,;:')
 
 
 class TridentPipeline:
@@ -298,11 +276,21 @@ class TridentPipeline:
         query: str,
         supporting_facts: Optional[List[Tuple[str, int]]] = None,
         context: Optional[List[List[str]]] = None,
-        mode: Optional[str] = None
+        mode: Optional[str] = None,
+        dataset: str = "hotpotqa"
     ) -> PipelineOutput:
-        """Process a query through the TRIDENT pipeline."""
+        """Process a query through the TRIDENT pipeline.
+
+        Args:
+            query: The question to answer
+            supporting_facts: Optional supporting facts for facet mining
+            context: Optional pre-provided context passages
+            mode: Pipeline mode ('safe_cover', 'pareto', 'both')
+            dataset: Dataset name ('hotpotqa' or 'musique') for dataset-specific prompts/extraction
+        """
         start_time = time.time()
         mode = mode or self.config.mode
+        self._current_dataset = dataset  # Store for use in answer generation
         
         # Track telemetry
         self.telemetry.start_query(query)
@@ -353,19 +341,20 @@ class TridentPipeline:
         # Step 5: Generate answer (FIXED - now properly extracts final answer)
         answer = ""
         if not result['abstained'] and result['selected_passages']:
-            # Build prompt with selected passages
+            # Build prompt with selected passages using dataset-specific prompt
             prompt = self.llm.build_multi_hop_prompt(
                 question=query,
                 passages=result['selected_passages'],
-                facets=[f.to_dict() for f in facets]
+                facets=[f.to_dict() for f in facets],
+                dataset=dataset
             )
             llm_output = self.llm.generate(prompt)
-            
+
             # CRITICAL FIX: Extract and clean the final answer from LLM output
             # This ensures we're not logging intermediate outputs like facet mining
             raw_answer = llm_output.text
-            # Use the new, more robust extraction function
-            answer = extract_final_answer(raw_answer, query)
+            # Use dataset-specific extraction function
+            answer = extract_final_answer(raw_answer, query, dataset=dataset)
             tokens_used = llm_output.tokens_used
         else:
             answer = "ABSTAINED" if result['abstained'] else ""

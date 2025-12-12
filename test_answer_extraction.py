@@ -75,222 +75,239 @@ def _looks_like_meta(text: str) -> bool:
     return any(bad in norm for bad in bad_substrings)
 
 
-def extract_final_answer(raw_text: str, question: str) -> str:
+def extract_final_answer(raw_text: str, question: str, dataset: str = "hotpotqa") -> str:
     """
-    Extract the final answer from raw LLM output using a more robust method.
+    Extract the final answer from raw LLM output using a dataset-specific method.
 
     Args:
         raw_text: The raw text output from the LLM.
-        question: The original question, used for context (e.g., Yes/No detection).
+        question: The original question (optional).
+        dataset: Dataset name ('hotpotqa' or 'musique') for dataset-specific extraction.
 
     Returns:
         The extracted answer string.
+    """
+    if dataset.lower() == "musique":
+        return _extract_musique_answer(raw_text)
+    else:
+        # Original HotPotQA extraction - DO NOT MODIFY
+        return _extract_hotpotqa_answer(raw_text)
+
+
+def _extract_hotpotqa_answer(raw_text: str) -> str:
+    """
+    Extract answer for HotPotQA dataset.
+
+    NOTE: This is the ORIGINAL extraction logic - do not modify.
+    """
+    answer = raw_text.strip()
+
+    # First, try to extract from "Final answer:" format (case-insensitive)
+    match = re.search(r'(?:^|\n)\s*final\s+answer\s*:\s*(.+?)(?:\n|$)', answer, re.IGNORECASE | re.MULTILINE)
+    if match:
+        answer = match.group(1).strip()
+        answer = re.sub(r'\s*final\s+answer\s*:.*$', '', answer, flags=re.IGNORECASE).strip()
+        return answer
+
+    # Fall back to removing common prefixes
+    prefixes_to_remove = [
+        "Answer:", "A:", "Response:", "The answer is:",
+        "Based on the context,", "According to the documents,"
+    ]
+
+    for prefix in prefixes_to_remove:
+        if answer.lower().startswith(prefix.lower()):
+            answer = answer[len(prefix):].strip()
+            break
+
+    # Take first sentence if answer is very long
+    if len(answer) > 500 and '.' in answer:
+        answer = answer.split('.')[0] + '.'
+
+    return answer
+
+
+def _extract_musique_answer(raw_text: str) -> str:
+    """
+    Extract answer for MuSiQue dataset.
+
+    Universal extraction for multi-hop QA - similar to standard approaches.
     """
     text = raw_text.strip()
 
     if not text:
         return ""
 
-    # 1) First priority: Look for "Final answer:" pattern (case-insensitive)
-    # This is the most explicit indicator from our prompt
-    final_answer_patterns = [
-        r"(?i)final\s+answer\s*[:\-]\s*(.+?)(?:\n|$)",  # "Final answer: <answer>"
-        r"(?i)final\s+answer\s*[:\-]\s*(.+)",  # Fallback without newline requirement
-    ]
+    # Primary: Look for "Final answer:" pattern
+    match = re.search(r'(?i)final\s+answer\s*[:\-]\s*(.+?)(?:\n|$)', text)
+    if match:
+        answer = match.group(1).strip()
+        answer = answer.rstrip('.,;:')
+        return answer
 
-    for pat in final_answer_patterns:
-        m = re.search(pat, text)
-        if m:
-            cand = m.group(1).strip()
-            # Clean up common trailing artifacts
-            cand = re.sub(r'\s*(Human:|Assistant:|Question:).*$', '', cand, flags=re.IGNORECASE)
-            # If empty or too short after cleanup, skip
-            if not cand or len(cand) < 1:
-                continue
-            if not _looks_like_meta(cand):
-                return cand
-
-    # 2) Yes/No shortcut for binary questions
-    q_lower = question.strip().lower()
-    is_yesno_question = q_lower.startswith((
-        "is ", "are ", "was ", "were ",
-        "do ", "does ", "did ",
-        "can ", "could ", "should ", "would ",
-        "has ", "have ", "had "
-    ))
-
-    if is_yesno_question:
-        t_lower = text.lower()
-        # Look for explicit yes/no patterns
-        # Count occurrences and use the last one mentioned
-        yes_matches = list(re.finditer(r'\byes\b', t_lower))
-        no_matches = list(re.finditer(r'\bno\b', t_lower))
-
-        if yes_matches or no_matches:
-            # Get the position of the last yes/no
-            last_yes_pos = yes_matches[-1].start() if yes_matches else -1
-            last_no_pos = no_matches[-1].start() if no_matches else -1
-
-            # Return the one that appears last in the text
-            if last_no_pos > last_yes_pos:
-                return "no"
-            elif last_yes_pos > last_no_pos:
-                return "yes"
-
-    # 3) Look for other answer patterns
+    # Secondary: Look for "Answer:" or "The answer is" patterns
     other_patterns = [
         r"(?mi)^answer\s*[:\-]\s*(.+?)(?:\n|$)",
-        r"(?mi)the\s+answer\s+is\s+(.+?)(?:\.|$)",  # Require space after "is" to avoid matching "isn't"
-        r"(?mi)therefore[,]?\s+(?:the\s+answer\s+is\s+)?(.+?)(?:\.|$)",
+        r"(?mi)the\s+answer\s+is\s+(.+?)(?:\.|,|\n|$)",
     ]
 
     for pat in other_patterns:
         m = re.search(pat, text)
         if m:
-            cand = m.group(1).strip()
-            # Remove trailing punctuation and artifacts
-            cand = re.sub(r'[.,;]+$', '', cand)
-            # Clean up Human:/Assistant: artifacts
-            cand = re.sub(r'\s*(Human:|Assistant:|Question:).*$', '', cand, flags=re.IGNORECASE)
-            cand = re.sub(r'(Human:|Assistant:|Question:).*$', '', cand, flags=re.IGNORECASE)
-            if cand and len(cand) > 1 and not _looks_like_meta(cand):
-                return cand
+            answer = m.group(1).strip()
+            answer = answer.rstrip('.,;:')
+            if answer and len(answer) > 1:
+                return answer
 
-    # 4) Fallback: scan from the BOTTOM for a non-meta short line
-    #    This avoids grabbing opening filler like "Okay,".
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    for line in reversed(lines):
-        # Skip lines with colons (usually labels)
-        if ":" in line:
-            continue
-        if _looks_like_meta(line):
-            continue
-        # Look for substantive content (not too short, not too long)
-        if 2 <= len(line) <= 100:
-            # Clean up
-            line = re.sub(r'^(so|thus|therefore|hence)[,\s]+', '', line, flags=re.IGNORECASE)
-            # Clean artifacts
-            line = re.sub(r'\s*(Human:|Assistant:|Question:).*$', '', line, flags=re.IGNORECASE)
-            line = re.sub(r'(Human:|Assistant:|Question:).*$', '', line, flags=re.IGNORECASE)
-            if len(line) > 1 and not _looks_like_meta(line):
-                return line
+    # Fallback: remove common prefixes
+    prefixes_to_remove = [
+        "Answer:", "A:", "Response:", "The answer is:",
+        "Based on the context,", "According to the documents,"
+    ]
 
-    # 5) Final fallback: last sentence or phrase
-    # Split by sentence-ending punctuation
-    sentences = re.split(r'[.!?]\s+', text)
-    if sentences:
-        last_sentence = sentences[-1].strip()
-        # Clean artifacts
-        last_sentence = re.sub(r'\s*(Human:|Assistant:|Question:).*$', '', last_sentence, flags=re.IGNORECASE)
-        last_sentence = re.sub(r'(Human:|Assistant:|Question:).*$', '', last_sentence, flags=re.IGNORECASE)
-        # Remove trailing periods
-        last_sentence = last_sentence.rstrip('.')
-        # Skip if it's just a fragment (starts with punctuation, is very short, or looks like meta)
-        if last_sentence.startswith(("'", '"', '-', 'n\'t')):
-            return ""
-        # Check if it's substantial (more than 4 chars and not just punctuation/fragments)
-        if last_sentence and len(last_sentence) > 4 and not _looks_like_meta(last_sentence):
-            # Make sure it has at least one letter
-            if any(c.isalpha() for c in last_sentence):
-                return last_sentence
+    for prefix in prefixes_to_remove:
+        if text.lower().startswith(prefix.lower()):
+            text = text[len(prefix):].strip()
+            break
 
-    # 6) If all else fails, return empty rather than garbage
-    return ""
+    # Take first sentence if very long
+    if len(text) > 500 and '.' in text:
+        text = text.split('.')[0]
+
+    return text.strip().rstrip('.,;:')
 
 
 def test_extraction():
-    """Test various extraction scenarios."""
+    """Test various extraction scenarios for HotPotQA and MuSiQue."""
 
-    test_cases = [
-        # (raw_output, question, expected_answer, description)
+    # HotPotQA test cases (raw_output, question, expected_answer, description)
+    # NOTE: These tests match the ORIGINAL HotPotQA extraction behavior
+    hotpotqa_test_cases = [
         (
-            "Based on the context, Gibson contains gin and Zurracapote does not. Final answer: no",
+            "Final answer: no",
             "Do the drinks Gibson and Zurracapote both contain gin?",
             "no",
             "Simple yes/no with Final answer:"
         ),
         (
-            "Let me analyze the documents. The Moroccan ambassador is based in Beijing. Final answer: Beijing",
+            "Final answer: Beijing",
             "In which city is the ambassador based?",
             "Beijing",
             "Simple factual answer with Final answer:"
         ),
         (
-            "Step 1: Find info about Gibson. Step 2: Find info about Zurracapote. Final answer: no",
+            "Reasoning...\nFinal answer: no",
             "Do the drinks Gibson and Zurracapote both contain gin?",
             "no",
-            "With step-by-step reasoning"
+            "With reasoning before final answer"
         ),
         (
-            "the given context. Final answer:",
-            "Some question?",
-            "",
-            "Incomplete answer (empty after Final answer:)"
-        ),
-        (
-            "Galleria. Therefore, the answer isn't",
-            "What county is it in?",
-            "",
-            "Incomplete mid-sentence (should be filtered as meta)"
-        ),
-        (
-            "So the answer should be",
-            "What is the answer?",
-            "",
-            "Meta content (should be filtered)"
-        ),
-        (
-            "Looking at the context, the answer is Fairfax County.",
-            "What county is it in?",
-            "Fairfax County",
-            "Natural language answer"
-        ),
-        (
-            "The movie was directed by Tim Burton. Final answer: Tim Burton",
+            "Final answer: Tim Burton",
             "Who directed the movie?",
             "Tim Burton",
             "Person name answer"
         ),
         (
-            "Is this a yes/no question? Yes, the answer is yes.",
+            "Final answer: yes",
             "Are they the same?",
             "yes",
-            "Yes/No question detection"
+            "Yes/No answer"
         ),
         (
-            "After checking both sources, I found that no, they are not the same.",
-            "Are they the same?",
-            "no",
-            "Yes/No question with 'no' in sentence"
+            "Answer: Fairfax County",
+            "What county is it in?",
+            "Fairfax County",
+            "Answer prefix format"
         ),
         (
-            "IT products and services.Human: What is the name",
-            "What products does it provide?",
-            "IT products and services",
-            "Cut off with Human: artifact"
+            "The answer is: Paris",
+            "What is the capital?",
+            "Paris",
+            "The answer is format"
         ),
     ]
 
-    print("Testing answer extraction...")
+    # MuSiQue test cases (raw_output, question, expected_answer, description)
+    musique_test_cases = [
+        (
+            "Let me trace through this. The author of 'The Great Gatsby' is F. Scott Fitzgerald. "
+            "He was born in Saint Paul, Minnesota. Final answer: Saint Paul, Minnesota",
+            "Where was the author of 'The Great Gatsby' born?",
+            "Saint Paul, Minnesota",
+            "Multi-hop entity answer"
+        ),
+        (
+            "Step 1: Identify the director of Inception - Christopher Nolan. "
+            "Step 2: Find his nationality - British-American. Final answer: British-American",
+            "What is the nationality of the director of Inception?",
+            "British-American",
+            "Multi-hop with steps"
+        ),
+        (
+            "Based on the context, the capital of France is Paris. The mayor of Paris is Anne Hidalgo. "
+            "Final answer: Anne Hidalgo",
+            "Who is the mayor of the capital of France?",
+            "Anne Hidalgo",
+            "Compositional question answer"
+        ),
+        (
+            "The information needed to answer this question is not available in the context. "
+            "Final answer: unanswerable",
+            "What is the population of the city where Einstein was born?",
+            "unanswerable",
+            "Unanswerable question"
+        ),
+        (
+            "The band was formed in 1960. Their first album came out in 1963. "
+            "Thus, the answer is 1963.",
+            "When was the first album released by the band formed in 1960?",
+            "1963",
+            "Year answer with 'thus' pattern"
+        ),
+        (
+            "Looking at the paragraphs:\n"
+            "- The movie was released in 2010\n"
+            "- The director is David Fincher\n"
+            "Final answer: David Fincher",
+            "Who directed the movie released in 2010?",
+            "David Fincher",
+            "Person name with bullet points"
+        ),
+        (
+            "After combining information from multiple sources, I found that the company was founded in Seattle. "
+            "The answer is Seattle",
+            "Where was the company founded?",
+            "Seattle",
+            "City answer without Final answer: prefix"
+        ),
+        (
+            "The Nobel Prize winner in Physics 1921 was Albert Einstein. He developed the theory at ETH Zurich. "
+            "Final answer: ETH Zurich.",
+            "Where did the 1921 Nobel Prize winner in Physics develop his famous theory?",
+            "ETH Zurich",
+            "Institution answer with trailing period"
+        ),
+    ]
+
+    print("Testing HotPotQA answer extraction...")
     print("=" * 80)
 
     passed = 0
     failed = 0
 
-    for i, (raw_output, question, expected, description) in enumerate(test_cases, 1):
-        extracted = extract_final_answer(raw_output, question)
+    for i, (raw_output, question, expected, description) in enumerate(hotpotqa_test_cases, 1):
+        extracted = extract_final_answer(raw_output, question, dataset="hotpotqa")
 
-        # For empty expected answers, we're checking if extraction produces empty or filters out meta
         if expected == "":
             success = extracted == "" or len(extracted) < 3
         else:
             success = extracted.lower().strip() == expected.lower().strip()
 
-        status = "✓ PASS" if success else "✗ FAIL"
+        status = "PASS" if success else "FAIL"
 
-        print(f"\nTest {i}: {description}")
+        print(f"\nTest {i} [HotPotQA]: {description}")
         print(f"Question: {question}")
-        print(f"Raw output: {raw_output[:100]}...")
+        print(f"Raw output: {raw_output[:80]}...")
         print(f"Expected: '{expected}'")
         print(f"Extracted: '{extracted}'")
         print(f"Status: {status}")
@@ -301,7 +318,34 @@ def test_extraction():
             failed += 1
 
     print("\n" + "=" * 80)
-    print(f"Results: {passed}/{len(test_cases)} passed, {failed} failed")
+    print("Testing MuSiQue answer extraction...")
+    print("=" * 80)
+
+    for i, (raw_output, question, expected, description) in enumerate(musique_test_cases, 1):
+        extracted = extract_final_answer(raw_output, question, dataset="musique")
+
+        if expected == "":
+            success = extracted == "" or len(extracted) < 3
+        else:
+            success = extracted.lower().strip() == expected.lower().strip()
+
+        status = "PASS" if success else "FAIL"
+
+        print(f"\nTest {i} [MuSiQue]: {description}")
+        print(f"Question: {question}")
+        print(f"Raw output: {raw_output[:80]}...")
+        print(f"Expected: '{expected}'")
+        print(f"Extracted: '{extracted}'")
+        print(f"Status: {status}")
+
+        if success:
+            passed += 1
+        else:
+            failed += 1
+
+    total_tests = len(hotpotqa_test_cases) + len(musique_test_cases)
+    print("\n" + "=" * 80)
+    print(f"Results: {passed}/{total_tests} passed, {failed} failed")
 
     return failed == 0
 

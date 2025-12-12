@@ -2,16 +2,20 @@
 
 This module ensures all baseline adapters use the same prompt format and answer
 extraction logic as Trident for fair comparison.
+
+Supports dataset-specific prompts and extraction for HotPotQA and MuSiQue.
 """
 
 import re
+import string
 from typing import List, Dict, Any, Optional
 
 
 def build_trident_style_prompt(
     question: str,
     passages: List[Dict[str, Any]],
-    facets: Optional[List[str]] = None
+    facets: Optional[List[str]] = None,
+    dataset: str = "hotpotqa"
 ) -> str:
     """
     Build a Trident-style multi-hop prompt.
@@ -23,9 +27,27 @@ def build_trident_style_prompt(
         question: The question to answer
         passages: List of passage dicts with 'text' or 'content' key
         facets: Optional reasoning requirements (not typically used by baselines)
+        dataset: Dataset name ('hotpotqa' or 'musique') for dataset-specific prompts
 
     Returns:
         Formatted prompt string
+    """
+    if dataset.lower() == "musique":
+        return build_musique_prompt(question, passages, facets)
+    else:
+        # Original HotPotQA prompt - DO NOT MODIFY
+        return build_hotpotqa_prompt(question, passages, facets)
+
+
+def build_hotpotqa_prompt(
+    question: str,
+    passages: List[Dict[str, Any]],
+    facets: Optional[List[str]] = None
+) -> str:
+    """
+    Build a HotPotQA-specific multi-hop prompt.
+
+    NOTE: This is the ORIGINAL prompt - do not modify.
     """
     # Build context block
     context_parts = []
@@ -59,6 +81,46 @@ def build_trident_style_prompt(
         "   Final answer: I cannot answer based on the given context.\n\n"
         f"Question: {question}\n"
         "Now reason and then give the final answer.\n"
+    )
+
+    return prompt
+
+
+def build_musique_prompt(
+    question: str,
+    passages: List[Dict[str, Any]],
+    facets: Optional[List[str]] = None
+) -> str:
+    """
+    Build a MuSiQue-specific multi-hop prompt.
+
+    Uses a universal multi-hop QA format similar to standard approaches.
+    """
+    # Build context from passages
+    context_parts = []
+    for i, passage in enumerate(passages, 1):
+        text = passage.get('text', passage.get('content', ''))
+        context_parts.append(f"[{i}] {text}")
+
+    context = "\n\n".join(context_parts)
+
+    if facets:
+        requirements = "\n".join(f"- {f}" for f in facets)
+        requirements_block = f"Sub-questions to consider:\n{requirements}\n\n"
+    else:
+        requirements_block = ""
+
+    prompt = (
+        f"Context:\n{context}\n\n"
+        f"{requirements_block}"
+        "Answer the following multi-hop question by combining information from the paragraphs above.\n\n"
+        "Instructions:\n"
+        "1. Use ONLY the information provided in the context.\n"
+        "2. Think step by step to find the answer.\n"
+        "3. The answer should be a short phrase (typically 1-5 words).\n"
+        "4. On the last line, write: Final answer: <your answer>\n\n"
+        f"Question: {question}\n\n"
+        "Answer:\n"
     )
 
     return prompt
@@ -134,7 +196,7 @@ def extract_ketrag_original_answer(generated_text: str) -> str:
     return answer
 
 
-def extract_trident_style_answer(generated_text: str) -> str:
+def extract_trident_style_answer(generated_text: str, question: str = "", dataset: str = "hotpotqa") -> str:
     """
     Extract answer from generated text using Trident's extraction logic.
 
@@ -143,38 +205,101 @@ def extract_trident_style_answer(generated_text: str) -> str:
 
     Args:
         generated_text: Raw LLM output
+        question: The original question (optional)
+        dataset: Dataset name ('hotpotqa' or 'musique') for dataset-specific extraction
 
     Returns:
         Extracted answer text
     """
+    if dataset.lower() == "musique":
+        return extract_musique_answer(generated_text)
+    else:
+        # Original HotPotQA extraction - DO NOT MODIFY
+        return extract_hotpotqa_answer(generated_text)
+
+
+def extract_hotpotqa_answer(generated_text: str) -> str:
+    """
+    Extract answer for HotPotQA dataset.
+
+    NOTE: This is the ORIGINAL extraction logic - do not modify.
+    """
     answer = generated_text.strip()
 
     # First, try to extract from "Final answer:" format (case-insensitive)
-    # This is the format requested by build_trident_style_prompt
     match = re.search(
         r'(?:^|\n)\s*final\s+answer\s*:\s*(.+?)(?:\n|$)',
         answer,
         re.IGNORECASE | re.MULTILINE
     )
     if match:
-        # Extract the answer portion after "Final answer:"
         answer = match.group(1).strip()
-        # Remove any trailing "Final answer:" artifacts
         answer = re.sub(r'\s*final\s+answer\s*:.*$', '', answer, flags=re.IGNORECASE).strip()
-    else:
-        # Fall back to removing common prefixes
-        prefixes_to_remove = [
-            "Answer:", "A:", "Response:", "The answer is:",
-            "Based on the context,", "According to the documents,"
-        ]
+        return answer
 
-        for prefix in prefixes_to_remove:
-            if answer.lower().startswith(prefix.lower()):
-                answer = answer[len(prefix):].strip()
-                break
+    # Fall back to removing common prefixes
+    prefixes_to_remove = [
+        "Answer:", "A:", "Response:", "The answer is:",
+        "Based on the context,", "According to the documents,"
+    ]
+
+    for prefix in prefixes_to_remove:
+        if answer.lower().startswith(prefix.lower()):
+            answer = answer[len(prefix):].strip()
+            break
 
     # Take first sentence if answer is very long
     if len(answer) > 500 and '.' in answer:
         answer = answer.split('.')[0] + '.'
 
     return answer
+
+
+def extract_musique_answer(generated_text: str) -> str:
+    """
+    Extract answer for MuSiQue dataset.
+
+    Universal extraction for multi-hop QA - similar to standard approaches.
+    """
+    text = generated_text.strip()
+
+    if not text:
+        return ""
+
+    # Primary: Look for "Final answer:" pattern
+    match = re.search(r'(?i)final\s+answer\s*[:\-]\s*(.+?)(?:\n|$)', text)
+    if match:
+        answer = match.group(1).strip()
+        answer = answer.rstrip('.,;:')
+        return answer
+
+    # Secondary: Look for "Answer:" or "The answer is" patterns
+    other_patterns = [
+        r"(?mi)^answer\s*[:\-]\s*(.+?)(?:\n|$)",
+        r"(?mi)the\s+answer\s+is\s+(.+?)(?:\.|,|\n|$)",
+    ]
+
+    for pat in other_patterns:
+        m = re.search(pat, text)
+        if m:
+            answer = m.group(1).strip()
+            answer = answer.rstrip('.,;:')
+            if answer and len(answer) > 1:
+                return answer
+
+    # Fallback: remove common prefixes
+    prefixes_to_remove = [
+        "Answer:", "A:", "Response:", "The answer is:",
+        "Based on the context,", "According to the documents,"
+    ]
+
+    for prefix in prefixes_to_remove:
+        if text.lower().startswith(prefix.lower()):
+            text = text[len(prefix):].strip()
+            break
+
+    # Take first sentence if very long
+    if len(text) > 500 and '.' in text:
+        text = text.split('.')[0]
+
+    return text.strip().rstrip('.,;:')
