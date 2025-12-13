@@ -1,0 +1,23 @@
+{
+  "mode": "self_rag",
+  "llm": {
+    "model_name": "meta-llama/Llama-2-7b-hf",
+    "temperature": 0.0,
+    "max_new_tokens": 256,
+    "load_in_8bit": false
+  },
+  "retrieval": {
+    "method": "dense",
+    "encoder_model": "facebook/contriever",
+    "top_k": 100
+  },
+  "baselines": {
+    "selfrag_k": 8,
+    "selfrag_use_critic": false
+  },
+  "evaluation": {
+    "metrics": ["em", "f1"],
+    "dataset": "hotpotqa",
+    "save_predictions": true
+  }
+}

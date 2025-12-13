@@ -13,6 +13,8 @@ class MuSiQueDataLoader:
     DATA_FILES = {
         'ans_dev': 'musique_ans_v1.0_dev.jsonl',
         'ans_test': 'musique_ans_v1.0_test.jsonl',
+        'ans_train': 'musique_ans_v1.0_train.jsonl',
+        'full_train': 'musique_full_v1.0_train.jsonl',
         'full_dev': 'musique_full_v1.0_dev.jsonl',
         'full_test': 'musique_full_v1.0_test.jsonl',
         'singlehop': 'dev_test_singlehop_questions_v1.0.json'
@@ -37,7 +39,7 @@ class MuSiQueDataLoader:
         """Load raw MuSiQue data.
 
         Args:
-            split: One of 'ans_dev', 'ans_test', 'full_dev', 'full_test', 'singlehop'
+            split: One of 'ans_dev', 'ans_test', 'full_dev', 'full_test', 'singlehop','ans_train','full_train'
             limit: Maximum number of examples to load
 
         Returns:

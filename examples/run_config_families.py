@@ -17,9 +17,15 @@ Usage:
 
 from __future__ import annotations
 
+import sys
 import argparse
 import json
 from pathlib import Path
+
+# Ensure the project root is on sys.path so examples can import the local trident package
+_project_root = Path(__file__).resolve().parents[1]
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
 
 from trident.config import TridentConfig
 from trident.config_families import (

@@ -21,7 +21,7 @@ warnings.filterwarnings("ignore", message=".*NumbaDeprecationWarning.*")
 
 # Add KET-RAG to path FIRST (before any other imports that might load graphrag)
 SCRIPT_DIR = Path(__file__).parent.parent
-KETRAG_PATH = SCRIPT_DIR / "KET-RAG"
+KETRAG_PATH = SCRIPT_DIR / "external_baselines" / "KET-RAG"
 
 # Remove any existing graphrag from path and add KET-RAG's version
 sys.path = [p for p in sys.path if 'graphrag' not in p.lower() or 'KET-RAG' in p]

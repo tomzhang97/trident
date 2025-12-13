@@ -64,6 +64,52 @@ def build_trident_style_prompt(
     return prompt
 
 
+def build_standard_rag_prompt(
+    question: str,
+    passages: List[Dict[str, Any]]
+) -> str:
+    """
+    Build standard RAG prompt format used in research papers.
+
+    Format:
+    System: "Answer the question based on the given passage. Only give me the answer
+             and do not output any other words."
+    Passages: "Doc 1 (Title: {title}) {content}"
+    User: "Question: {question}"
+
+    Args:
+        question: The question to answer
+        passages: List of passage dicts with 'text'/'content' and optional 'title'
+
+    Returns:
+        Formatted prompt string
+    """
+    # System instruction
+    system_msg = (
+        "Answer the question based on the given passage. "
+        "Only give me the answer and do not output any other words."
+    )
+
+    # Format passages
+    if passages:
+        passage_lines = []
+        for i, passage in enumerate(passages, 1):
+            title = passage.get('title', f'Document {i}')
+            content = passage.get('text', passage.get('content', ''))
+            passage_lines.append(f"Doc {i} (Title: {title}) {content}")
+
+        passages_text = "\n".join(passage_lines)
+        system_msg += f"\n\nThe following are given passages:\n{passages_text}"
+
+    # User question
+    user_msg = f"Question: {question}"
+
+    # Combine into single prompt
+    prompt = f"{system_msg}\n\n{user_msg}"
+
+    return prompt
+
+
 KETRAG_SYSTEM_PROMPT = """
 ---Role---
 
@@ -176,5 +222,37 @@ def extract_trident_style_answer(generated_text: str) -> str:
     # Take first sentence if answer is very long
     if len(answer) > 500 and '.' in answer:
         answer = answer.split('.')[0] + '.'
+
+    return answer
+
+
+def extract_standard_rag_answer(generated_text: str) -> str:
+    """
+    Extract answer from standard RAG prompt output.
+
+    The standard prompt asks for only the answer with no extra words,
+    so we just strip whitespace and remove common prefixes if present.
+
+    Args:
+        generated_text: Raw LLM output
+
+    Returns:
+        Extracted answer text
+    """
+    answer = generated_text.strip()
+
+    # Remove common prefixes if the model adds them anyway
+    prefixes_to_remove = [
+        "Answer:", "A:", "The answer is:", "Response:",
+    ]
+
+    for prefix in prefixes_to_remove:
+        if answer.lower().startswith(prefix.lower()):
+            answer = answer[len(prefix):].strip()
+            break
+
+    # Take first line if multi-line (standard prompt asks for just the answer)
+    if '\n' in answer:
+        answer = answer.split('\n')[0].strip()
 
     return answer

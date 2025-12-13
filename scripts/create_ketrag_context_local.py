@@ -32,8 +32,8 @@ from tqdm.asyncio import tqdm as atqdm
 # Add paths
 SCRIPT_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(SCRIPT_DIR))
-sys.path.insert(0, str(SCRIPT_DIR / "KET-RAG"))
-sys.path.insert(0, str(SCRIPT_DIR / "KET-RAG" / "indexing_sket"))
+sys.path.insert(0, str(SCRIPT_DIR / "external_baselines" / "KET-RAG"))
+sys.path.insert(0, str(SCRIPT_DIR / "external_baselines" / "KET-RAG" / "indexing_sket"))
 
 from graphrag.query.llm.text_utils import num_tokens
 from graphrag.query.input.loaders.dfs import read_text_units

@@ -14,7 +14,7 @@ from pathlib import Path
 
 # Add KET-RAG to path
 SCRIPT_DIR = Path(__file__).parent.parent
-sys.path.insert(0, str(SCRIPT_DIR / "KET-RAG"))
+sys.path.insert(0, str(SCRIPT_DIR / "external_baselines" / "KET-RAG"))
 
 import graphrag.api as api
 from graphrag.config import load_config
@@ -36,7 +36,7 @@ async def prompt_tune(
     domain: str | None = None,
     selection_method: str = "random",
     limit: int = 15,
-    max_tokens: int = 4000,
+    max_tokens: int = 3000,
     chunk_size: int = 300,
     language: str | None = None,
     discover_entity_types: bool = True,
@@ -115,7 +115,7 @@ def main():
                         help="Document selection method")
     parser.add_argument("--limit", type=int, default=15,
                         help="Number of documents to use")
-    parser.add_argument("--max-tokens", type=int, default=4000,
+    parser.add_argument("--max-tokens", type=int, default=5000,
                         help="Max tokens for prompts")
     parser.add_argument("--chunk-size", type=int, default=300,
                         help="Chunk size for text")

@@ -5,9 +5,11 @@ This module defines concrete config presets for running cost-quality frontier ex
 1. **Pareto configs**: Target Self-RAG-level costs with higher accuracy
 2. **Safe-Cover configs**: Strict risk control with different budget regimes
 3. **Self-RAG configs**: Fair baseline comparisons
+4. **Dataset-specific helpers**: Create full TridentConfig for different datasets
 
 Usage:
     from trident.config_families import PARETO_CHEAP_1500, SAFE_COVER_EQUAL_2500
+     from trident.config_families import make_musique_config
 
     # Create a TridentConfig with a specific preset
     config = TridentConfig(
@@ -15,12 +17,17 @@ Usage:
         pareto=PARETO_CHEAP_1500,
         ...
     )
+    # Or use dataset-specific helper
+    config = make_musique_config("pareto_cheap_1500")
 """
 
 from __future__ import annotations
 
-from .config import ParetoConfig, SafeCoverConfig, BaselineConfig
-
+from .config import (
+    ParetoConfig, SafeCoverConfig, BaselineConfig,
+    TridentConfig, EvaluationConfig, LLMConfig, RetrievalConfig,
+    NLIConfig, CalibrationConfig, TelemetryConfig
+)
 
 # =============================================================================
 # Pareto: "Cheap TRIDENT" configs
@@ -122,6 +129,31 @@ PARETO_MATCH_1500_ALPHA06 = ParetoConfig(
     bwk_exploration_bonus=0.1,
 )
 
+PARETO_MATCH_500_ALPHA06 = ParetoConfig(
+    budget=500,
+    max_evidence_tokens=500,
+    max_units=5,
+    stop_on_budget=True,
+    relaxed_alpha=0.6,  # More lenient threshold for better coverage
+    weight_default=1.0,
+    use_vqc=False,
+    use_bwk=False,
+    max_vqc_iterations=0,
+    bwk_exploration_bonus=0.1,
+)
+
+PARETO_MATCH_400 = ParetoConfig(
+    budget=400,
+    max_evidence_tokens=400,
+    max_units=4,
+    stop_on_budget=True,
+    relaxed_alpha=0.5,
+    weight_default=1.0,
+    use_vqc=True,
+    use_bwk=True,
+    max_vqc_iterations=0,
+    bwk_exploration_bonus=0.1,
+)
 
 # =============================================================================
 # Safe-Cover configs: Strict risk control
@@ -247,7 +279,9 @@ PARETO_CONFIGS = {
     "pareto_match_1500": PARETO_MATCH_1500,
     "pareto_match_1300": PARETO_MATCH_1300,
     "pareto_match_1100": PARETO_MATCH_1100,
+    "pareto_match_400": PARETO_MATCH_400,
     "pareto_match_1500_alpha06": PARETO_MATCH_1500_ALPHA06,
+    "pareto_match_500_alpha06": PARETO_MATCH_500_ALPHA06,
 }
 
 SAFE_COVER_CONFIGS = {
@@ -310,3 +344,95 @@ def get_selfrag_config(config_name: str) -> BaselineConfig:
             f"Unknown Self-RAG config name: {config_name}. "
             f"Available configs: {available}"
         )
+    
+# =============================================================================
+# Dataset-specific config helpers
+# =============================================================================
+
+def make_dataset_config(
+    config_name: str,
+    dataset: str = "hotpotqa",
+    model_name: str = "meta-llama/Llama-2-7b-hf",
+    device: str = "cuda:0",
+) -> TridentConfig:
+    """Create a full TridentConfig for a specific dataset.
+
+    Args:
+        config_name: Name of the config preset (e.g., "pareto_cheap_1500")
+        dataset: Dataset name ("hotpotqa", "musique", etc.)
+        model_name: LLM model name
+        device: Device to run on
+
+    Returns:
+        Complete TridentConfig ready for use
+
+    Example:
+        config = make_dataset_config("pareto_cheap_1500", dataset="musique")
+    """
+    # Get the base config
+    base_config = get_config(config_name)
+
+    # Determine mode from config type
+    if isinstance(base_config, ParetoConfig):
+        mode = "pareto"
+        pareto_config = base_config
+        safe_cover_config = SafeCoverConfig()
+    elif isinstance(base_config, SafeCoverConfig):
+        mode = "safe_cover"
+        safe_cover_config = base_config
+        pareto_config = ParetoConfig()
+    else:
+        raise ValueError(f"Unexpected config type: {type(base_config)}")
+
+    return TridentConfig(
+        mode=mode,
+        pareto=pareto_config,
+        safe_cover=safe_cover_config,
+        llm=LLMConfig(model_name=model_name, device=device),
+        evaluation=EvaluationConfig(dataset=dataset),
+        baselines=SELFRAG_BASE,
+    )
+
+
+def make_musique_config(
+    config_name: str,
+    model_name: str = "meta-llama/Llama-2-7b-hf",
+    device: str = "cuda:0",
+) -> TridentConfig:
+    """Create a TridentConfig for MuSiQue dataset.
+
+    Args:
+        config_name: Name of the config preset (e.g., "pareto_cheap_1500")
+        model_name: LLM model name
+        device: Device to run on
+
+    Returns:
+        Complete TridentConfig configured for MuSiQue
+
+    Example:
+        from trident.config_families import make_musique_config
+        config = make_musique_config("pareto_cheap_1500")
+    """
+    return make_dataset_config(config_name, dataset="musique", model_name=model_name, device=device)
+
+
+def make_hotpotqa_config(
+    config_name: str,
+    model_name: str = "meta-llama/Llama-2-7b-hf",
+    device: str = "cuda:0",
+) -> TridentConfig:
+    """Create a TridentConfig for HotpotQA dataset.
+
+    Args:
+        config_name: Name of the config preset (e.g., "pareto_cheap_1500")
+        model_name: LLM model name
+        device: Device to run on
+
+    Returns:
+        Complete TridentConfig configured for HotpotQA
+
+    Example:
+        from trident.config_families import make_hotpotqa_config
+        config = make_hotpotqa_config("pareto_cheap_1500")
+    """
+    return make_dataset_config(config_name, dataset="hotpotqa", model_name=model_name, device=device)

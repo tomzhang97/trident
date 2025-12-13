@@ -38,8 +38,8 @@ from tqdm.asyncio import tqdm_asyncio
 # Add paths for imports
 SCRIPT_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(SCRIPT_DIR))
-sys.path.insert(0, str(SCRIPT_DIR / "KET-RAG"))
-sys.path.insert(0, str(SCRIPT_DIR / "KET-RAG" / "indexing_sket"))
+sys.path.insert(0, str(SCRIPT_DIR / "external_baselines" /  "KET-RAG"))
+sys.path.insert(0, str(SCRIPT_DIR / "external_baselines" /  "KET-RAG" / "indexing_sket"))
 
 from graphrag.query.context_builder.entity_extraction import EntityVectorStoreKey
 from graphrag.query.structured_search.local_search.mixed_context import LocalSearchMixedContext

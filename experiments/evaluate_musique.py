@@ -35,6 +35,8 @@ evaluate = evaluate_module.evaluate
 SPLIT_TO_FILE = {
     'ans_dev': 'musique_ans_v1.0_dev.jsonl',
     'ans_test': 'musique_ans_v1.0_test.jsonl',
+    'ans_train': 'musique_ans_v1.0_train.jsonl',
+    'full_train': 'musique_full_v1.0_train.jsonl',
     'full_dev': 'musique_full_v1.0_dev.jsonl',
     'full_test': 'musique_full_v1.0_test.jsonl',
 }

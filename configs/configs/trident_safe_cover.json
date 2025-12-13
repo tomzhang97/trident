@@ -1,0 +1,46 @@
+{
+  "mode": "safe_cover",
+  "safe_cover": {
+    "per_facet_alpha": 0.01,
+    "coverage_threshold": 0.15,
+    "token_cap": 2000,
+    "dual_tolerance": 1e-6,
+    "early_abstain": true,
+    "use_certificates": true,
+    "monitor_drift": false,
+    "fallback_to_pareto": true
+  },
+  "pareto": {
+    "budget": 2000,
+    "relaxed_alpha": 0.5,
+    "use_vqc": false,
+    "use_bwk": false
+  },
+  "llm": {
+    "model_name": "meta-llama/Meta-Llama-3-8B-Instruct",
+    "temperature": 0.0,
+    "max_new_tokens": 256,
+    "load_in_8bit": false
+  },
+  "retrieval": {
+    "method": "dense",
+    "encoder_model": "facebook/contriever",
+    "top_k": 100
+  },
+  "nli": {
+    "model_name": "microsoft/deberta-v2-xlarge-mnli",
+    "batch_size": 32,
+    "score_threshold": 0.9
+  },
+  "calibration": {
+    "method": "isotonic",
+    "use_mondrian": true,
+    "reliability_table_size": 20
+  },
+  "evaluation": {
+    "metrics": ["em", "f1", "support_em", "faithfulness"],
+    "dataset": "hotpotqa",
+    "save_predictions": true,
+    "save_certificates": true
+  }
+}

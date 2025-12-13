@@ -118,7 +118,7 @@ llm:
   type: openai_chat
   model: local-model
   model_supports_json: true
-  max_tokens: 4000
+  max_tokens: 5000
   request_timeout: 180.0
   api_base: LOCAL_LLM_URL_PLACEHOLDER
   api_version: null

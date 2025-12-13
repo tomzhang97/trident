@@ -117,7 +117,7 @@ llm:
   type: openai_chat
   model: gpt-4o-mini
   model_supports_json: true
-  max_tokens: 4000
+  max_tokens: 5000
   request_timeout: 180.0
   api_base: null
   api_version: null

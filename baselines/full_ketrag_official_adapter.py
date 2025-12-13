@@ -21,7 +21,7 @@ from baselines.full_baseline_interface import (
 )
 
 # Add the KET-RAG folder to path for imports
-KETRAG_PATH = Path(__file__).parent.parent / "KET-RAG"
+KETRAG_PATH = Path(__file__).parent.parent / "external_baselines" / "KET-RAG"
 KETRAG_SKET_PATH = KETRAG_PATH / "indexing_sket"
 if str(KETRAG_SKET_PATH) not in sys.path:
     sys.path.insert(0, str(KETRAG_SKET_PATH))

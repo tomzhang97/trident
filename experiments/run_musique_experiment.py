@@ -9,17 +9,17 @@ This script handles the complete workflow:
 4. Generate comprehensive reports
 
 Usage:
-    # Run TRIDENT Safe-Cover on MuSiQue dev set
-    python experiments/run_musique_experiment.py --mode safe_cover --split ans_dev
+    # Run TRIDENT Pareto on MuSiQue dev set
+    python experiments/run_musique_experiment.py --config_name pareto_cheap_1500 --split ans_dev
 
-    # Run Self-RAG baseline
-    python experiments/run_musique_experiment.py --mode self_rag --split ans_dev
+    # Run TRIDENT Safe-Cover on MuSiQue dev set
+    python experiments/run_musique_experiment.py --config_name safe_cover_equal_2000 --split ans_dev
 
     # Run with limited examples for testing
-    python experiments/run_musique_experiment.py --mode safe_cover --split ans_dev --limit 100
+    python experiments/run_musique_experiment.py --config_name pareto_cheap_1500 --split ans_dev --limit 100
 
-    # Run on full dataset with answerability
-    python experiments/run_musique_experiment.py --mode safe_cover --split full_dev
+    # List available configs
+    python experiments/run_musique_experiment.py --list_configs
 """
 
 import argparse
@@ -27,14 +27,23 @@ import json
 import os
 import sys
 import time
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional
+
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue, Empty
+from threading import Lock
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from musique.data_loader import MuSiQueDataLoader
+from trident.config_families import (
+    make_musique_config, ALL_CONFIGS, PARETO_CONFIGS, SAFE_COVER_CONFIGS
+)
 
 
 def setup_output_dirs(base_dir: str, mode: str, split: str) -> Dict[str, Path]:
@@ -97,6 +106,27 @@ def prepare_data(
     }
 
 
+def _resolve_gpu_ids(start_gpu: int, num_gpus: int) -> List[str]:
+    """
+    Resolve physical GPU IDs to use.
+
+    If the user already set CUDA_VISIBLE_DEVICES (e.g. "2,3,4,5"),
+    then start_gpu is treated as an *index into that visible list*.
+    Otherwise, start_gpu is treated as the physical GPU id.
+    """
+    if num_gpus <= 0:
+        return []
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible:
+        # Keep as strings to support both indices and UUIDs in rare setups
+        vis_list = [x.strip() for x in visible.split(",") if x.strip()]
+        return vis_list[start_gpu:start_gpu + num_gpus]
+
+    # No mask set: treat as physical IDs
+    return [str(i) for i in range(start_gpu, start_gpu + num_gpus)]
+
+
 def run_experiment(
     shard_paths: List[str],
     results_dir: Path,
@@ -107,7 +137,7 @@ def run_experiment(
     num_gpus: int = 1,
     additional_args: Optional[Dict] = None
 ) -> List[str]:
-    """Run TRIDENT/baseline on all shards."""
+    """Run TRIDENT/baseline on all shards, parallelized across GPUs."""
     print(f"\n{'='*60}")
     print("STEP 2: Running experiments")
     print(f"{'='*60}")
@@ -115,58 +145,151 @@ def run_experiment(
     print(f"Mode: {mode}")
     print(f"Config: {config_path}")
     print(f"Model: {model}")
-    print(f"GPUs: {num_gpus}")
+    print(f"Requested device: {device}")
+    print(f"Requested num_gpus: {num_gpus}")
 
-    result_paths = []
+    # CPU mode (keep behavior simple)
+    if device < 0 or num_gpus <= 1:
+        print("Running sequentially (CPU or single GPU).")
+        result_paths = []
+        for i, shard_path in enumerate(shard_paths):
+            shard_name = Path(shard_path).stem
+            output_dir = results_dir / shard_name
+            output_dir.mkdir(parents=True, exist_ok=True)
 
-    for i, shard_path in enumerate(shard_paths):
-        shard_name = Path(shard_path).stem
-        output_dir = results_dir / shard_name
-        gpu_id = i % num_gpus if device < 0 else device
+            gpu_id = device if device >= 0 else -1
+            cmd = [
+                "python", "experiments/eval_complete_runnable.py",
+                "--worker",
+                "--data_path", shard_path,
+                "--output_dir", str(output_dir),
+                "--mode", mode,
+                "--config", config_path,
+                "--model", model,
+                "--device", str(gpu_id),
+                "--dataset", "musique"
+            ]
 
-        print(f"\nProcessing shard {i+1}/{len(shard_paths)}: {shard_name}")
-        print(f"  GPU: {gpu_id}")
-
-        cmd = [
-            "python", "experiments/eval_complete_runnable.py",
-            "--worker",
-            "--data_path", shard_path,
-            "--output_dir", str(output_dir),
-            "--mode", mode,
-            "--config", config_path,
-            "--model", model,
-            "--device", str(gpu_id),
-            "--dataset", "musique"
-        ]
-
-        # Add additional arguments
-        if additional_args:
-            for key, value in additional_args.items():
-                if value is not None:
+            if additional_args:
+                for key, value in additional_args.items():
+                    if value is None:
+                        continue
                     if isinstance(value, bool):
                         if value:
                             cmd.append(f"--{key}")
                     else:
                         cmd.extend([f"--{key}", str(value)])
 
-        # Execute command
-        import subprocess
-        print(f"  Command: {' '.join(cmd)}")
+            print(f"\nProcessing shard {i+1}/{len(shard_paths)}: {shard_name}")
+            print(f"  Command: {' '.join(cmd)}")
 
-        start_time = time.time()
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        elapsed = time.time() - start_time
+            log_path = output_dir / "worker.log"
+            start_time = time.time()
+            with open(log_path, "w", encoding="utf-8") as logf:
+                result = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT, text=True)
+            elapsed = time.time() - start_time
 
-        if result.returncode != 0:
-            print(f"  ERROR: {result.stderr}")
-        else:
-            print(f"  Completed in {elapsed:.1f}s")
+            if result.returncode != 0:
+                print(f"  ERROR (see {log_path})")
+            else:
+                print(f"  Completed in {elapsed:.1f}s (log: {log_path})")
 
-        result_path = output_dir / "results.json"
-        if result_path.exists():
-            result_paths.append(str(result_path))
+            result_path = output_dir / "results.json"
+            if result_path.exists():
+                result_paths.append(str(result_path))
+
+        return result_paths
+
+    # Multi-GPU parallel mode
+    gpu_ids = _resolve_gpu_ids(device, num_gpus)
+    if not gpu_ids:
+        raise RuntimeError(
+            f"No GPUs resolved (device={device}, num_gpus={num_gpus}). "
+            f"Check CUDA_VISIBLE_DEVICES or your args."
+        )
+
+    print(f"Running in parallel on GPUs: {gpu_ids}")
+    q: Queue = Queue()
+    for sp in shard_paths:
+        q.put(sp)
+
+    result_paths: List[str] = []
+    result_lock = Lock()
+    print_lock = Lock()
+
+    def run_one_shard_on_gpu(gpu_id: str):
+        """Worker bound to a single GPU; pulls shards until queue is empty."""
+        while True:
+            try:
+                shard_path = q.get_nowait()
+            except Empty:
+                return
+
+            shard_name = Path(shard_path).stem
+            output_dir = results_dir / shard_name
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Build command
+            cmd = [
+                "python", "experiments/eval_complete_runnable.py",
+                "--worker",
+                "--data_path", shard_path,
+                "--output_dir", str(output_dir),
+                "--mode", mode,
+                "--config", config_path,
+                "--model", model,
+                # IMPORTANT: when we mask to a single GPU, it's always cuda:0 inside the subprocess
+                "--device", "0",
+                "--dataset", "musique"
+            ]
+
+            if additional_args:
+                for key, value in additional_args.items():
+                    if value is None:
+                        continue
+                    if isinstance(value, bool):
+                        if value:
+                            cmd.append(f"--{key}")
+                    else:
+                        cmd.extend([f"--{key}", str(value)])
+
+            # Per-process environment: pin to exactly one GPU
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+            log_path = output_dir / f"worker_gpu{gpu_id}.log"
+            with print_lock:
+                print(f"\n[GPU {gpu_id}] Processing shard: {shard_name}")
+                print(f"[GPU {gpu_id}] Command: {' '.join(cmd)}")
+                print(f"[GPU {gpu_id}] Log: {log_path}")
+
+            start_time = time.time()
+            with open(log_path, "w", encoding="utf-8") as logf:
+                result = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT, text=True, env=env)
+            elapsed = time.time() - start_time
+
+            if result.returncode != 0:
+                with print_lock:
+                    print(f"[GPU {gpu_id}] ERROR (see {log_path})")
+            else:
+                with print_lock:
+                    print(f"[GPU {gpu_id}] Done in {elapsed:.1f}s")
+
+            rp = output_dir / "results.json"
+            if rp.exists():
+                with result_lock:
+                    result_paths.append(str(rp))
+
+            q.task_done()
+
+    # Launch one worker per GPU (guarantees 1 shard at a time per GPU)
+    with ThreadPoolExecutor(max_workers=len(gpu_ids)) as ex:
+        futures = [ex.submit(run_one_shard_on_gpu, gid) for gid in gpu_ids]
+        for f in futures:
+            f.result()
 
     return result_paths
+
 
 
 def aggregate_results(result_paths: List[str], eval_dir: Path) -> Dict[str, Any]:
@@ -317,10 +440,9 @@ def generate_report(
 # MuSiQue Experiment Report
 
 ## Configuration
-- **Mode**: {args.mode}
+- **Config**: {args.config_name}
 - **Split**: {args.split}
 - **Model**: {args.model}
-- **Config**: {args.config}
 - **Date**: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
 ## Dataset Statistics
@@ -373,27 +495,28 @@ Examples:
   # Run with limited examples for quick testing
   python experiments/run_musique_experiment.py --mode safe_cover --split ans_dev --limit 50
 
-  # Run Self-RAG baseline
-  python experiments/run_musique_experiment.py --mode self_rag --split ans_dev
-
-  # Run on full dataset (with unanswerable questions)
-  python experiments/run_musique_experiment.py --mode safe_cover --split full_dev
+  # List available configs
+  python experiments/run_musique_experiment.py --list_configs
         """
     )
 
-    # Required arguments
+    # Config selection
     parser.add_argument(
-        "--mode",
+        "--config_name",
         type=str,
-        required=True,
-        choices=["safe_cover", "pareto", "self_rag", "graphrag", "ketrag"],
-        help="System mode to run"
+        default="pareto_cheap_1500",
+        help="Config preset name from config_families (e.g., pareto_cheap_1500, safe_cover_equal_2000)"
+    )
+    parser.add_argument(
+        "--list_configs",
+        action="store_true",
+        help="List all available config presets and exit"
     )
     parser.add_argument(
         "--split",
         type=str,
         default="ans_dev",
-        choices=["ans_dev", "ans_test", "full_dev", "full_test", "singlehop"],
+        choices=["ans_dev", "ans_test", "full_dev", "full_test", "singlehop", 'ans_train', 'full_train'],
         help="MuSiQue data split"
     )
 
@@ -407,12 +530,6 @@ Examples:
         type=str,
         default="meta-llama/Llama-2-7b-hf",
         help="LLM model to use"
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/musique.json",
-        help="Config file path"
     )
 
     # Hardware options
@@ -439,25 +556,45 @@ Examples:
     parser.add_argument("--max_new_tokens", type=int, default=256, help="Max tokens to generate")
     parser.add_argument("--load_in_8bit", action="store_true", help="Load model in 8-bit")
 
-    # Baseline-specific options
-    parser.add_argument("--common_k", type=int, default=8, help="Retrieval k for baselines")
-    parser.add_argument("--selfrag_use_critic", action="store_true", help="Use critic in Self-RAG")
-
     args = parser.parse_args()
+
+    # Handle --list_configs
+    if args.list_configs:
+        print("\nAvailable config presets:")
+        print("\nPareto configs:")
+        for name in PARETO_CONFIGS:
+            print(f"  - {name}")
+        print("\nSafe-Cover configs:")
+        for name in SAFE_COVER_CONFIGS:
+            print(f"  - {name}")
+        sys.exit(0)
+
+    # Create config using config_families
+    device = f"cuda:{args.device}" if args.device >= 0 else "cpu"
+    config = make_musique_config(args.config_name, model_name=args.model, device=device)
+
+    # Save config to file for experiment runner
+    config_dict = asdict(config)
+    config_path = Path(args.output_dir) / f"config_{args.config_name}.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(config_path, 'w') as f:
+        json.dump(config_dict, f, indent=2)
 
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
 ║           MuSiQue Experiment Runner for TRIDENT              ║
 ╠══════════════════════════════════════════════════════════════╣
-║  Mode: {args.mode:<54}║
+║  Config: {args.config_name:<52}║
+║  Mode: {config.mode:<54}║
 ║  Split: {args.split:<53}║
 ║  Model: {args.model:<53}║
 ╚══════════════════════════════════════════════════════════════╝
 """)
 
     # Setup directories
-    dirs = setup_output_dirs(args.output_dir, args.mode, args.split)
+    dirs = setup_output_dirs(args.output_dir, config.mode, args.split)
     print(f"Run directory: {dirs['run_dir']}")
+    print(f"Using config: {config_path}")
 
     # Step 1: Prepare data
     data_info = prepare_data(
@@ -472,15 +609,13 @@ Examples:
         'temperature': args.temperature,
         'max_new_tokens': args.max_new_tokens,
         'load_in_8bit': args.load_in_8bit,
-        'common_k': args.common_k,
-        'selfrag_use_critic': args.selfrag_use_critic
     }
 
     result_paths = run_experiment(
         data_info['shard_paths'],
         dirs['results_dir'],
-        args.mode,
-        args.config,
+        config.mode,
+        str(config_path),
         args.model,
         args.device,
         args.num_gpus,

@@ -19,7 +19,7 @@ from baselines.full_baseline_interface import (
 )
 
 # Add the self-rag folder to path for imports
-SELFRAG_PATH = Path(__file__).parent.parent / "self-rag" / "retrieval_lm"
+SELFRAG_PATH = Path(__file__).parent.parent / "external_baselines" / "self-rag" / "retrieval_lm"
 if str(SELFRAG_PATH) not in sys.path:
     sys.path.insert(0, str(SELFRAG_PATH))
 
