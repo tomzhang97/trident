@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
-"""Main experiment runner for TRIDENT evaluation with local LLMs."""
+"""Main experiment runner for TRIDENT evaluation with local LLMs.
+
+Supports:
+- Single worker mode (--worker): Process a single data shard
+- Multi-GPU mode (--num_gpus N): Automatically shard data and run in parallel
+- Both JSON and JSONL data formats (for HotpotQA and MuSiQue)
+
+Usage:
+    # Single GPU worker mode
+    python eval_complete_runnable.py --worker --data_path data.json --output_dir results/
+
+    # Multi-GPU parallel mode (automatically shards and distributes)
+    python eval_complete_runnable.py --data_path data.jsonl --output_dir results/ --num_gpus 4
+
+    # With MuSiQue JSONL format
+    python eval_complete_runnable.py --data_path musique_ans_v1.0_dev.jsonl --output_dir results/ --num_gpus 4
+"""
 
 import argparse
 import json
@@ -9,9 +25,13 @@ import time
 import traceback
 import re
 import string
+import subprocess
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Any
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue, Empty
+from threading import Lock
 
 import importlib
 import importlib.util
@@ -75,6 +95,141 @@ def _f1(pred: str, gt: str) -> float:
     prec = len(common) / len(pred_tokens)
     rec = len(common) / len(gt_tokens)
     return 2 * prec * rec / (prec + rec)
+
+
+def load_data(data_path: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Load data from JSON or JSONL file.
+
+    Supports:
+    - JSON: List of examples or HotpotQA format
+    - JSONL: One JSON object per line (MuSiQue format)
+
+    Automatically converts to standard format with _id, question, answer, context, supporting_facts.
+    """
+    path = Path(data_path)
+
+    if path.suffix == '.jsonl':
+        # JSONL format (MuSiQue)
+        examples = []
+        with open(path, 'r') as f:
+            for line in f:
+                if line.strip():
+                    examples.append(json.loads(line))
+                    if limit and len(examples) >= limit:
+                        break
+        # Convert MuSiQue format to standard format
+        return convert_musique_format(examples)
+    else:
+        # JSON format (HotpotQA or pre-processed)
+        with open(path, 'r') as f:
+            data = json.load(f)
+
+        if isinstance(data, list):
+            examples = data[:limit] if limit else data
+        else:
+            examples = [data]
+
+        # Check if it's raw HotpotQA format and convert
+        if examples and '_id' not in examples[0] and 'id' in examples[0]:
+            return convert_hotpotqa_format(examples)
+
+        return examples
+
+
+def convert_musique_format(examples: List[Dict]) -> List[Dict]:
+    """Convert MuSiQue JSONL format to standard format."""
+    converted = []
+    for ex in examples:
+        # Extract context from paragraphs
+        context = []
+        supporting_facts = []
+
+        for para in ex.get('paragraphs', []):
+            title = para.get('title', f"para_{para.get('idx', 0)}")
+            text = para.get('paragraph_text', '')
+            # Split into sentences
+            sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+            sentences = [s.strip() for s in sentences if s.strip()]
+            context.append((title, sentences))
+
+            # Track supporting paragraphs
+            if para.get('is_supporting', False):
+                for sent_idx in range(len(sentences)):
+                    supporting_facts.append((title, sent_idx))
+
+        converted.append({
+            '_id': ex.get('id', ''),
+            'question': ex.get('question', ''),
+            'answer': ex.get('answer', ''),
+            'answer_aliases': ex.get('answer_aliases', []),
+            'context': context,
+            'supporting_facts': supporting_facts,
+            'type': ex.get('id', '').split('__')[0] if '__' in ex.get('id', '') else 'unknown',
+            'answerable': ex.get('answerable', True),
+        })
+    return converted
+
+
+def convert_hotpotqa_format(examples: List[Dict]) -> List[Dict]:
+    """Convert raw HotpotQA JSON format to standard format."""
+    converted = []
+    for ex in examples:
+        # Handle context format
+        context = ex.get('context', [])
+        if isinstance(context, dict):
+            # HuggingFace format
+            titles = context.get('title', [])
+            sentences_list = context.get('sentences', [])
+            context = list(zip(titles, sentences_list))
+
+        # Handle supporting_facts format
+        sf = ex.get('supporting_facts', [])
+        if isinstance(sf, dict):
+            sf_titles = sf.get('title', [])
+            sf_sents = sf.get('sent_id', [])
+            sf = list(zip(sf_titles, sf_sents))
+
+        converted.append({
+            '_id': ex.get('_id', ex.get('id', '')),
+            'question': ex.get('question', ''),
+            'answer': ex.get('answer', ''),
+            'context': context,
+            'supporting_facts': sf,
+            'type': ex.get('type', 'unknown'),
+            'level': ex.get('level', 'unknown'),
+        })
+    return converted
+
+
+def save_shard(examples: List[Dict], output_path: str) -> None:
+    """Save examples as a JSON shard."""
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w') as f:
+        json.dump(examples, f, indent=2)
+
+
+def create_shards(
+    examples: List[Dict],
+    output_dir: str,
+    shard_size: int = 100,
+    prefix: str = 'shard'
+) -> List[str]:
+    """Create data shards for parallel processing."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    shard_paths = []
+    for i in range(0, len(examples), shard_size):
+        shard = examples[i:i + shard_size]
+        start_idx = i
+        end_idx = min(i + shard_size, len(examples)) - 1
+
+        shard_name = f"{prefix}_{start_idx}_{end_idx}.json"
+        shard_path = output_path / shard_name
+        save_shard(shard, str(shard_path))
+        shard_paths.append(str(shard_path))
+
+    return shard_paths
 
 
 class ExperimentRunner:
@@ -263,16 +418,15 @@ class ExperimentRunner:
         )
     
     def _init_retriever(self) -> Any:
-
         """Initialize the retrieval system."""
-        
+
         # If we have a data file with contexts, build corpus from it
         if hasattr(self.args, 'data_path') and self.args.data_path:
             corpus_texts = []
             corpus_ids = []
 
-            with open(self.args.data_path) as f:
-                data = json.load(f)
+            # Use the new load_data function that handles JSON and JSONL
+            data = load_data(self.args.data_path)
 
             for idx, example in enumerate(data):
                 if 'context' in example:
@@ -357,9 +511,8 @@ class ExperimentRunner:
     
     def run_worker(self) -> None:
         """Run evaluation on a shard of data."""
-        # Load data shard
-        with open(self.args.data_path) as f:
-            data = json.load(f)
+        # Load data shard (handles both JSON and JSONL)
+        data = load_data(self.args.data_path)
         
         results = []
         total_time = 0
@@ -530,13 +683,210 @@ class ExperimentRunner:
         return summary
 
 
+def run_multi_gpu(args: argparse.Namespace) -> None:
+    """Run evaluation in parallel across multiple GPUs."""
+    print(f"\n{'='*60}")
+    print("MULTI-GPU EVALUATION MODE")
+    print(f"{'='*60}")
+
+    # Load and optionally limit data
+    print(f"Loading data from: {args.data_path}")
+    examples = load_data(args.data_path, limit=args.limit)
+    print(f"Loaded {len(examples)} examples")
+
+    # Create output directories
+    output_dir = Path(args.output_dir)
+    shards_dir = output_dir / "shards"
+    results_dir = output_dir / "results"
+    shards_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create shards
+    print(f"Creating shards (size={args.shard_size})...")
+    shard_paths = create_shards(examples, str(shards_dir), args.shard_size)
+    print(f"Created {len(shard_paths)} shards")
+
+    # Resolve GPU IDs
+    gpu_ids = _resolve_gpu_ids(args.device, args.num_gpus)
+    if not gpu_ids:
+        raise RuntimeError(f"No GPUs available (device={args.device}, num_gpus={args.num_gpus})")
+    print(f"Using GPUs: {gpu_ids}")
+
+    # Queue for shard distribution
+    q: Queue = Queue()
+    for sp in shard_paths:
+        q.put(sp)
+
+    result_paths: List[str] = []
+    result_lock = Lock()
+    print_lock = Lock()
+
+    def run_worker_on_gpu(gpu_id: str):
+        """Worker bound to a single GPU."""
+        while True:
+            try:
+                shard_path = q.get_nowait()
+            except Empty:
+                return
+
+            shard_name = Path(shard_path).stem
+            shard_output_dir = results_dir / shard_name
+            shard_output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Build command
+            cmd = [
+                sys.executable, __file__,
+                "--worker",
+                "--data_path", shard_path,
+                "--output_dir", str(shard_output_dir),
+                "--mode", args.mode,
+                "--model", args.model,
+                "--device", "0",  # Always 0 since we mask CUDA_VISIBLE_DEVICES
+                "--dataset", args.dataset,
+                "--temperature", str(args.temperature),
+                "--max_new_tokens", str(args.max_new_tokens),
+                "--seed", str(args.seed),
+            ]
+
+            if args.config:
+                cmd.extend(["--config", args.config])
+            if args.config_family:
+                cmd.extend(["--config_family", args.config_family])
+            if args.load_in_8bit:
+                cmd.append("--load_in_8bit")
+
+            # Per-process environment: pin to exactly one GPU
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+            log_path = shard_output_dir / f"worker_gpu{gpu_id}.log"
+            with print_lock:
+                print(f"[GPU {gpu_id}] Processing: {shard_name}")
+
+            start_time = time.time()
+            with open(log_path, "w", encoding="utf-8") as logf:
+                result = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT, text=True, env=env)
+            elapsed = time.time() - start_time
+
+            if result.returncode != 0:
+                with print_lock:
+                    print(f"[GPU {gpu_id}] ERROR on {shard_name} (see {log_path})")
+            else:
+                with print_lock:
+                    print(f"[GPU {gpu_id}] Done {shard_name} in {elapsed:.1f}s")
+
+            rp = shard_output_dir / "results.json"
+            if rp.exists():
+                with result_lock:
+                    result_paths.append(str(rp))
+
+            q.task_done()
+
+    # Launch workers
+    print(f"\nStarting {len(gpu_ids)} workers...")
+    with ThreadPoolExecutor(max_workers=len(gpu_ids)) as ex:
+        futures = [ex.submit(run_worker_on_gpu, gid) for gid in gpu_ids]
+        for f in futures:
+            f.result()
+
+    # Aggregate results
+    print(f"\n{'='*60}")
+    print("AGGREGATING RESULTS")
+    print(f"{'='*60}")
+
+    all_results = []
+    for rp in result_paths:
+        with open(rp, 'r') as f:
+            data = json.load(f)
+        if 'results' in data:
+            all_results.extend(data['results'])
+
+    # Compute aggregate metrics
+    em_scores = []
+    f1_scores = []
+    abstained = 0
+    tokens_used = []
+
+    for result in all_results:
+        if result.get('abstained') or 'error' in result:
+            abstained += 1
+            continue
+
+        pred = result.get('prediction', '')
+        gts = result.get('ground_truth', [])
+        if pred and gts:
+            best_em = max(1.0 if _normalize(pred) == _normalize(gt) else 0.0 for gt in gts)
+            best_f1 = max(_f1(pred, gt) for gt in gts)
+            em_scores.append(best_em)
+            f1_scores.append(best_f1)
+
+        tokens_used.append(result.get('tokens_used', 0))
+
+    summary = {
+        'total': len(all_results),
+        'valid': len(all_results) - abstained,
+        'abstained': abstained,
+        'abstention_rate': abstained / len(all_results) if all_results else 0,
+        'avg_em': np.mean(em_scores) if em_scores else 0,
+        'avg_f1': np.mean(f1_scores) if f1_scores else 0,
+        'avg_tokens': np.mean(tokens_used) if tokens_used else 0,
+    }
+
+    # Save aggregated results
+    aggregated_path = output_dir / "aggregated_results.json"
+    with open(aggregated_path, 'w') as f:
+        json.dump({
+            'summary': summary,
+            'results': all_results
+        }, f, indent=2)
+
+    print(f"\nResults:")
+    print(f"  Total examples: {summary['total']}")
+    print(f"  EM: {summary['avg_em']:.4f}")
+    print(f"  F1: {summary['avg_f1']:.4f}")
+    print(f"  Abstention rate: {summary['abstention_rate']:.4f}")
+    print(f"\nSaved to: {aggregated_path}")
+
+
+def _resolve_gpu_ids(start_gpu: int, num_gpus: int) -> List[str]:
+    """Resolve physical GPU IDs to use."""
+    if num_gpus <= 0:
+        return []
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible:
+        vis_list = [x.strip() for x in visible.split(",") if x.strip()]
+        return vis_list[start_gpu:start_gpu + num_gpus]
+
+    return [str(i) for i in range(start_gpu, start_gpu + num_gpus)]
+
+
 def main():
-    parser = argparse.ArgumentParser(description="TRIDENT Experiment Runner")
-    
+    parser = argparse.ArgumentParser(
+        description="TRIDENT Experiment Runner",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Single worker mode
+  python eval_complete_runnable.py --worker --data_path shard.json --output_dir results/
+
+  # Multi-GPU parallel mode (automatically shards data)
+  python eval_complete_runnable.py --data_path musique_ans_v1.0_dev.jsonl --output_dir results/ --num_gpus 4
+
+  # With limit and custom shard size
+  python eval_complete_runnable.py --data_path data.jsonl --output_dir results/ --num_gpus 4 --limit 1000 --shard_size 50
+        """
+    )
+
     # Required arguments
-    parser.add_argument("--worker", action="store_true", help="Run as worker")
-    parser.add_argument("--data_path", type=str, required=True, help="Path to data shard")
+    parser.add_argument("--worker", action="store_true", help="Run as single worker (internal use)")
+    parser.add_argument("--data_path", type=str, required=True, help="Path to data file (JSON or JSONL)")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
+
+    # Multi-GPU options
+    parser.add_argument("--num_gpus", type=int, default=1, help="Number of GPUs for parallel processing")
+    parser.add_argument("--shard_size", type=int, default=100, help="Examples per shard for multi-GPU mode")
+    parser.add_argument("--limit", type=int, default=None, help="Limit number of examples to process")
     
     # Model configuration
     parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-hf", help="LLM model name")
@@ -612,14 +962,20 @@ def main():
         torch.manual_seed(args.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
-    
-    # Run experiment
-    runner = ExperimentRunner(args)
-    
+
+    # Determine run mode
     if args.worker:
+        # Single worker mode (used internally by multi-GPU orchestration)
+        runner = ExperimentRunner(args)
         runner.run_worker()
+    elif args.num_gpus > 1:
+        # Multi-GPU parallel mode
+        run_multi_gpu(args)
     else:
-        print("Please use --worker flag to run evaluation")
+        # Single GPU mode - just run as worker directly
+        print(f"Running on single GPU (device={args.device})")
+        runner = ExperimentRunner(args)
+        runner.run_worker()
 
 
 if __name__ == "__main__":
