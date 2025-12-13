@@ -632,8 +632,10 @@ Examples:
         split_to_file = {
             'ans_dev': 'musique_ans_v1.0_dev.jsonl',
             'ans_test': 'musique_ans_v1.0_test.jsonl',
+            'ans_train': 'musique_ans_v1.0_train.jsonl',
             'full_dev': 'musique_full_v1.0_dev.jsonl',
-            'full_test': 'musique_full_v1.0_test.jsonl'
+            'full_test': 'musique_full_v1.0_test.jsonl',
+            'full_train': 'musique_full_v1.0_train.jsonl'
         }
 
         if args.split in split_to_file:
