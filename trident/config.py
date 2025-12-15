@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 
 
@@ -35,36 +35,68 @@ class RetrievalConfig:
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 
-@dataclass 
+@dataclass
 class FacetConfig:
-    """Per-facet statistical controls."""
-    alpha: float = 0.01
-    max_tests: int = 10
-    prefilter_tests: int = 3
-    fallback_scale: float = 0.5
-    weight: float = 1.0
+    """
+    Per-facet statistical controls.
+
+    Per TRIDENT Framework Section 4.2:
+    - alpha: Per-facet error budget (α_f)
+    - max_tests: T_f, max passages tested per facet for Bonferroni
+    - alpha_bar is computed as: α_f / T_f
+    """
+    alpha: float = 0.01  # α_f: Per-facet Type I error level
+    max_tests: int = 10  # T_f: Max passages tested per facet (Bonferroni budget)
+    prefilter_tests: int = 3  # Tests for spurious facet filtering
+    fallback_scale: float = 0.5  # ρ: Conservative threshold multiplier on drift (0.5-0.9)
+    weight: float = 1.0  # w_f: Facet weight for utility computation
 
 
 @dataclass
 class SafeCoverConfig:
-    """Settings for RC-MCFC Safe-Cover algorithm."""
-    per_facet_alpha: float = 0.1  # Default alpha for all facets
-    coverage_threshold: float = 0.15
+    """
+    Settings for RC-MCFC Safe-Cover algorithm.
+
+    Per TRIDENT Framework Section 4:
+    - Query-level FWER ≤ α_query for facet-coverage claims
+    - Context budget respected; sound abstention when infeasible
+    - Full audit trail (versions, thresholds, p-values, bins)
+    """
+    # FWER Control (Section 4.2)
+    per_facet_alpha: float = 0.1  # α_query: Query-level FWER target
     per_facet_configs: Dict[str, FacetConfig] = field(default_factory=dict)
-    token_cap: Optional[int] = 2000
-    dual_tolerance: float = 1e-6
-    early_abstain: bool = False
-    use_certificates: bool = False
-    monitor_drift: bool = False
-    psi_threshold: float = 0.5
-    coverage_threshold: float = 0.15
-    # CRITICAL FIX: Add fallback_to_pareto field
-    fallback_to_pareto: bool = True # Default to True for backward compatibility/good behavior
-    # Budget control fields for config families
-    max_evidence_tokens: Optional[int] = None  # Maximum evidence tokens to use
+
+    # Budget Control (Section 4.3)
+    token_cap: Optional[int] = 2000  # B_ctx: Hard context budget cap
+    max_evidence_tokens: Optional[int] = None  # Alternative: Maximum evidence tokens
     max_units: Optional[int] = None  # Maximum number of passages/units to select
+
+    # Algorithm Parameters
+    dual_tolerance: float = 1e-6  # Tolerance for dual LP convergence
+    coverage_threshold: float = 0.15  # Minimum coverage threshold
+
+    # Abstention Control (Section 4.6)
+    early_abstain: bool = False  # Abstain early if LB_dual > B_ctx
+    abstain_on_infeasible: bool = False  # Abstain if constraints cannot be satisfied
     stop_on_budget: bool = True  # Stop selection when budget is exhausted
-    abstain_on_infeasible: bool = False  # Abstain if constraints cannot be satisfied under budget
+
+    # Certificate Generation (Section 4.7)
+    use_certificates: bool = True  # Emit certificates for covered facets
+
+    # Shift Monitoring (Section 5)
+    monitor_drift: bool = False  # Enable PSI/KL monitoring
+    psi_threshold: float = 0.25  # PSI alarm threshold (was 0.5, now per spec)
+    kl_threshold: float = 0.5  # KL divergence alarm threshold
+    violation_multiplier: float = 2.0  # Violation rate > 2·α_query triggers alarm
+    threshold_shrink_factor: float = 0.7  # ρ ∈ (0.5, 0.9) for threshold shrinking
+    recalibration_buffer_size: int = 1000  # N_recal for scheduling recalibration
+
+    # Fallback Behavior
+    fallback_to_pareto: bool = True  # Fall back to Pareto mode on abstention
+
+    # P-Value Configuration
+    pvalue_mode: str = "deterministic"  # "deterministic" or "randomized"
+    label_noise_epsilon: float = 0.0  # ε for label-noise robust p-values
 
 
 @dataclass
@@ -85,13 +117,42 @@ class ParetoConfig:
 
 @dataclass
 class CalibrationConfig:
-    """Settings for score calibration."""
-    method: str = "isotonic"  # isotonic, platt, beta
+    """
+    Settings for score calibration.
+
+    Per TRIDENT Framework Section 3.3:
+    - Selection-conditional Mondrian calibration
+    - Bins: b(p,f) = (facet_type(f), length_bucket(p), retriever_score_bucket(p))
+    - Typical grid: 6 × 3 × 3 = 54 bins
+    """
+    method: str = "conformal"  # "conformal", "isotonic", "platt", "beta"
     version: str = "v1.0"
+
+    # Mondrian Bin Configuration (Section 3.3)
+    use_mondrian: bool = True
+    n_min: int = 50  # Minimum per-bin negatives before merging
+
+    # Bin Specification (6 × 3 × 3 = 54 bins)
+    facet_types: List[str] = field(default_factory=lambda: [
+        "ENTITY", "RELATION", "TEMPORAL", "NUMERIC", "BRIDGE_HOP1", "BRIDGE_HOP2"
+    ])
+    length_buckets: List[Tuple[int, int]] = field(default_factory=lambda: [
+        (0, 50), (50, 150), (150, 10000)  # short, medium, long
+    ])
+    retriever_score_buckets: List[Tuple[float, float]] = field(default_factory=lambda: [
+        (0.0, 0.33), (0.33, 0.67), (0.67, 1.0)  # low, medium, high
+    ])
+
+    # Legacy fields
     facet_bins: Dict[str, List[float]] = field(default_factory=dict)
     reliability_table_size: int = 20
-    use_mondrian: bool = True
     recalibration_buffer_size: int = 1000
+
+    # P-Value Mode (Section 3.4)
+    pvalue_mode: str = "deterministic"  # "deterministic" or "randomized"
+
+    # Label Noise Robustness (Section 3.5)
+    label_noise_epsilon: float = 0.0  # ε for denominator-inflated p-values
 
 
 @dataclass
