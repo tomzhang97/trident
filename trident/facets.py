@@ -12,15 +12,35 @@ from transformers import pipeline
 
 
 class FacetType(Enum):
-    """Types of reasoning facets."""
+    """Types of reasoning facets.
+
+    Per TRIDENT framework Section 2.1:
+    - ENTITY: Entity mention with type
+    - RELATION: Relation assertion between entities
+    - TEMPORAL: Temporal expression with time normalization
+    - NUMERIC: Numeric value with normalization
+    - BRIDGE_HOP1: First hop of multi-hop bridge (e1, r1, e_bridge)
+    - BRIDGE_HOP2: Second hop of multi-hop bridge (e_bridge, r2, e2)
+    - COMPARISON: Comparative statement (retained for compatibility)
+    - CAUSAL: Causal relationship (retained for compatibility)
+    - PROCEDURAL: Procedural steps (retained for compatibility)
+    """
     ENTITY = "ENTITY"
     RELATION = "RELATION"
     TEMPORAL = "TEMPORAL"
     NUMERIC = "NUMERIC"
-    BRIDGE = "BRIDGE"
+    BRIDGE_HOP1 = "BRIDGE_HOP1"  # First atomic hop: (e1, r1, e_bridge)
+    BRIDGE_HOP2 = "BRIDGE_HOP2"  # Second atomic hop: (e_bridge, r2, e2)
+    # Legacy types retained for backward compatibility
+    BRIDGE = "BRIDGE"  # Deprecated: use BRIDGE_HOP1 and BRIDGE_HOP2
     COMPARISON = "COMPARISON"
     CAUSAL = "CAUSAL"
     PROCEDURAL = "PROCEDURAL"
+
+    @classmethod
+    def core_types(cls) -> list:
+        """Return the six core facet types from the framework specification."""
+        return [cls.ENTITY, cls.RELATION, cls.TEMPORAL, cls.NUMERIC, cls.BRIDGE_HOP1, cls.BRIDGE_HOP2]
 
 
 @dataclass(frozen=True)
@@ -67,7 +87,22 @@ class Facet:
             attribute = self.template.get('attribute', '')
             return f"{entity} has {attribute} of {value}"
         
+        elif self.facet_type == FacetType.BRIDGE_HOP1:
+            # First hop: (e1, r1, e_bridge)
+            entity1 = self.template.get('entity1', '')
+            relation = self.template.get('relation', '')
+            bridge_entity = self.template.get('bridge_entity', '')
+            return f"{entity1} {relation} {bridge_entity}"
+
+        elif self.facet_type == FacetType.BRIDGE_HOP2:
+            # Second hop: (e_bridge, r2, e2)
+            bridge_entity = self.template.get('bridge_entity', '')
+            relation = self.template.get('relation', '')
+            entity2 = self.template.get('entity2', '')
+            return f"{bridge_entity} {relation} {entity2}"
+
         elif self.facet_type == FacetType.BRIDGE:
+            # Legacy bridge type (deprecated)
             entity1 = self.template.get('entity1', '')
             entity2 = self.template.get('entity2', '')
             relation = self.template.get('relation', '')
@@ -328,31 +363,95 @@ class FacetMiner:
         query: str,
         supporting_facts: Optional[List[Tuple[str, int]]] = None
     ) -> List[Facet]:
-        """Extract bridge facets for multi-hop reasoning."""
+        """
+        Extract bridge facets for multi-hop reasoning.
+
+        Per TRIDENT Framework Section 2.1 (Bridge decomposition):
+        Multi-hop requirements are decomposed into two atomic hops:
+        - BRIDGE_HOP1(e1, r1, e_bridge): First hop from entity1 to bridge entity
+        - BRIDGE_HOP2(e_bridge, r2, e2): Second hop from bridge entity to entity2
+
+        Each hop is a mandatory facet in Safe-Cover, restoring classical
+        set-cover semantics (one passage may cover one or more atomic facets).
+        """
         facets = []
-        
+
         # Look for patterns that indicate multi-hop reasoning
         if supporting_facts:
             # Use supporting facts to identify bridge entities
             entities = set()
             for title, _ in supporting_facts:
                 entities.add(title)
-            
+
             if len(entities) >= 2:
                 entities_list = list(entities)
+                hop_counter = 0
+
+                # For each adjacent pair, create BRIDGE_HOP1 and BRIDGE_HOP2
                 for i in range(len(entities_list) - 1):
-                    facet = Facet(
-                        facet_id=f"bridge_{len(facets)}",
-                        facet_type=FacetType.BRIDGE,
+                    e1 = entities_list[i]
+                    e_bridge = entities_list[i + 1] if i + 1 < len(entities_list) else entities_list[i]
+                    e2 = entities_list[i + 2] if i + 2 < len(entities_list) else e_bridge
+
+                    # Infer relations from query if possible
+                    r1 = self._infer_relation(query, e1, e_bridge)
+                    r2 = self._infer_relation(query, e_bridge, e2)
+
+                    # BRIDGE_HOP1: (e1, r1, e_bridge)
+                    facet_hop1 = Facet(
+                        facet_id=f"bridge_hop1_{hop_counter}",
+                        facet_type=FacetType.BRIDGE_HOP1,
                         template={
-                            'entity1': entities_list[i],
-                            'entity2': entities_list[i + 1],
-                            'relation': 'connected'
-                        }
+                            'entity1': e1,
+                            'relation': r1,
+                            'bridge_entity': e_bridge,
+                        },
+                        metadata={'hop_index': 1, 'bridge_chain': hop_counter}
                     )
-                    facets.append(facet)
-        
+                    facets.append(facet_hop1)
+
+                    # BRIDGE_HOP2: (e_bridge, r2, e2) - only if we have a third entity
+                    if i + 2 < len(entities_list) or e_bridge != e2:
+                        facet_hop2 = Facet(
+                            facet_id=f"bridge_hop2_{hop_counter}",
+                            facet_type=FacetType.BRIDGE_HOP2,
+                            template={
+                                'bridge_entity': e_bridge,
+                                'relation': r2,
+                                'entity2': e2,
+                            },
+                            metadata={'hop_index': 2, 'bridge_chain': hop_counter}
+                        )
+                        facets.append(facet_hop2)
+
+                    hop_counter += 1
+
         return facets
+
+    def _infer_relation(self, query: str, entity1: str, entity2: str) -> str:
+        """Infer relation between entities from query context."""
+        # Common relation patterns to look for
+        relation_indicators = [
+            ('wrote', 'authored'),
+            ('created', 'created'),
+            ('directed', 'directed'),
+            ('born in', 'birthplace'),
+            ('died in', 'death_place'),
+            ('located in', 'location'),
+            ('capital of', 'capital'),
+            ('member of', 'membership'),
+            ('part of', 'part_of'),
+            ('played for', 'team'),
+            ('starred in', 'appeared_in'),
+        ]
+
+        query_lower = query.lower()
+        for pattern, relation in relation_indicators:
+            if pattern in query_lower:
+                return relation
+
+        # Default relation if none found
+        return "related_to"
     
     def _is_multi_hop(self, query: str) -> bool:
         """Check if query requires multi-hop reasoning."""
