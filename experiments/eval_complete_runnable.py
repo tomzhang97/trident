@@ -241,16 +241,28 @@ class ExperimentRunner:
         self.device = f"cuda:{args.device}" if args.device >= 0 else "cpu"
 
         # Load configuration
+        self.logger.info("Step 1/5: Loading configuration...")
         self.config = self._load_config()
 
         # Initialize components
+        self.logger.info("Step 2/5: Loading LLM model (this may take a few minutes)...")
         self.llm = self._init_llm()
+        self.logger.info("Step 2/5: LLM loaded successfully")
+
         self.instrumented_llm = InstrumentedLLM(self.llm)
+
+        self.logger.info("Step 3/5: Initializing retriever and building index...")
         self.retriever = self._init_retriever()
+        self.logger.info("Step 3/5: Retriever ready")
 
         # Initialize the appropriate system based on mode
+        self.logger.info("Step 4/5: Initializing system...")
         self.system = self._init_system()
+        self.logger.info("Step 4/5: System initialized")
+
+        self.logger.info("Step 5/5: Setting up evaluator...")
         self.evaluator = BenchmarkEvaluator(self.config.evaluation)
+        self.logger.info("Initialization complete!")
         
     def _load_config(self) -> TridentConfig:
         """Load or create configuration."""
@@ -420,13 +432,46 @@ class ExperimentRunner:
     def _init_retriever(self) -> Any:
         """Initialize the retrieval system."""
 
-        # If we have a data file with contexts, build corpus from it
+        # If we have a data file with contexts, check if we need retrieval
         if hasattr(self.args, 'data_path') and self.args.data_path:
+            # Check if data has context
+            data = load_data(self.args.data_path, limit=1)  # Just peek at first example
+            has_context = data and 'context' in data[0] and data[0]['context']
+
+            # Check if user explicitly wants to build retriever index
+            force_build_index = getattr(self.args, 'build_retriever_index', False)
+
+            if has_context and not force_build_index:
+                # Data has context and user didn't request index building
+                # The pipeline will use context directly when processing queries
+                self.logger.info("Data has context - skipping index building (context will be used directly)")
+                self.logger.info("  Use --build_retriever_index to force building a retriever index")
+
+                # Create a minimal retriever (won't actually be used for retrieval)
+                if self.config.retrieval.method == "sparse":
+                    return BM25Retriever()
+                else:
+                    # Create retriever without building index
+                    retriever = DenseRetriever(
+                        encoder_model=self.config.retrieval.encoder_model,
+                        device=self.device,
+                        top_k=self.config.retrieval.top_k
+                    )
+                    retriever.corpus = []  # Empty corpus - won't be used
+                    return retriever
+
+            # Build retriever index from data
+            if force_build_index:
+                self.logger.info("Building retriever index (--build_retriever_index specified)...")
+            else:
+                self.logger.info("Data has no context - building retriever index from corpus...")
+
             corpus_texts = []
             corpus_ids = []
 
-            # Use the new load_data function that handles JSON and JSONL
-            data = load_data(self.args.data_path)
+            # Reload full data for corpus building (with limit if specified)
+            data = load_data(self.args.data_path, limit=self.args.limit)
+            self.logger.info(f"Loading corpus from {len(data)} examples...")
 
             for idx, example in enumerate(data):
                 if 'context' in example:
@@ -434,6 +479,8 @@ class ExperimentRunner:
                         text = " ".join(sentences) if isinstance(sentences, list) else sentences
                         corpus_texts.append(text)
                         corpus_ids.append(f"doc_{idx}_{ctx_idx}_{title}")
+
+            self.logger.info(f"Corpus size: {len(corpus_texts)} documents")
 
             # Create retriever with this corpus
             if self.config.retrieval.method == "hybrid":
@@ -456,9 +503,17 @@ class ExperimentRunner:
 
             # Build appropriate index
             if hasattr(retriever, "build_index"):
+                self.logger.info("Building embeddings index (this may take a while)...")
                 retriever.build_index()
 
             return retriever
+
+        # Fallback: create empty retriever
+        return DenseRetriever(
+            encoder_model=self.config.retrieval.encoder_model,
+            device=self.device,
+            top_k=self.config.retrieval.top_k
+        )
     
     def _init_system(self) -> Any:
         """Initialize the appropriate system based on mode."""
@@ -512,7 +567,7 @@ class ExperimentRunner:
     def run_worker(self) -> None:
         """Run evaluation on a shard of data."""
         # Load data shard (handles both JSON and JSONL)
-        data = load_data(self.args.data_path)
+        data = load_data(self.args.data_path, limit=self.args.limit)
         
         results = []
         total_time = 0
@@ -911,6 +966,8 @@ Examples:
     parser.add_argument("--corpus_path", type=str, help="Path to corpus for retrieval")
     parser.add_argument("--encoder_model", type=str, default="facebook/contriever")
     parser.add_argument("--top_k", type=int, default=100, help="Top-k passages to retrieve")
+    parser.add_argument("--build_retriever_index", action="store_true",
+                       help="Force building retriever index even when data has context")
     
     # Dataset configuration
     parser.add_argument("--dataset", type=str, default="hotpotqa", help="Dataset name")

@@ -145,3 +145,161 @@ class TelemetryTracker:
         self.counters.clear()
         self.current_query = None
         self.query_start_time = None
+
+
+@dataclass
+class SafeCoverDebugger:
+    """
+    Debug helper for Safe-Cover pipeline.
+
+    Use this to diagnose common issues:
+    - Zero evidence selection
+    - Always abstaining
+    - P-value/calibration issues
+    """
+
+    enabled: bool = True
+    log_level: str = "INFO"
+    _logger: Optional[logging.Logger] = None
+
+    def __post_init__(self):
+        if self.enabled:
+            self._logger = logging.getLogger("safe_cover_debug")
+            self._logger.setLevel(getattr(logging, self.log_level))
+            if not self._logger.handlers:
+                handler = logging.StreamHandler()
+                handler.setFormatter(logging.Formatter(
+                    '%(asctime)s [DEBUG] %(message)s'
+                ))
+                self._logger.addHandler(handler)
+
+    def log(self, msg: str, data: Optional[Dict[str, Any]] = None) -> None:
+        """Log a debug message."""
+        if self.enabled and self._logger:
+            if data:
+                self._logger.info(f"{msg}: {json.dumps(data, default=str)}")
+            else:
+                self._logger.info(msg)
+
+    def log_retrieval(self, num_passages: int, retriever_type: str) -> None:
+        """Log retrieval stage results."""
+        self.log("RETRIEVAL", {
+            "num_passages": num_passages,
+            "retriever_type": retriever_type,
+            "status": "OK" if num_passages > 0 else "EMPTY"
+        })
+        if num_passages == 0:
+            self.log("WARNING: Zero passages retrieved. Check corpus_path/index_path config.")
+
+    def log_facets(self, facets: List[Any]) -> None:
+        """Log facet mining results."""
+        self.log("FACET_MINING", {
+            "num_facets": len(facets),
+            "facet_types": [getattr(f, 'facet_type', 'unknown') for f in facets] if facets else [],
+            "status": "OK" if len(facets) > 0 else "EMPTY"
+        })
+        if not facets:
+            self.log("WARNING: Zero facets mined. Will abstain with reason=no_facets.")
+
+    def log_scoring(self, num_scores: int, p_values: Dict[Any, float]) -> None:
+        """Log scoring stage results."""
+        if p_values:
+            min_pv = min(p_values.values())
+            max_pv = max(p_values.values())
+            avg_pv = sum(p_values.values()) / len(p_values)
+        else:
+            min_pv = max_pv = avg_pv = 0.0
+
+        self.log("SCORING", {
+            "num_scores": num_scores,
+            "min_pvalue": min_pv,
+            "max_pvalue": max_pv,
+            "avg_pvalue": avg_pv,
+        })
+
+    def log_selection(
+        self,
+        selected: List[Any],
+        covered: List[str],
+        uncovered: List[str],
+        alpha: float
+    ) -> None:
+        """Log selection stage results."""
+        self.log("SELECTION", {
+            "num_selected": len(selected),
+            "num_covered": len(covered),
+            "num_uncovered": len(uncovered),
+            "alpha": alpha,
+            "status": "OK" if len(selected) > 0 else "EMPTY"
+        })
+        if not selected:
+            self.log("WARNING: Zero passages selected. Check p-value thresholds vs alpha.")
+
+    def log_abstention(self, reason: str, details: Optional[Dict[str, Any]] = None) -> None:
+        """Log abstention event."""
+        self.log("ABSTENTION", {
+            "reason": reason,
+            "details": details or {}
+        })
+
+    def diagnose_empty_selection(
+        self,
+        num_passages: int,
+        num_facets: int,
+        p_values: Dict[Any, float],
+        alpha: float
+    ) -> str:
+        """Diagnose why selection is empty and return recommendations."""
+        issues = []
+
+        if num_passages == 0:
+            issues.append("ISSUE: Zero passages retrieved.")
+            issues.append("  FIX: Check retrieval.corpus_path and retrieval.index_path in config.")
+
+        if num_facets == 0:
+            issues.append("ISSUE: Zero facets mined.")
+            issues.append("  FIX: Check query format or facet miner configuration.")
+
+        if p_values:
+            min_pv = min(p_values.values())
+            if min_pv > alpha:
+                issues.append(f"ISSUE: Minimum p-value ({min_pv:.4f}) > alpha ({alpha:.4f}).")
+                issues.append("  FIX: Increase safe_cover.per_facet_alpha or use pvalue_mode='randomized'.")
+                issues.append("  FIX: Decrease nli.score_threshold if verifier is too strict.")
+
+            below_alpha = sum(1 for pv in p_values.values() if pv <= alpha)
+            if below_alpha == 0:
+                issues.append(f"ISSUE: No p-values below threshold.")
+                issues.append(f"  INFO: {len(p_values)} scores, alpha={alpha}")
+
+        return "\n".join(issues) if issues else "No obvious issues detected."
+
+
+def create_debug_config() -> Dict[str, Any]:
+    """
+    Create a debug-friendly config for troubleshooting Safe-Cover.
+
+    Use this config to validate the pipeline before tightening thresholds.
+    """
+    return {
+        "mode": "safe_cover",
+        "safe_cover": {
+            "per_facet_alpha": 0.1,  # Relaxed threshold
+            "early_abstain": False,  # Don't abstain early
+            "abstain_on_infeasible": False,  # Allow partial coverage
+            "pvalue_mode": "randomized",  # Avoid deterministic discretization
+            "fallback_to_pareto": True,  # Fallback if Safe-Cover fails
+        },
+        "calibration": {
+            "use_mondrian": False,  # Simpler calibration
+            "pvalue_mode": "randomized",
+            "n_min": 30,  # Lower bin requirement
+        },
+        "nli": {
+            "score_threshold": 0.8,  # Less strict scoring
+        },
+        "telemetry": {
+            "enable": True,
+            "log_level": "DEBUG",
+        }
+    }
