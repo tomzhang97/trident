@@ -241,16 +241,28 @@ class ExperimentRunner:
         self.device = f"cuda:{args.device}" if args.device >= 0 else "cpu"
 
         # Load configuration
+        self.logger.info("Step 1/5: Loading configuration...")
         self.config = self._load_config()
 
         # Initialize components
+        self.logger.info("Step 2/5: Loading LLM model (this may take a few minutes)...")
         self.llm = self._init_llm()
+        self.logger.info("Step 2/5: LLM loaded successfully")
+
         self.instrumented_llm = InstrumentedLLM(self.llm)
+
+        self.logger.info("Step 3/5: Initializing retriever and building index...")
         self.retriever = self._init_retriever()
+        self.logger.info("Step 3/5: Retriever ready")
 
         # Initialize the appropriate system based on mode
+        self.logger.info("Step 4/5: Initializing system...")
         self.system = self._init_system()
+        self.logger.info("Step 4/5: System initialized")
+
+        self.logger.info("Step 5/5: Setting up evaluator...")
         self.evaluator = BenchmarkEvaluator(self.config.evaluation)
+        self.logger.info("Initialization complete!")
         
     def _load_config(self) -> TridentConfig:
         """Load or create configuration."""

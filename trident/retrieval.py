@@ -110,13 +110,19 @@ class DenseRetriever:
         """Build embedding index for corpus."""
         if not self.corpus:
             raise ValueError("No corpus loaded")
-        
+
+        print(f"Building index for {len(self.corpus)} documents...")
         embeddings = []
         batch_size = 32
-        
-        for i in range(0, len(self.corpus), batch_size):
+
+        total_batches = (len(self.corpus) + batch_size - 1) // batch_size
+        for batch_idx, i in enumerate(range(0, len(self.corpus), batch_size)):
             batch = self.corpus[i:i + batch_size]
-            
+
+            # Progress logging
+            if batch_idx % 10 == 0 or batch_idx == total_batches - 1:
+                print(f"  Encoding batch {batch_idx + 1}/{total_batches} ({i}/{len(self.corpus)} docs)")
+
             if self.use_contriever:
                 batch_embeddings = self._encode_contriever(batch)
             else:
@@ -126,11 +132,12 @@ class DenseRetriever:
                     show_progress_bar=False
                 )
                 batch_embeddings = batch_embeddings.cpu().numpy()
-            
+
             embeddings.append(batch_embeddings)
-        
+
         self.corpus_embeddings = np.vstack(embeddings)
-        
+        print(f"Index built: {self.corpus_embeddings.shape}")
+
         if save_path:
             self.save_index(save_path)
     
