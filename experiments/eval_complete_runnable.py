@@ -432,12 +432,37 @@ class ExperimentRunner:
     def _init_retriever(self) -> Any:
         """Initialize the retrieval system."""
 
-        # If we have a data file with contexts, build corpus from it
+        # If we have a data file with contexts, check if we need retrieval
         if hasattr(self.args, 'data_path') and self.args.data_path:
+            # Check if data has context - if so, we don't need to build index
+            # The pipeline will use provided context directly
+            data = load_data(self.args.data_path, limit=1)  # Just peek at first example
+            has_context = data and 'context' in data[0] and data[0]['context']
+
+            if has_context:
+                # Data has context, so we don't need to build a full retriever index
+                # The pipeline will use context directly when processing queries
+                self.logger.info("Data has context - skipping index building (context will be used directly)")
+
+                # Create a minimal retriever (won't actually be used for retrieval)
+                if self.config.retrieval.method == "sparse":
+                    return BM25Retriever()
+                else:
+                    # Create retriever without building index
+                    retriever = DenseRetriever(
+                        encoder_model=self.config.retrieval.encoder_model,
+                        device=self.device,
+                        top_k=self.config.retrieval.top_k
+                    )
+                    retriever.corpus = []  # Empty corpus - won't be used
+                    return retriever
+
+            # No context in data - need to build retriever index
+            self.logger.info("Data has no context - building retriever index from corpus...")
             corpus_texts = []
             corpus_ids = []
 
-            # Use the new load_data function that handles JSON and JSONL
+            # Reload full data for corpus building
             data = load_data(self.args.data_path)
 
             for idx, example in enumerate(data):
@@ -471,6 +496,13 @@ class ExperimentRunner:
                 retriever.build_index()
 
             return retriever
+
+        # Fallback: create empty retriever
+        return DenseRetriever(
+            encoder_model=self.config.retrieval.encoder_model,
+            device=self.device,
+            top_k=self.config.retrieval.top_k
+        )
     
     def _init_system(self) -> Any:
         """Initialize the appropriate system based on mode."""
