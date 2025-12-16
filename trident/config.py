@@ -63,6 +63,8 @@ class SafeCoverConfig:
     - Full audit trail (versions, thresholds, p-values, bins)
     """
     # FWER Control (Section 4.2)
+    # CRITICAL: per_facet_alpha should be reasonably high to avoid always-abstain
+    # With deterministic p-values, min achievable is 1/(n_b+1) ~ 0.02 for 50 negatives
     per_facet_alpha: float = 0.1  # α_query: Query-level FWER target
     per_facet_configs: Dict[str, FacetConfig] = field(default_factory=dict)
 
@@ -76,6 +78,7 @@ class SafeCoverConfig:
     coverage_threshold: float = 0.15  # Minimum coverage threshold
 
     # Abstention Control (Section 4.6)
+    # CRITICAL: Set to False by default to allow partial coverage
     early_abstain: bool = False  # Abstain early if LB_dual > B_ctx
     abstain_on_infeasible: bool = False  # Abstain if constraints cannot be satisfied
     stop_on_budget: bool = True  # Stop selection when budget is exhausted
@@ -95,7 +98,8 @@ class SafeCoverConfig:
     fallback_to_pareto: bool = True  # Fall back to Pareto mode on abstention
 
     # P-Value Configuration
-    pvalue_mode: str = "deterministic"  # "deterministic" or "randomized"
+    # CRITICAL: Use "randomized" to avoid deterministic p-value discretization trap
+    pvalue_mode: str = "randomized"  # "deterministic" or "randomized"
     label_noise_epsilon: float = 0.0  # ε for label-noise robust p-values
 
 

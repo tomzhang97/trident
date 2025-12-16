@@ -28,6 +28,8 @@ from .config import SafeCoverConfig
 class AbstentionReason(Enum):
     """Reasons for abstention per Section 4.6."""
     NONE = "none"
+    NO_FACETS = "no_facets"  # Facet miner returned zero facets
+    NO_PASSAGES = "no_passages"  # Retrieval returned zero passages
     NO_COVERING_PASSAGES = "no_covering_passages"  # ∃f ∈ F_uncov with no p : f ∈ C(p)
     INFEASIBILITY_PROVEN = "infeasibility_proven"  # LB_dual > B_ctx - cost_ctx
     BUDGET_EXHAUSTED = "budget_exhausted"  # No candidates fit within remaining budget
@@ -236,6 +238,38 @@ class SafeCoverAlgorithm:
         4. Compute dual lower bound for early abstention
         5. Generate certificates for covered facets
         """
+        # CRITICAL FIX: Handle zero facets case
+        if not facets:
+            return SafeCoverResult(
+                selected_passages=[],
+                certificates=[],
+                covered_facets=[],
+                uncovered_facets=[],
+                dual_lower_bound=0.0,
+                abstained=True,
+                abstention_reason=AbstentionReason.NO_FACETS,
+                coverage_map={},
+                total_cost=0,
+                infeasible=True,
+                episode_knobs=None,
+            )
+
+        # CRITICAL FIX: Handle zero passages case
+        if not passages:
+            return SafeCoverResult(
+                selected_passages=[],
+                certificates=[],
+                covered_facets=[],
+                uncovered_facets=[f.facet_id for f in facets],
+                dual_lower_bound=float('inf'),
+                abstained=True,
+                abstention_reason=AbstentionReason.NO_PASSAGES,
+                coverage_map={},
+                total_cost=0,
+                infeasible=True,
+                episode_knobs=None,
+            )
+
         # Step 1: Freeze episode knobs (Section 4.1)
         knobs = self._freeze_episode_knobs(facets)
 
