@@ -265,10 +265,51 @@ class FullSelfRAGAdapter(BaselineSystem):
                         raw_generation = results[key].get("pred", "")
                         break
 
-            # Count tokens
-            prompt_tokens = self._count_tokens(prompt)
-            completion_tokens = self._count_tokens(answer) if answer else 0
-            query_token_tracker.add_call(prompt_tokens, completion_tokens, purpose="generation")
+            # Count tokens from ALL generations that Self-RAG performed
+            # Self-RAG makes multiple LLM calls internally (no_retrieval + multiple retrieval_N)
+            total_prompt_tokens = 0
+            total_completion_tokens = 0
+            num_generations = 0
+
+            # Base prompt tokens (used for all generations)
+            base_prompt_tokens = self._count_tokens(prompt)
+
+            # Count no_retrieval generation if present
+            if "no_retrieval" in results:
+                no_ret_text = results["no_retrieval"]
+                if no_ret_text:
+                    total_prompt_tokens += base_prompt_tokens
+                    total_completion_tokens += self._count_tokens(no_ret_text)
+                    num_generations += 1
+
+            # Count all retrieval_N generations
+            for key in results:
+                if key.startswith("retrieval_"):
+                    ret_result = results[key]
+                    if isinstance(ret_result, dict):
+                        ret_text = ret_result.get("pred", "")
+                        # Each retrieval generation has prompt + evidence context
+                        # Estimate evidence tokens from the corresponding document
+                        doc_idx = int(key.split("_")[1]) if "_" in key else 0
+                        evidence_tokens = 0
+                        if evidences and doc_idx < len(evidences):
+                            evidence_tokens = self._count_tokens(evidences[doc_idx].get("text", ""))
+                        total_prompt_tokens += base_prompt_tokens + evidence_tokens
+                        if ret_text:
+                            total_completion_tokens += self._count_tokens(ret_text)
+                        num_generations += 1
+                    elif isinstance(ret_result, str) and ret_result:
+                        # Simple string result
+                        total_prompt_tokens += base_prompt_tokens
+                        total_completion_tokens += self._count_tokens(ret_result)
+                        num_generations += 1
+
+            # Fallback: if no generations tracked, at least count the final answer
+            if num_generations == 0:
+                total_prompt_tokens = base_prompt_tokens
+                total_completion_tokens = self._count_tokens(answer) if answer else 0
+
+            query_token_tracker.add_call(total_prompt_tokens, total_completion_tokens, purpose="generation")
 
             # Prepare selected passages
             selected_passages = []
@@ -294,8 +335,9 @@ class FullSelfRAGAdapter(BaselineSystem):
                     "do_retrieve": do_retrieve,
                     "all_results": results,
                     "num_context_docs": len(context) if context else 0,
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
+                    "prompt_tokens": total_prompt_tokens,
+                    "completion_tokens": total_completion_tokens,
+                    "num_generations": num_generations,
                     # Vanilla Self-RAG settings
                     "mode": self.mode,
                     "threshold": self.threshold,
