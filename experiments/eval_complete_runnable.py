@@ -567,7 +567,7 @@ class ExperimentRunner:
     def run_worker(self) -> None:
         """Run evaluation on a shard of data."""
         # Load data shard (handles both JSON and JSONL)
-        data = load_data(self.args.data_path)
+        data = load_data(self.args.data_path, limit=self.args.limit)
         
         results = []
         total_time = 0
