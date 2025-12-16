@@ -142,14 +142,18 @@ class FullSelfRAGAdapter(BaselineSystem):
         self.mode = mode
         self.ndocs = ndocs
 
-        # Set CUDA device if specified
-        if device is not None:
+        # Only set CUDA device if not already set externally and device is specified
+        # This avoids conflicts when user sets CUDA_VISIBLE_DEVICES before running
+        existing_cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if device is not None and existing_cuda_devices is None:
             if device.startswith("cuda:"):
                 device_id = device.split(":")[-1]
             else:
                 device_id = device
             print(f"Setting CUDA_VISIBLE_DEVICES={device_id} for Self-RAG")
             os.environ["CUDA_VISIBLE_DEVICES"] = device_id
+        elif existing_cuda_devices is not None:
+            print(f"Using externally set CUDA_VISIBLE_DEVICES={existing_cuda_devices}")
 
         # Load model using vLLM (same as vanilla Self-RAG)
         print(f"Loading Self-RAG model: {model_name}...")

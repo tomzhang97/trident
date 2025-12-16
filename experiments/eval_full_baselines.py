@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# IMPORTANT: These must be at the very top, before ANY other imports
+import os
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+import multiprocessing
+# Set multiprocessing start method to 'spawn' before any CUDA operations
+# This fixes the "Cannot re-initialize CUDA in forked subprocess" error
+try:
+    multiprocessing.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Already set
+
 """
 Evaluation script for full baseline systems (Self-RAG, KET-RAG, Vanilla RAG, HippoRAG).
 
@@ -40,14 +52,8 @@ Environment variables:
     HF_TOKEN: Required for Self-RAG model download
 """
 
-import multiprocessing
-# IMPORTANT: Set multiprocessing start method to 'spawn' before any CUDA operations
-# This fixes the "Cannot re-initialize CUDA in forked subprocess" error
-multiprocessing.set_start_method('spawn', force=True)
-
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Dict, Any, List
