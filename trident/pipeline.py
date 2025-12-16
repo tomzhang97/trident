@@ -443,24 +443,73 @@ class TridentPipeline:
         cache_key = query
         if cache_key in self.retrieval_cache:
             return self.retrieval_cache[cache_key]
-        
-        # If context is provided (e.g., HotpotQA), use it directly
-        if context:
+
+        # CRITICAL FIX: Robustly check if context is provided and non-empty
+        # Context should be a list of (title, sentences) tuples
+        has_valid_context = (
+            context is not None and
+            isinstance(context, list) and
+            len(context) > 0
+        )
+
+        if has_valid_context:
             passages = []
-            for idx, (title, sentences) in enumerate(context):
-                text = " ".join(sentences) if isinstance(sentences, list) else sentences
-                passage = Passage(
-                    pid=f"context_{idx}",
-                    text=text,
-                    cost=self._estimate_token_cost(text),
-                    metadata={'title': title, 'source': 'provided_context'}
-                )
-                passages.append(passage)
-            result = RetrievalResult(passages=passages, scores=[1.0] * len(passages))
+            skipped = 0
+
+            for idx, item in enumerate(context):
+                try:
+                    # Handle different context formats robustly
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        title, sentences = item[0], item[1]
+                    elif isinstance(item, dict):
+                        # Handle dict format: {'title': ..., 'sentences': ...}
+                        title = item.get('title', f'doc_{idx}')
+                        sentences = item.get('sentences', item.get('text', ''))
+                    else:
+                        # Skip malformed entries
+                        skipped += 1
+                        continue
+
+                    # Convert sentences to text
+                    if isinstance(sentences, list):
+                        text = " ".join(str(s) for s in sentences if s)
+                    else:
+                        text = str(sentences) if sentences else ""
+
+                    # Skip empty texts
+                    if not text.strip():
+                        skipped += 1
+                        continue
+
+                    passage = Passage(
+                        pid=f"context_{idx}",
+                        text=text,
+                        cost=self._estimate_token_cost(text),
+                        metadata={'title': str(title), 'source': 'provided_context'}
+                    )
+                    passages.append(passage)
+
+                except Exception as e:
+                    # Log but don't fail on malformed context entries
+                    skipped += 1
+                    continue
+
+            if skipped > 0:
+                self.telemetry.log("context_warning", {
+                    "skipped_entries": skipped,
+                    "valid_entries": len(passages)
+                })
+
+            # Only use context if we got valid passages, otherwise fall back to retriever
+            if passages:
+                result = RetrievalResult(passages=passages, scores=[1.0] * len(passages))
+            else:
+                # All context entries were invalid, fall back to retriever
+                result = self.retriever.retrieve(query, top_k=self.config.retrieval.top_k)
         else:
-            # Use retriever
+            # No context provided, use retriever
             result = self.retriever.retrieve(query, top_k=self.config.retrieval.top_k)
-        
+
         # Cache result
         self.retrieval_cache[cache_key] = result
         return result

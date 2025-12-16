@@ -183,9 +183,14 @@ class DenseRetriever:
     
     def retrieve(self, query: str, top_k: Optional[int] = None) -> RetrievalResult:
         """Retrieve passages for a query."""
+        # CRITICAL FIX: Handle empty corpus gracefully
+        if not self.corpus:
+            # No corpus loaded - return empty result
+            return RetrievalResult(passages=[], scores=[])
+
         if self.corpus_embeddings is None:
             self.build_index()
-        
+
         top_k = top_k or self.top_k
         
         # Encode query
