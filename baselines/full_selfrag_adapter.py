@@ -200,6 +200,16 @@ class FullSelfRAGAdapter(BaselineSystem):
         """Count tokens in text using the model's tokenizer."""
         return len(self.tokenizer.encode(text))
 
+    def _count_evidence_tokens(self, text: str) -> int:
+        """
+        Count evidence tokens using word-based heuristic (same as TRIDENT).
+
+        Uses the formula: int(words * 1.3) + 10
+        This matches TRIDENT's evidence token counting for fair comparison.
+        """
+        words = len(text.split())
+        return int(words * 1.3) + 10
+
     def answer(
         self,
         question: str,
@@ -271,14 +281,18 @@ class FullSelfRAGAdapter(BaselineSystem):
                         raw_generation = results[key].get("pred", "")
                         break
 
-            # Count tokens from ALL generations that Self-RAG performed
-            # Self-RAG makes multiple LLM calls internally (no_retrieval + multiple retrieval_N)
+            # Count tokens using the same approach as TRIDENT for fair comparison:
+            # 1. LLM tokens (prompt + completion) - counted with HF tokenizer
+            # 2. Evidence tokens - counted with word heuristic: int(words * 1.3) + 10
+            # Total = llm_tokens + evidence_tokens
+
+            # Base prompt tokens (using HF tokenizer)
+            base_prompt_tokens = self._count_tokens(prompt)
+
+            # Count LLM tokens from ALL generations that Self-RAG performed
             total_prompt_tokens = 0
             total_completion_tokens = 0
             num_generations = 0
-
-            # Base prompt tokens (used for all generations)
-            base_prompt_tokens = self._count_tokens(prompt)
 
             # Count no_retrieval generation if present
             if "no_retrieval" in results:
@@ -294,18 +308,11 @@ class FullSelfRAGAdapter(BaselineSystem):
                     ret_result = results[key]
                     if isinstance(ret_result, dict):
                         ret_text = ret_result.get("pred", "")
-                        # Each retrieval generation has prompt + evidence context
-                        # Estimate evidence tokens from the corresponding document
-                        doc_idx = int(key.split("_")[1]) if "_" in key else 0
-                        evidence_tokens = 0
-                        if evidences and doc_idx < len(evidences):
-                            evidence_tokens = self._count_tokens(evidences[doc_idx].get("text", ""))
-                        total_prompt_tokens += base_prompt_tokens + evidence_tokens
+                        total_prompt_tokens += base_prompt_tokens
                         if ret_text:
                             total_completion_tokens += self._count_tokens(ret_text)
                         num_generations += 1
                     elif isinstance(ret_result, str) and ret_result:
-                        # Simple string result
                         total_prompt_tokens += base_prompt_tokens
                         total_completion_tokens += self._count_tokens(ret_result)
                         num_generations += 1
@@ -314,6 +321,18 @@ class FullSelfRAGAdapter(BaselineSystem):
             if num_generations == 0:
                 total_prompt_tokens = base_prompt_tokens
                 total_completion_tokens = self._count_tokens(answer) if answer else 0
+
+            # Calculate evidence tokens using word-based heuristic (same as TRIDENT)
+            # Formula: int(words * 1.3) + 10 for each evidence passage
+            total_evidence_tokens = 0
+            if evidences:
+                for evidence in evidences:
+                    evidence_text = evidence.get("text", "")
+                    total_evidence_tokens += self._count_evidence_tokens(evidence_text)
+
+            # Total tokens = LLM tokens (prompt + completion) + evidence tokens
+            llm_tokens = total_prompt_tokens + total_completion_tokens
+            total_tokens = llm_tokens + total_evidence_tokens
 
             query_token_tracker.add_call(total_prompt_tokens, total_completion_tokens, purpose="generation")
 
@@ -326,7 +345,7 @@ class FullSelfRAGAdapter(BaselineSystem):
 
             return BaselineResponse(
                 answer=answer,
-                tokens_used=query_token_tracker.total_tokens,
+                tokens_used=total_tokens,  # Uses: llm_tokens + evidence_tokens (same as TRIDENT)
                 latency_ms=query_latency_tracker.get_total_latency(),
                 selected_passages=selected_passages,
                 abstained=False,
@@ -334,8 +353,8 @@ class FullSelfRAGAdapter(BaselineSystem):
                 stats={
                     "indexing_latency_ms": 0.0,
                     "indexing_tokens": 0,
-                    "query_tokens": query_token_tracker.total_tokens,
-                    "total_cost_tokens": query_token_tracker.total_tokens,
+                    "query_tokens": total_tokens,
+                    "total_cost_tokens": total_tokens,
                     # Self-RAG specific stats
                     "raw_generation": raw_generation,
                     "do_retrieve": do_retrieve,
@@ -343,6 +362,8 @@ class FullSelfRAGAdapter(BaselineSystem):
                     "num_context_docs": len(context) if context else 0,
                     "prompt_tokens": total_prompt_tokens,
                     "completion_tokens": total_completion_tokens,
+                    "evidence_tokens": total_evidence_tokens,  # Word heuristic: int(words * 1.3) + 10
+                    "llm_tokens": llm_tokens,  # prompt + completion
                     "num_generations": num_generations,
                     # Vanilla Self-RAG settings
                     "mode": self.mode,
