@@ -227,27 +227,8 @@ Answer:"""
         context_block = self.build_rag_prompt(question, passages)
 
         if facets:
-            # Format facets as human-readable requirements, not raw dicts
-            formatted_facets = []
-            for f in facets:
-                if isinstance(f, dict):
-                    # Extract meaningful information from facet dict
-                    template = f.get('template', {})
-                    mention = template.get('mention', '') if isinstance(template, dict) else str(template)
-                    facet_type = f.get('facet_type', '')
-                    if mention:
-                        formatted_facets.append(f"Find information about: {mention}")
-                    elif facet_type:
-                        formatted_facets.append(f"Address {facet_type} reasoning")
-                else:
-                    # If it's already a string or has __str__, use it
-                    formatted_facets.append(str(f))
-
-            if formatted_facets:
-                requirements = "\n".join(f"- {req}" for req in formatted_facets)
-                requirements_block = f"Reasoning requirements:\n{requirements}\n\n"
-            else:
-                requirements_block = ""
+            requirements = "\n".join(f"- {f}" for f in facets)
+            requirements_block = f"Reasoning requirements:\n{requirements}\n\n"
         else:
             requirements_block = ""
 
