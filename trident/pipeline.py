@@ -133,6 +133,30 @@ def extract_final_answer(raw_text: str, question: str) -> str:
     if not text:
         return ""
 
+    # SAFETY CHECK: Detect if raw output looks like facet/internal data dump
+    # This happens when the LLM outputs facet dictionaries instead of answers
+    facet_patterns = ['facet_type', 'facet_id', "'template':", '"template":',
+                      'BRIDGE', 'LEAF', "'mention':", '"mention":']
+    facet_count = sum(1 for p in facet_patterns if p in text)
+    if facet_count >= 3:
+        # The output looks like raw facet data - try to recover
+        # Look for any "Final answer:" even in corrupted output
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"[FACET DATA LEAK] LLM output contains facet structures. "
+                     f"Text sample: {text[:200]}...")
+
+        # Try to find a Final answer line anyway
+        final_match = re.search(r'(?i)final\s+answer\s*[:\-]\s*([^\n{]+)', text)
+        if final_match:
+            cand = final_match.group(1).strip()
+            # Make sure it's not itself facet data
+            if not any(p in cand for p in facet_patterns):
+                return cand
+
+        # Cannot recover - return error message
+        return "[ERROR: Answer extraction failed - output contained internal data]"
+
     # 0) Strip "Step N:" style reasoning lines (even at end of text)
     text = re.sub(r'(?mi)^step\s+\d+:[^\n]*$', '', text)
     text = re.sub(r'(?i)step\s+\d+:[^\.!\n]*', '', text)
@@ -402,13 +426,27 @@ class TridentPipeline:
                 facets=[f.to_dict() for f in facets]
             )
             llm_output = self.llm.generate(prompt)
-            
+
             # CRITICAL FIX: Extract and clean the final answer from LLM output
             # This ensures we're not logging intermediate outputs like facet mining
             raw_answer = llm_output.text
             # Use the new, more robust extraction function
             answer = extract_final_answer(raw_answer, query)
             tokens_used = llm_output.tokens_used
+
+            # DIAGNOSTIC: Log if answer extraction looks suspicious
+            # (contains facet-like patterns or is very long)
+            if ('facet_type' in answer or 'facet_id' in answer or
+                'template' in answer or len(answer) > 500):
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    f"[ANSWER EXTRACTION WARNING] Suspicious answer detected for query: {query[:50]}...\n"
+                    f"  Raw answer length: {len(raw_answer)}\n"
+                    f"  Extracted answer length: {len(answer)}\n"
+                    f"  Raw answer (first 200 chars): {raw_answer[:200]}...\n"
+                    f"  Extracted answer (first 200 chars): {answer[:200]}..."
+                )
         else:
             answer = "ABSTAINED" if result['abstained'] else ""
             tokens_used = 0
