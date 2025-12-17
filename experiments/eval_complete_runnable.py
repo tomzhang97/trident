@@ -861,6 +861,7 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
     f1_scores = []
     abstained = 0
     tokens_used = []
+    latencies = []
 
     for result in all_results:
         if result.get('abstained') or 'error' in result:
@@ -876,6 +877,7 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
             f1_scores.append(best_f1)
 
         tokens_used.append(result.get('tokens_used', 0))
+        latencies.append(result.get('latency_ms', 0))
 
     summary = {
         'total': len(all_results),
@@ -885,6 +887,7 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
         'avg_em': np.mean(em_scores) if em_scores else 0,
         'avg_f1': np.mean(f1_scores) if f1_scores else 0,
         'avg_tokens': np.mean(tokens_used) if tokens_used else 0,
+        'avg_latency_ms': np.mean(latencies) if latencies else 0,
     }
 
     # Save aggregated results
@@ -900,6 +903,7 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
     print(f"  EM: {summary['avg_em']:.4f}")
     print(f"  F1: {summary['avg_f1']:.4f}")
     print(f"  Abstention rate: {summary['abstention_rate']:.4f}")
+    print(f"  Avg latency: {summary['avg_latency_ms']:.1f}ms")
     print(f"\nSaved to: {aggregated_path}")
 
 
