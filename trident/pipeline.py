@@ -303,19 +303,56 @@ class TridentPipeline:
         """Process a query through the TRIDENT pipeline."""
         start_time = time.time()
         mode = mode or self.config.mode
-        
+
         # Track telemetry
         self.telemetry.start_query(query)
-        
+
         # Step 1: Facet mining
         facets = self.facet_miner.extract_facets(query, supporting_facts)
         self.telemetry.log("facet_mining", {"num_facets": len(facets)})
-        
+
         # Step 2: Retrieval
         retrieval_result = self._retrieve_passages(query, context)
         passages = retrieval_result.passages
         self.telemetry.log("retrieval", {"num_passages": len(passages)})
-        
+
+        # Handle zero facets case - fall back to Pareto if configured
+        if not facets and mode == "safe_cover":
+            if self.config.safe_cover.fallback_to_pareto:
+                self.telemetry.log("fallback", {"reason": "no_facets"})
+                mode = "pareto"  # Switch to Pareto mode for this query
+            else:
+                # Return abstained result
+                latency_ms = (time.time() - start_time) * 1000
+                return PipelineOutput(
+                    answer="ABSTAINED",
+                    selected_passages=[],
+                    certificates=None,
+                    abstained=True,
+                    tokens_used=0,
+                    latency_ms=latency_ms,
+                    metrics={'coverage': 0.0, 'num_facets': 0, 'abstention_reason': 'no_facets'},
+                    mode=mode,
+                    facets=[],
+                    trace=self.telemetry.get_trace()
+                )
+
+        # Handle zero passages case
+        if not passages:
+            latency_ms = (time.time() - start_time) * 1000
+            return PipelineOutput(
+                answer="ABSTAINED",
+                selected_passages=[],
+                certificates=None,
+                abstained=True,
+                tokens_used=0,
+                latency_ms=latency_ms,
+                metrics={'coverage': 0.0, 'num_facets': len(facets), 'abstention_reason': 'no_passages'},
+                mode=mode,
+                facets=[f.to_dict() for f in facets],
+                trace=self.telemetry.get_trace()
+            )
+
         # Step 3: Two-stage scoring
         scores = self._two_stage_scoring(passages, facets)
         self.telemetry.log("scoring", {"num_scores": len(scores.stage2_scores)})
