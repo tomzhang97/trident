@@ -303,60 +303,18 @@ class TridentPipeline:
         """Process a query through the TRIDENT pipeline."""
         start_time = time.time()
         mode = mode or self.config.mode
-
+        
         # Track telemetry
         self.telemetry.start_query(query)
-
+        
         # Step 1: Facet mining
         facets = self.facet_miner.extract_facets(query, supporting_facts)
         self.telemetry.log("facet_mining", {"num_facets": len(facets)})
-
-        # CRITICAL FIX: Handle zero facets early with proper abstention
-        if not facets:
-            latency_ms = (time.time() - start_time) * 1000
-            return PipelineOutput(
-                answer="ABSTAINED",
-                selected_passages=[],
-                certificates=None,
-                abstained=True,
-                tokens_used=0,
-                latency_ms=latency_ms,
-                metrics={
-                    'coverage': 0.0,
-                    'num_facets': 0,
-                    'num_units': 0,
-                    'abstention_reason': 'no_facets',
-                },
-                mode=mode,
-                facets=[],
-                trace=self.telemetry.get_trace()
-            )
         
         # Step 2: Retrieval
         retrieval_result = self._retrieve_passages(query, context)
         passages = retrieval_result.passages
         self.telemetry.log("retrieval", {"num_passages": len(passages)})
-
-        # CRITICAL FIX: Handle zero passages early with proper abstention
-        if not passages:
-            latency_ms = (time.time() - start_time) * 1000
-            return PipelineOutput(
-                answer="ABSTAINED",
-                selected_passages=[],
-                certificates=None,
-                abstained=True,
-                tokens_used=0,
-                latency_ms=latency_ms,
-                metrics={
-                    'coverage': 0.0,
-                    'num_facets': len(facets),
-                    'num_units': 0,
-                    'abstention_reason': 'no_passages',
-                },
-                mode=mode,
-                facets=[f.to_dict() for f in facets],
-                trace=self.telemetry.get_trace()
-            )
         
         # Step 3: Two-stage scoring
         scores = self._two_stage_scoring(passages, facets)
@@ -443,73 +401,24 @@ class TridentPipeline:
         cache_key = query
         if cache_key in self.retrieval_cache:
             return self.retrieval_cache[cache_key]
-
-        # CRITICAL FIX: Robustly check if context is provided and non-empty
-        # Context should be a list of (title, sentences) tuples
-        has_valid_context = (
-            context is not None and
-            isinstance(context, list) and
-            len(context) > 0
-        )
-
-        if has_valid_context:
+        
+        # If context is provided (e.g., HotpotQA), use it directly
+        if context:
             passages = []
-            skipped = 0
-
-            for idx, item in enumerate(context):
-                try:
-                    # Handle different context formats robustly
-                    if isinstance(item, (list, tuple)) and len(item) >= 2:
-                        title, sentences = item[0], item[1]
-                    elif isinstance(item, dict):
-                        # Handle dict format: {'title': ..., 'sentences': ...}
-                        title = item.get('title', f'doc_{idx}')
-                        sentences = item.get('sentences', item.get('text', ''))
-                    else:
-                        # Skip malformed entries
-                        skipped += 1
-                        continue
-
-                    # Convert sentences to text
-                    if isinstance(sentences, list):
-                        text = " ".join(str(s) for s in sentences if s)
-                    else:
-                        text = str(sentences) if sentences else ""
-
-                    # Skip empty texts
-                    if not text.strip():
-                        skipped += 1
-                        continue
-
-                    passage = Passage(
-                        pid=f"context_{idx}",
-                        text=text,
-                        cost=self._estimate_token_cost(text),
-                        metadata={'title': str(title), 'source': 'provided_context'}
-                    )
-                    passages.append(passage)
-
-                except Exception as e:
-                    # Log but don't fail on malformed context entries
-                    skipped += 1
-                    continue
-
-            if skipped > 0:
-                self.telemetry.log("context_warning", {
-                    "skipped_entries": skipped,
-                    "valid_entries": len(passages)
-                })
-
-            # Only use context if we got valid passages, otherwise fall back to retriever
-            if passages:
-                result = RetrievalResult(passages=passages, scores=[1.0] * len(passages))
-            else:
-                # All context entries were invalid, fall back to retriever
-                result = self.retriever.retrieve(query, top_k=self.config.retrieval.top_k)
+            for idx, (title, sentences) in enumerate(context):
+                text = " ".join(sentences) if isinstance(sentences, list) else sentences
+                passage = Passage(
+                    pid=f"context_{idx}",
+                    text=text,
+                    cost=self._estimate_token_cost(text),
+                    metadata={'title': title, 'source': 'provided_context'}
+                )
+                passages.append(passage)
+            result = RetrievalResult(passages=passages, scores=[1.0] * len(passages))
         else:
-            # No context provided, use retriever
+            # Use retriever
             result = self.retriever.retrieve(query, top_k=self.config.retrieval.top_k)
-
+        
         # Cache result
         self.retrieval_cache[cache_key] = result
         return result
@@ -657,11 +566,8 @@ class TridentPipeline:
             certificates.append({
                 'facet_id': cert.facet_id,
                 'passage_id': cert.passage_id,
-                'threshold': cert.threshold,  # CRITICAL FIX: was 'alpha_bar' but field is 'threshold'
+                'alpha_bar': cert.alpha_bar,
                 'p_value': cert.p_value,
-                'alpha_facet': cert.alpha_facet,
-                'alpha_query': cert.alpha_query,
-                'bin': cert.bin,
                 'timestamp': cert.timestamp,
                 'calibrator_version': self.config.calibration.version
             })
@@ -673,19 +579,17 @@ class TridentPipeline:
         return {
             'selected_passages': selected,
             'certificates': certificates,
-            'abstained': is_abstained,
-            'infeasible': is_infeasible,
-            'dual_lower_bound': getattr(result, 'dual_lower_bound', None),
+            'abstained': is_abstained, # Use the computed value
+            'infeasible': is_infeasible, # Add infeasible flag
+            'dual_lower_bound': getattr(result, 'dual_lower_bound', None), # Adjust based on actual result object
             'retrieval_tokens': total_cost,
-            'evidence_tokens': total_cost,
+            'evidence_tokens': total_cost,  # Track evidence tokens separately
             'metrics': {
                 'coverage': len(result.covered_facets) / len(facets) if facets else 0,
                 'utility': len(result.covered_facets),
                 'efficiency': len(result.covered_facets) / max(total_cost, 1) if total_cost > 0 else 0,
                 'num_units': len(selected),
-                'num_facets': len(facets),  # CRITICAL FIX: Track num_facets
                 'num_violated_facets': len(result.uncovered_facets),
-                'abstention_reason': result.abstention_reason.value if is_abstained else None,  # Track reason
             }
         }
     
