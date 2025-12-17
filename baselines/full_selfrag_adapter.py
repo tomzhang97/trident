@@ -156,6 +156,7 @@ class FullSelfRAGAdapter(BaselineSystem):
             print(f"Using externally set CUDA_VISIBLE_DEVICES={existing_cuda_devices}")
 
         # Load model using vLLM (same as vanilla Self-RAG)
+        # Use enforce_eager=True to avoid CUDA graph capture issues with mixed GPU architectures
         print(f"Loading Self-RAG model: {model_name}...")
         self.model = LLM(
             model_name,
@@ -163,6 +164,7 @@ class FullSelfRAGAdapter(BaselineSystem):
             dtype="half",
             tensor_parallel_size=1,
             gpu_memory_utilization=gpu_memory_utilization,
+            enforce_eager=True,  # Disable CUDA graphs to avoid PTX compatibility issues
         )
 
         # Load tokenizer for special token IDs
