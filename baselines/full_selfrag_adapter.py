@@ -174,25 +174,62 @@ class FullSelfRAGAdapter(BaselineSystem):
 
         print(f"Self-RAG initialized with mode={mode}, threshold={threshold}")
 
-    def _format_evidences(self, context: List[List[str]]) -> List[Dict[str, str]]:
+    def _format_evidences(self, context: List) -> List[Dict[str, str]]:
         """
-        Format HotpotQA context into Self-RAG evidence format.
+        Format context into Self-RAG evidence format.
 
         Args:
-            context: HotpotQA context (list of [title, sentences] pairs)
+            context: Context in various formats:
+                - HotpotQA: list of [title, sentences] pairs
+                - MuSiQue: list of (title, sentences) tuples
+                - Dict format: list of {'title': ..., 'text': ...} dicts
 
         Returns:
             List of evidence dicts with 'title' and 'text' keys
         """
         evidences = []
-        for title, sentences in context:
-            text = " ".join(sentences) if isinstance(sentences, list) else sentences
-            evidences.append({"title": title, "text": text})
+        for idx, item in enumerate(context):
+            try:
+                # Handle different context formats
+                if isinstance(item, dict):
+                    # Dict format: {'title': ..., 'text': ...} or {'title': ..., 'sentences': ...}
+                    title = item.get('title', f'doc_{idx}')
+                    text = item.get('text', '')
+                    if not text:
+                        sentences = item.get('sentences', [])
+                        text = " ".join(sentences) if isinstance(sentences, list) else str(sentences)
+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                    # List/tuple format: [title, sentences] or (title, sentences)
+                    title, sentences = item[0], item[1]
+                    text = " ".join(sentences) if isinstance(sentences, list) else str(sentences)
+                else:
+                    # Single string or other format - use as text directly
+                    title = f'doc_{idx}'
+                    text = str(item) if item else ''
+
+                # Skip empty texts
+                if text and text.strip():
+                    evidences.append({"title": str(title), "text": text.strip()})
+            except Exception as e:
+                # Skip malformed entries but continue processing
+                print(f"Warning: Skipping malformed context entry {idx}: {e}")
+                continue
+
         return evidences
 
     def _count_tokens(self, text: str) -> int:
         """Count tokens in text using the model's tokenizer."""
         return len(self.tokenizer.encode(text))
+
+    def _count_evidence_tokens(self, text: str) -> int:
+        """
+        Count evidence tokens using word-based heuristic (same as TRIDENT).
+
+        Uses the formula: int(words * 1.3) + 10
+        This matches TRIDENT's evidence token counting for fair comparison.
+        """
+        words = len(text.split())
+        return int(words * 1.3) + 10
 
     def answer(
         self,
@@ -228,6 +265,13 @@ class FullSelfRAGAdapter(BaselineSystem):
 
             # Limit evidences to ndocs
             evidences = evidences[:self.ndocs]
+
+            # CRITICAL FIX: Handle empty evidences case
+            # Self-RAG requires at least some evidence to avoid index errors
+            if not evidences:
+                print(f"Warning: No valid evidences for question, using no-retrieval mode")
+                # Create a minimal placeholder evidence to avoid crashes
+                evidences = [{"title": "no_context", "text": "No context available."}]
 
             # Generate using vanilla Self-RAG function
             query_latency_tracker.start()
@@ -265,9 +309,23 @@ class FullSelfRAGAdapter(BaselineSystem):
                         raw_generation = results[key].get("pred", "")
                         break
 
-            # Count tokens
+            # Count tokens using same methodology as TRIDENT for fair comparison:
+            # 1. LLM tokens (prompt + completion) - using HF tokenizer
+            # 2. Evidence tokens - using word heuristic: int(words * 1.3) + 10
             prompt_tokens = self._count_tokens(prompt)
             completion_tokens = self._count_tokens(answer) if answer else 0
+            llm_tokens = prompt_tokens + completion_tokens
+
+            # Calculate evidence tokens for passages used (same heuristic as TRIDENT)
+            evidence_tokens = 0
+            if evidences and do_retrieve:
+                for evidence in evidences:
+                    evidence_text = evidence.get("text", "")
+                    evidence_tokens += self._count_evidence_tokens(evidence_text)
+
+            # Total tokens = LLM tokens + evidence tokens
+            total_tokens = llm_tokens + evidence_tokens
+
             query_token_tracker.add_call(prompt_tokens, completion_tokens, purpose="generation")
 
             # Prepare selected passages
@@ -279,7 +337,7 @@ class FullSelfRAGAdapter(BaselineSystem):
 
             return BaselineResponse(
                 answer=answer,
-                tokens_used=query_token_tracker.total_tokens,
+                tokens_used=total_tokens,  # Includes evidence tokens for fair comparison
                 latency_ms=query_latency_tracker.get_total_latency(),
                 selected_passages=selected_passages,
                 abstained=False,
@@ -287,8 +345,8 @@ class FullSelfRAGAdapter(BaselineSystem):
                 stats={
                     "indexing_latency_ms": 0.0,
                     "indexing_tokens": 0,
-                    "query_tokens": query_token_tracker.total_tokens,
-                    "total_cost_tokens": query_token_tracker.total_tokens,
+                    "query_tokens": total_tokens,
+                    "total_cost_tokens": total_tokens,
                     # Self-RAG specific stats
                     "raw_generation": raw_generation,
                     "do_retrieve": do_retrieve,
@@ -296,6 +354,8 @@ class FullSelfRAGAdapter(BaselineSystem):
                     "num_context_docs": len(context) if context else 0,
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
+                    "evidence_tokens": evidence_tokens,
+                    "llm_tokens": llm_tokens,
                     # Vanilla Self-RAG settings
                     "mode": self.mode,
                     "threshold": self.threshold,

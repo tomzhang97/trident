@@ -60,48 +60,32 @@ class BenchmarkEvaluator:
         support_f1_scores = []
         faithfulness_scores = []
         abstention_count = 0
-        # CRITICAL FIX: Collect tokens and latency for ALL examples
-        all_token_counts = []
-        all_latencies = []
+        token_counts = []
+        latencies = []
         coverage_rates = []
-
+        
         for pred, ref in zip(predictions, references):
-            # CRITICAL FIX: Always track latency and tokens regardless of abstention
-            all_latencies.append(pred.get('latency_ms', 0))
-            all_token_counts.append(pred.get('tokens_used', 0))
-
-            # Track coverage rate for all examples
-            if pred.get('facets'):
-                total_facets = len(pred['facets'])
-                covered_facets = sum(1 for f in pred['facets']
-                                   if f.get('covered', False))
-                coverage_rates.append(covered_facets / max(total_facets, 1))
-            elif pred.get('metrics', {}).get('coverage') is not None:
-                # CRITICAL FIX: Also accept coverage from metrics
-                coverage_rates.append(pred['metrics']['coverage'])
-
-            # Handle abstentions - skip accuracy metrics but not resource metrics
+            # Handle abstentions
             if pred.get('abstained', False):
                 abstention_count += 1
                 continue
-
+            
             # Exact Match and F1
             pred_answer = self._normalize_answer(pred.get('prediction', ''))
             ref_answers = ref.get('answer', [])
             if isinstance(ref_answers, str):
                 ref_answers = [ref_answers]
-
+            
             # Compute EM
-            if ref_answers:
-                em = max(self._exact_match(pred_answer, self._normalize_answer(ans))
-                        for ans in ref_answers)
-                em_scores.append(em)
-
-                # Compute F1
-                f1 = max(self._f1_score(pred_answer, self._normalize_answer(ans))
-                        for ans in ref_answers)
-                f1_scores.append(f1)
-
+            em = max(self._exact_match(pred_answer, self._normalize_answer(ans)) 
+                    for ans in ref_answers)
+            em_scores.append(em)
+            
+            # Compute F1
+            f1 = max(self._f1_score(pred_answer, self._normalize_answer(ans)) 
+                    for ans in ref_answers)
+            f1_scores.append(f1)
+            
             # Support EM/F1 for multi-hop
             if 'support_em' in self.metrics_to_compute:
                 pred_facts = pred.get('supporting_facts', [])
@@ -111,7 +95,7 @@ class BenchmarkEvaluator:
                     support_f1 = self._support_f1_score(pred_facts, ref_facts)
                     support_em_scores.append(support_em)
                     support_f1_scores.append(support_f1)
-
+            
             # Faithfulness (if passages provided)
             if 'faithfulness' in self.metrics_to_compute:
                 faith_score = self._compute_faithfulness(
@@ -119,9 +103,23 @@ class BenchmarkEvaluator:
                     pred.get('selected_passages', [])
                 )
                 faithfulness_scores.append(faith_score)
-
+            
+            # Token usage
+            token_counts.append(pred.get('tokens_used', 0))
+            
+            # Latency
+            latencies.append(pred.get('latency_ms', 0))
+            
+            # Coverage rate
+            if pred.get('facets'):
+                total_facets = len(pred['facets'])
+                covered_facets = sum(1 for f in pred['facets'] 
+                                   if f.get('covered', False))
+                coverage_rates.append(covered_facets / max(total_facets, 1))
+        
         # Compute averages
-        # CRITICAL FIX: Use all examples for resource metrics, only non-abstained for accuracy
+        num_valid = len(predictions) - abstention_count
+        
         return EvaluationMetrics(
             exact_match=np.mean(em_scores) if em_scores else 0.0,
             f1_score=np.mean(f1_scores) if f1_scores else 0.0,
@@ -129,9 +127,8 @@ class BenchmarkEvaluator:
             support_f1=np.mean(support_f1_scores) if support_f1_scores else 0.0,
             faithfulness=np.mean(faithfulness_scores) if faithfulness_scores else 0.0,
             abstention_rate=abstention_count / len(predictions) if predictions else 0.0,
-            # CRITICAL FIX: Use ALL examples for resource metrics
-            avg_tokens_used=np.mean(all_token_counts) if all_token_counts else 0.0,
-            avg_latency_ms=np.mean(all_latencies) if all_latencies else 0.0,
+            avg_tokens_used=np.mean(token_counts) if token_counts else 0.0,
+            avg_latency_ms=np.mean(latencies) if latencies else 0.0,
             coverage_rate=np.mean(coverage_rates) if coverage_rates else 0.0
         )
     

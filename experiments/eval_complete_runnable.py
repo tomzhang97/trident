@@ -101,12 +101,13 @@ def load_data(data_path: str, limit: Optional[int] = None) -> List[Dict[str, Any
     """Load data from JSON or JSONL file.
 
     Supports:
-    - JSON: List of examples or HotpotQA format
+    - JSON: List of examples or HotpotQA/2WikiMultiHop format
     - JSONL: One JSON object per line (MuSiQue format)
 
     Automatically converts to standard format with _id, question, answer, context, supporting_facts.
     """
     path = Path(data_path)
+    path_lower = str(data_path).lower()
 
     if path.suffix == '.jsonl':
         # JSONL format (MuSiQue)
@@ -120,7 +121,7 @@ def load_data(data_path: str, limit: Optional[int] = None) -> List[Dict[str, Any
         # Convert MuSiQue format to standard format
         return convert_musique_format(examples)
     else:
-        # JSON format (HotpotQA or pre-processed)
+        # JSON format (HotpotQA, 2WikiMultiHop, or pre-processed)
         with open(path, 'r') as f:
             data = json.load(f)
 
@@ -129,9 +130,18 @@ def load_data(data_path: str, limit: Optional[int] = None) -> List[Dict[str, Any
         else:
             examples = [data]
 
-        # Check if it's raw HotpotQA format and convert
+        # Detect dataset type from path or data structure
+        is_2wiki = '2wiki' in path_lower or 'wikimultihop' in path_lower
+
+        # Check if it's raw format and convert
         if examples and '_id' not in examples[0] and 'id' in examples[0]:
+            if is_2wiki:
+                return convert_2wikimultihop_format(examples)
             return convert_hotpotqa_format(examples)
+
+        # Also convert if path indicates 2WikiMultiHop (even with _id)
+        if is_2wiki and examples:
+            return convert_2wikimultihop_format(examples)
 
         return examples
 
@@ -184,6 +194,43 @@ def convert_hotpotqa_format(examples: List[Dict]) -> List[Dict]:
 
         # Handle supporting_facts format
         sf = ex.get('supporting_facts', [])
+        if isinstance(sf, dict):
+            sf_titles = sf.get('title', [])
+            sf_sents = sf.get('sent_id', [])
+            sf = list(zip(sf_titles, sf_sents))
+
+        converted.append({
+            '_id': ex.get('_id', ex.get('id', '')),
+            'question': ex.get('question', ''),
+            'answer': ex.get('answer', ''),
+            'context': context,
+            'supporting_facts': sf,
+            'type': ex.get('type', 'unknown'),
+            'level': ex.get('level', 'unknown'),
+        })
+    return converted
+
+
+def convert_2wikimultihop_format(examples: List[Dict]) -> List[Dict]:
+    """Convert 2WikiMultiHop JSON format to standard format.
+
+    2WikiMultiHop format is similar to HotpotQA with some differences:
+    - May have 'evidences' field instead of 'supporting_facts'
+    - Context may be in different formats
+    - Types: comparison, inference, compositional, bridge
+    """
+    converted = []
+    for ex in examples:
+        # Handle context format - 2Wiki uses similar format to HotpotQA
+        context = ex.get('context', [])
+        if isinstance(context, dict):
+            # Handle dict format
+            titles = context.get('title', [])
+            sentences_list = context.get('sentences', [])
+            context = list(zip(titles, sentences_list))
+
+        # Handle supporting_facts - 2Wiki may use 'evidences' or 'supporting_facts'
+        sf = ex.get('supporting_facts', ex.get('evidences', []))
         if isinstance(sf, dict):
             sf_titles = sf.get('title', [])
             sf_sents = sf.get('sent_id', [])
@@ -861,6 +908,7 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
     f1_scores = []
     abstained = 0
     tokens_used = []
+    latencies = []
 
     for result in all_results:
         if result.get('abstained') or 'error' in result:
@@ -876,6 +924,7 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
             f1_scores.append(best_f1)
 
         tokens_used.append(result.get('tokens_used', 0))
+        latencies.append(result.get('latency_ms', 0))
 
     summary = {
         'total': len(all_results),
@@ -885,6 +934,7 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
         'avg_em': np.mean(em_scores) if em_scores else 0,
         'avg_f1': np.mean(f1_scores) if f1_scores else 0,
         'avg_tokens': np.mean(tokens_used) if tokens_used else 0,
+        'avg_latency_ms': np.mean(latencies) if latencies else 0,
     }
 
     # Save aggregated results
@@ -900,6 +950,7 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
     print(f"  EM: {summary['avg_em']:.4f}")
     print(f"  F1: {summary['avg_f1']:.4f}")
     print(f"  Abstention rate: {summary['abstention_rate']:.4f}")
+    print(f"  Avg latency: {summary['avg_latency_ms']:.1f}ms")
     print(f"\nSaved to: {aggregated_path}")
 
 

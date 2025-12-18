@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# IMPORTANT: These must be at the very top, before ANY other imports
+import os
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+import multiprocessing
+# Set multiprocessing start method to 'spawn' before any CUDA operations
+# This fixes the "Cannot re-initialize CUDA in forked subprocess" error
+try:
+    multiprocessing.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Already set
+
 """
 Evaluation script for full baseline systems (Self-RAG, KET-RAG, Vanilla RAG, HippoRAG).
 
@@ -40,14 +52,9 @@ Environment variables:
     HF_TOKEN: Required for Self-RAG model download
 """
 
-import multiprocessing
-# IMPORTANT: Set multiprocessing start method to 'spawn' before any CUDA operations
-# This fixes the "Cannot re-initialize CUDA in forked subprocess" error
-multiprocessing.set_start_method('spawn', force=True)
-
 import argparse
 import json
-import os
+import re
 import sys
 from pathlib import Path
 from typing import Dict, Any, List
@@ -66,12 +73,47 @@ from baselines.full_baseline_interface import compute_exact_match, compute_f1
 # at import time.
 
 
+def convert_musique_example(ex: Dict) -> Dict:
+    """Convert a single MuSiQue example to standard format."""
+    context = []
+    supporting_facts = []
+
+    for para in ex.get('paragraphs', []):
+        title = para.get('title', f"para_{para.get('idx', 0)}")
+        text = para.get('paragraph_text', '')
+        # Split into sentences
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        sentences = [s.strip() for s in sentences if s.strip()]
+        context.append([title, sentences])
+
+        # Track supporting paragraphs
+        if para.get('is_supporting', False):
+            for sent_idx in range(len(sentences)):
+                supporting_facts.append([title, sent_idx])
+
+    return {
+        '_id': ex.get('id', ''),
+        'question': ex.get('question', ''),
+        'answer': ex.get('answer', ''),
+        'answer_aliases': ex.get('answer_aliases', []),
+        'context': context,
+        'supporting_facts': supporting_facts,
+        'type': ex.get('id', '').split('__')[0] if '__' in ex.get('id', '') else 'unknown',
+        'answerable': ex.get('answerable', True),
+    }
+
+
 def load_hotpotqa_data(data_path: str, max_samples: int = None) -> List[Dict[str, Any]]:
-    """Load HotpotQA data from JSONL or JSON array files.
+    """Load HotpotQA/MuSiQue/2WikiMultiHop data from JSONL or JSON array files.
 
     The loader skips empty lines in JSONL files and also supports files that
     contain a single JSON array (common when exporting small evaluation shards).
+
+    Automatically detects and converts MuSiQue format (which uses 'paragraphs'
+    instead of 'context').
     """
+    path_lower = data_path.lower()
+    is_musique = 'musique' in path_lower
 
     with open(data_path, 'r') as f:
         # Peek at the first non-empty line to determine file shape
@@ -88,16 +130,21 @@ def load_hotpotqa_data(data_path: str, max_samples: int = None) -> List[Dict[str
             data = json.load(f)
             if max_samples:
                 data = data[:max_samples]
-            return data
+        else:
+            data: List[Dict[str, Any]] = []
+            for i, line in enumerate(f):
+                if max_samples and i >= max_samples:
+                    break
+                if not line.strip():
+                    continue
+                data.append(json.loads(line))
 
-        data: List[Dict[str, Any]] = []
-        for i, line in enumerate(f):
-            if max_samples and i >= max_samples:
-                break
-            if not line.strip():
-                continue
-            data.append(json.loads(line))
-        return data
+    # Detect MuSiQue format: has 'paragraphs' but no 'context'
+    if data and ('paragraphs' in data[0] or is_musique):
+        print(f"Detected MuSiQue format, converting {len(data)} examples...")
+        data = [convert_musique_example(ex) for ex in data]
+
+    return data
 
 
 def evaluate_baseline(

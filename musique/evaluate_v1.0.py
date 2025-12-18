@@ -538,6 +538,20 @@ def evaluate_trident(
         import os
         os.unlink(temp_path)
 
+    # Add latency and token metrics from TRIDENT results
+    latencies = []
+    tokens = []
+    for result in trident_results:
+        if 'latency_ms' in result:
+            latencies.append(result['latency_ms'])
+        if 'tokens_used' in result:
+            tokens.append(result['tokens_used'])
+
+    if latencies:
+        metrics['avg_latency_ms'] = round(sum(latencies) / len(latencies), 1)
+    if tokens:
+        metrics['avg_tokens'] = round(sum(tokens) / len(tokens), 1)
+
     return metrics
 
 

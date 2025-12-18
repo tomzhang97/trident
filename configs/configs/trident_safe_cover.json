@@ -1,20 +1,23 @@
 {
   "mode": "safe_cover",
   "safe_cover": {
-    "per_facet_alpha": 0.1,
+    "per_facet_alpha": 0.05,
     "coverage_threshold": 0.15,
-    "token_cap": 2000,
+    "token_cap": 4000,
+    "max_evidence_tokens": 4000,
+    "max_units": 16,
     "dual_tolerance": 1e-6,
-    "early_abstain": false,
+    "early_abstain": true,
     "abstain_on_infeasible": false,
     "use_certificates": true,
     "monitor_drift": false,
+    "psi_threshold": 0.5,
     "fallback_to_pareto": true,
-    "pvalue_mode": "randomized"
+    "pvalue_mode": "deterministic"
   },
   "pareto": {
     "budget": 2000,
-    "relaxed_alpha": 0.3,
+    "relaxed_alpha": 0.5,
     "use_vqc": false,
     "use_bwk": false
   },
@@ -32,13 +35,11 @@
   "nli": {
     "model_name": "microsoft/deberta-v2-xlarge-mnli",
     "batch_size": 32,
-    "score_threshold": 0.8
+    "score_threshold": 0.9
   },
   "calibration": {
-    "method": "conformal",
-    "use_mondrian": false,
-    "pvalue_mode": "randomized",
-    "n_min": 30,
+    "method": "isotonic",
+    "use_mondrian": true,
     "reliability_table_size": 20
   },
   "evaluation": {
