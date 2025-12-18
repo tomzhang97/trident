@@ -243,7 +243,7 @@ def extract_final_answer(raw_text: str, question: str) -> str:
 
 class TridentPipeline:
     """Main TRIDENT pipeline orchestrator."""
-
+    
     def __init__(
         self,
         config: TridentConfig,
@@ -255,13 +255,13 @@ class TridentPipeline:
         self.llm = llm
         self.retriever = retriever
         self.device = device
-
+        
         # Initialize components
         self.facet_miner = FacetMiner(config)
         self.nli_scorer = NLIScorer(config.nli, device)
         self.calibrator = ReliabilityCalibrator(use_mondrian=config.calibration.use_mondrian)
         self.telemetry = TelemetryTracker(config.telemetry)
-
+        
         # Initialize mode-specific components
         if config.mode in ["safe_cover", "both"]:
             self.safe_cover_algo = SafeCoverAlgorithm(
@@ -269,7 +269,7 @@ class TridentPipeline:
                 calibrator=self.calibrator
             )
             self.drift_monitor = DriftMonitor(config.safe_cover) if config.safe_cover.monitor_drift else None
-
+            
         if config.mode in ["pareto", "both"]:
             self.pareto_optimizer = ParetoKnapsackOptimizer(config.pareto)
             if config.pareto.use_vqc:
@@ -288,11 +288,11 @@ class TridentPipeline:
                 self.vqc = VerifierQueryCompiler(config, self.nli_scorer)
             if config.pareto.use_bwk and not hasattr(self, 'bwk'):
                 self.bwk = BwKController(config.pareto)
-
+        
         # Caches
         self.score_cache: Dict[Tuple[str, str, str], float] = {}
         self.retrieval_cache: Dict[str, RetrievalResult] = {}
-
+    
     def process_query(
         self,
         query: str,
@@ -331,7 +331,7 @@ class TridentPipeline:
                 facets=[],
                 trace=self.telemetry.get_trace()
             )
-
+        
         # Step 2: Retrieval
         retrieval_result = self._retrieve_passages(query, context)
         passages = retrieval_result.passages
@@ -357,11 +357,11 @@ class TridentPipeline:
                 facets=[f.to_dict() for f in facets],
                 trace=self.telemetry.get_trace()
             )
-
+        
         # Step 3: Two-stage scoring
         scores = self._two_stage_scoring(passages, facets)
         self.telemetry.log("scoring", {"num_scores": len(scores.stage2_scores)})
-
+        
         # Step 4: Mode-specific selection
         if mode == "safe_cover":
             result = self._run_safe_cover(facets, passages, scores)
@@ -391,7 +391,7 @@ class TridentPipeline:
             }
         else:
             raise ValueError(f"Unknown mode: {mode}")
-
+        
         # Step 5: Generate answer (FIXED - now properly extracts final answer)
         answer = ""
         if not result['abstained'] and result['selected_passages']:
@@ -402,7 +402,7 @@ class TridentPipeline:
                 facets=[f.to_dict() for f in facets]
             )
             llm_output = self.llm.generate(prompt)
-
+            
             # CRITICAL FIX: Extract and clean the final answer from LLM output
             # This ensures we're not logging intermediate outputs like facet mining
             raw_answer = llm_output.text
@@ -412,10 +412,10 @@ class TridentPipeline:
         else:
             answer = "ABSTAINED" if result['abstained'] else ""
             tokens_used = 0
-
+        
         # Calculate total latency
         latency_ms = (time.time() - start_time) * 1000
-
+        
         # Prepare output
         return PipelineOutput(
             answer=answer,
@@ -429,10 +429,10 @@ class TridentPipeline:
             facets=[f.to_dict() for f in facets],
             trace=self.telemetry.get_trace()
         )
-
+    
     # Removed the old _extract_final_answer method and _clean_answer method
     # as they are replaced by the standalone extract_final_answer function.
-
+    
     def _retrieve_passages(
         self,
         query: str,
@@ -513,13 +513,13 @@ class TridentPipeline:
         # Cache result
         self.retrieval_cache[cache_key] = result
         return result
-
+    
     def _estimate_token_cost(self, text: str) -> int:
         """Estimate token cost more accurately."""
         # More realistic estimate: ~1.3 tokens per word + overhead
         words = len(text.split())
         return int(words * 1.3) + 10  # Add overhead for special tokens
-
+    
     def _two_stage_scoring(
         self,
         passages: List[Passage],
@@ -527,52 +527,52 @@ class TridentPipeline:
     ) -> TwoStageScores:
         """
         Perform two-stage scoring with shortlisting and CE/NLI.
-
+        
         CRITICAL FIX: Ensures facets are proper Facet objects, not strings.
         """
         stage1_scores = {}
         stage2_scores = {}
         p_values = {}
-
+        
         # Validate facets are proper objects
         for facet in facets:
             if not isinstance(facet, Facet):
                 raise TypeError(f"Expected Facet object, got {type(facet)}: {facet}")
-
+        
         for facet in facets:
             # Stage 1: Shortlist candidates per facet
             shortlist = self._shortlist_for_facet(passages, facet)
-
+            
             # Stage 2: CE/NLI scoring for shortlisted pairs
             for passage in shortlist:
                 cache_key = (passage.pid, facet.facet_id, self.config.calibration.version)
-
+                
                 if cache_key in self.score_cache:
                     score = self.score_cache[cache_key]
                 else:
                     score = self.nli_scorer.score(passage, facet)
                     self.score_cache[cache_key] = score
-
+                
                 stage2_scores[(passage.pid, facet.facet_id)] = score
-
+                
                 # Calibrate to p-value with text length for Mondrian
                 bucket = self._get_calibration_bucket(facet)
                 text_length = len(passage.text.split())
                 p_value = self.calibrator.to_pvalue(score, bucket, text_length)
-
+                
                 # CRITICAL FIX: Ensure p-values are reasonable
                 # If calibration gives extreme values, use score-based heuristic
                 if p_value > 0.99 or p_value < 0.0:
                     p_value = max(0.0, min(1.0, 1.0 - score))
-
+                
                 p_values[(passage.pid, facet.facet_id)] = p_value
-
+        
         return TwoStageScores(
             stage1_scores=stage1_scores,
             stage2_scores=stage2_scores,
             p_values=p_values
         )
-
+    
     def _shortlist_for_facet(
         self,
         passages: List[Passage],
@@ -585,11 +585,11 @@ class TridentPipeline:
         for passage in passages:
             score = self._lexical_score(passage.text, facet.get_keywords())
             scores.append((passage, score))
-
+        
         # Sort by score and take top candidates
         scores.sort(key=lambda x: x[1], reverse=True)
         return [p for p, _ in scores[:max_candidates]]
-
+    
     def _lexical_score(self, text: str, keywords: List[str]) -> float:
         """Simple lexical overlap score."""
         if not keywords:
@@ -597,11 +597,11 @@ class TridentPipeline:
         text_lower = text.lower()
         matches = sum(1 for kw in keywords if kw.lower() in text_lower)
         return matches / len(keywords)
-
+    
     def _get_calibration_bucket(self, facet: Facet) -> str:
         """
         Get calibration bucket for facet.
-
+        
         CRITICAL FIX: Properly handle facet type as enum.
         """
         # Ensure facet_type is accessed correctly
@@ -611,9 +611,9 @@ class TridentPipeline:
             facet_type_str = facet.facet_type
         else:
             facet_type_str = str(facet.facet_type)
-
+        
         return facet_type_str
-
+    
     def _run_safe_cover(
         self,
         facets: List[Facet],
@@ -688,7 +688,7 @@ class TridentPipeline:
                 'abstention_reason': result.abstention_reason.value if is_abstained else None,  # Track reason
             }
         }
-
+    
     def _run_pareto(
         self,
         query: str,
@@ -698,7 +698,7 @@ class TridentPipeline:
     ) -> Dict[str, Any]:
         """
         Run Pareto-Knapsack mode with optional VQC and BwK.
-
+        
         CRITICAL FIX: Properly respects budget constraints.
         CRITICAL FIX: VQC now runs based on uncovered facets and budget,
                     regardless of BwK action, allowing VQC to function.
@@ -706,10 +706,10 @@ class TridentPipeline:
         current_passages = passages.copy()
         current_facets = facets.copy()
         vqc_iterations = 0
-
+        
         # Calculate actual budget considering retrieval cost
         actual_budget = self.config.pareto.budget
-
+        
         # BwK controller for action selection
         if self.config.pareto.use_bwk:
             episode_state = {
@@ -763,7 +763,7 @@ class TridentPipeline:
                     current_passages=result.selected_passages,
                     max_rewrites=2
                 )
-
+                
                 # Retrieve new passages
                 new_passages = []
                 for rewrite in rewrites:
@@ -772,13 +772,13 @@ class TridentPipeline:
                         top_k=self.config.retrieval.top_k // 2
                     )
                     new_passages.extend(retrieval_result.passages)
-
+                
                 # Update passages and re-score
                 current_passages.extend(new_passages)
                 new_scores = self._two_stage_scoring(new_passages, current_facets)
                 scores.stage2_scores.update(new_scores.stage2_scores)
                 scores.p_values.update(new_scores.p_values)
-
+                
                 vqc_iterations += 1
             else:
                 # Break the loop if conditions for VQC are not met
@@ -792,7 +792,7 @@ class TridentPipeline:
             final_result_cost = result.total_cost
             reward = final_result_utility / max(final_result_cost, 1)
             self.bwk.update_reward(reward)
-
+        
         # Convert to output format
         selected = []
         for passage in result.selected_passages:
@@ -818,11 +818,11 @@ class TridentPipeline:
                 'num_units': len(selected),
             }
         }
-
+    
     def get_telemetry(self) -> Dict[str, Any]:
         """Get telemetry data."""
         return self.telemetry.get_summary()
-
+    
     def reset_caches(self) -> None:
         """Reset all caches."""
         self.score_cache.clear()
