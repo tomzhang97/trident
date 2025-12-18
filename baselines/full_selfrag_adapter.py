@@ -174,20 +174,47 @@ class FullSelfRAGAdapter(BaselineSystem):
 
         print(f"Self-RAG initialized with mode={mode}, threshold={threshold}")
 
-    def _format_evidences(self, context: List[List[str]]) -> List[Dict[str, str]]:
+    def _format_evidences(self, context: List) -> List[Dict[str, str]]:
         """
-        Format HotpotQA context into Self-RAG evidence format.
+        Format context into Self-RAG evidence format.
 
         Args:
-            context: HotpotQA context (list of [title, sentences] pairs)
+            context: Context in various formats:
+                - HotpotQA: list of [title, sentences] pairs
+                - MuSiQue: list of (title, sentences) tuples
+                - Dict format: list of {'title': ..., 'text': ...} dicts
 
         Returns:
             List of evidence dicts with 'title' and 'text' keys
         """
         evidences = []
-        for title, sentences in context:
-            text = " ".join(sentences) if isinstance(sentences, list) else sentences
-            evidences.append({"title": title, "text": text})
+        for idx, item in enumerate(context):
+            try:
+                # Handle different context formats
+                if isinstance(item, dict):
+                    # Dict format: {'title': ..., 'text': ...} or {'title': ..., 'sentences': ...}
+                    title = item.get('title', f'doc_{idx}')
+                    text = item.get('text', '')
+                    if not text:
+                        sentences = item.get('sentences', [])
+                        text = " ".join(sentences) if isinstance(sentences, list) else str(sentences)
+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                    # List/tuple format: [title, sentences] or (title, sentences)
+                    title, sentences = item[0], item[1]
+                    text = " ".join(sentences) if isinstance(sentences, list) else str(sentences)
+                else:
+                    # Single string or other format - use as text directly
+                    title = f'doc_{idx}'
+                    text = str(item) if item else ''
+
+                # Skip empty texts
+                if text and text.strip():
+                    evidences.append({"title": str(title), "text": text.strip()})
+            except Exception as e:
+                # Skip malformed entries but continue processing
+                print(f"Warning: Skipping malformed context entry {idx}: {e}")
+                continue
+
         return evidences
 
     def _count_tokens(self, text: str) -> int:
@@ -238,6 +265,13 @@ class FullSelfRAGAdapter(BaselineSystem):
 
             # Limit evidences to ndocs
             evidences = evidences[:self.ndocs]
+
+            # CRITICAL FIX: Handle empty evidences case
+            # Self-RAG requires at least some evidence to avoid index errors
+            if not evidences:
+                print(f"Warning: No valid evidences for question, using no-retrieval mode")
+                # Create a minimal placeholder evidence to avoid crashes
+                evidences = [{"title": "no_context", "text": "No context available."}]
 
             # Generate using vanilla Self-RAG function
             query_latency_tracker.start()
