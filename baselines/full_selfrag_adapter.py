@@ -194,6 +194,16 @@ class FullSelfRAGAdapter(BaselineSystem):
         """Count tokens in text using the model's tokenizer."""
         return len(self.tokenizer.encode(text))
 
+    def _count_evidence_tokens(self, text: str) -> int:
+        """
+        Count evidence tokens using word-based heuristic (same as TRIDENT).
+
+        Uses the formula: int(words * 1.3) + 10
+        This matches TRIDENT's evidence token counting for fair comparison.
+        """
+        words = len(text.split())
+        return int(words * 1.3) + 10
+
     def answer(
         self,
         question: str,
@@ -265,9 +275,23 @@ class FullSelfRAGAdapter(BaselineSystem):
                         raw_generation = results[key].get("pred", "")
                         break
 
-            # Count tokens
+            # Count tokens using same methodology as TRIDENT for fair comparison:
+            # 1. LLM tokens (prompt + completion) - using HF tokenizer
+            # 2. Evidence tokens - using word heuristic: int(words * 1.3) + 10
             prompt_tokens = self._count_tokens(prompt)
             completion_tokens = self._count_tokens(answer) if answer else 0
+            llm_tokens = prompt_tokens + completion_tokens
+
+            # Calculate evidence tokens for passages used (same heuristic as TRIDENT)
+            evidence_tokens = 0
+            if evidences and do_retrieve:
+                for evidence in evidences:
+                    evidence_text = evidence.get("text", "")
+                    evidence_tokens += self._count_evidence_tokens(evidence_text)
+
+            # Total tokens = LLM tokens + evidence tokens
+            total_tokens = llm_tokens + evidence_tokens
+
             query_token_tracker.add_call(prompt_tokens, completion_tokens, purpose="generation")
 
             # Prepare selected passages
@@ -279,7 +303,7 @@ class FullSelfRAGAdapter(BaselineSystem):
 
             return BaselineResponse(
                 answer=answer,
-                tokens_used=query_token_tracker.total_tokens,
+                tokens_used=total_tokens,  # Includes evidence tokens for fair comparison
                 latency_ms=query_latency_tracker.get_total_latency(),
                 selected_passages=selected_passages,
                 abstained=False,
@@ -287,8 +311,8 @@ class FullSelfRAGAdapter(BaselineSystem):
                 stats={
                     "indexing_latency_ms": 0.0,
                     "indexing_tokens": 0,
-                    "query_tokens": query_token_tracker.total_tokens,
-                    "total_cost_tokens": query_token_tracker.total_tokens,
+                    "query_tokens": total_tokens,
+                    "total_cost_tokens": total_tokens,
                     # Self-RAG specific stats
                     "raw_generation": raw_generation,
                     "do_retrieve": do_retrieve,
@@ -296,6 +320,8 @@ class FullSelfRAGAdapter(BaselineSystem):
                     "num_context_docs": len(context) if context else 0,
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
+                    "evidence_tokens": evidence_tokens,
+                    "llm_tokens": llm_tokens,
                     # Vanilla Self-RAG settings
                     "mode": self.mode,
                     "threshold": self.threshold,
