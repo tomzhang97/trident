@@ -1061,6 +1061,19 @@ Examples:
     if args.ketrag_k is None:
         args.ketrag_k = args.common_k
 
+    # Auto-detect dataset from data_path if not explicitly set (still default "hotpotqa")
+    if args.dataset == "hotpotqa" and args.data_path:
+        path_lower = args.data_path.lower()
+        if '2wiki' in path_lower or 'wikimultihop' in path_lower:
+            args.dataset = "2WikiMultiHop"
+            print(f"Auto-detected dataset: {args.dataset}")
+        elif 'musique' in path_lower:
+            args.dataset = "MuSiQue"
+            print(f"Auto-detected dataset: {args.dataset}")
+        elif 'hotpot' in path_lower:
+            args.dataset = "HotpotQA"
+            # Don't print for default case
+
     # Set random seeds
     np.random.seed(args.seed)
 
