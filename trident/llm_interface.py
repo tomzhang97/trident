@@ -219,10 +219,17 @@ Answer:"""
         question: str,
         passages: List[Dict[str, Any]],
         facets: List[Any],
+        dataset: str = "multi-hop QA",
     ) -> str:
         """
         Build a multi-hop QA prompt with an explicit 'Final answer:' line
         so that downstream extraction is robust.
+
+        Args:
+            question: The question to answer
+            passages: List of passage dictionaries with 'text' key
+            facets: List of facet requirements
+            dataset: Dataset name for prompt context (e.g., "HotpotQA", "MuSiQue", "2WikiMultiHop")
         """
         context_block = self.build_rag_prompt(question, passages)
 
@@ -235,7 +242,7 @@ Answer:"""
         prompt = (
             f"{context_block}\n"
             f"{requirements_block}"
-            "You are answering a multi-hop question from the HotpotQA dataset.\n"
+            f"You are answering a multi-hop question from a {dataset} dataset.\n"
             "1. Use ONLY the information in the context above.\n"
             "2. First, think briefly and, if helpful, reason in a few short steps.\n"
             "3. Then, on the LAST line of your response, output the answer in the form:\n"

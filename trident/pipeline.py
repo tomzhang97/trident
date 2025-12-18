@@ -396,10 +396,13 @@ class TridentPipeline:
         answer = ""
         if not result['abstained'] and result['selected_passages']:
             # Build prompt with selected passages
+            # Use dataset name from config for appropriate prompt context
+            dataset_name = getattr(self.config.evaluation, 'dataset', 'multi-hop QA')
             prompt = self.llm.build_multi_hop_prompt(
                 question=query,
                 passages=result['selected_passages'],
-                facets=[f.to_dict() for f in facets]
+                facets=[f.to_dict() for f in facets],
+                dataset=dataset_name
             )
             llm_output = self.llm.generate(prompt)
 
