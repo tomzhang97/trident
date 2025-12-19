@@ -61,9 +61,25 @@ class SafeCoverConfig:
     - Query-level FWER ≤ α_query for facet-coverage claims
     - Context budget respected; sound abstention when infeasible
     - Full audit trail (versions, thresholds, p-values, bins)
+
+    Alpha Semantics (Authoritative Mapping):
+    - alpha_query := per_facet_alpha (legacy name kept for backward compatibility)
+    - alpha_f := alpha_query / |F(q)|  (per-facet allocation)
+    - alpha_bar_f := alpha_f / T_f     (per-test threshold)
+
+    These three values are logged in every certificate. The legacy name
+    'per_facet_alpha' is preserved for backward compatibility but should be
+    understood as the QUERY-LEVEL target, not per-facet.
+
+    IMPORTANT: VQC and BwK are disabled in Safe-Cover mode (use_vqc=False,
+    use_bwk=False) because they change candidate distribution and invalidate
+    selection-conditional calibration.
     """
     # FWER Control (Section 4.2)
-    per_facet_alpha: float = 0.05  # α_query: Query-level FWER target
+    # NOTE: per_facet_alpha is the QUERY-LEVEL FWER target (α_query).
+    # The name is legacy; it does NOT mean each facet gets this budget.
+    # Actual per-facet budget is: α_f = per_facet_alpha / |F(q)|
+    per_facet_alpha: float = 0.05  # α_query: Query-level FWER target (LEGACY NAME)
     per_facet_configs: Dict[str, FacetConfig] = field(default_factory=dict)
 
     # Budget Control (Section 4.3)
@@ -73,7 +89,8 @@ class SafeCoverConfig:
 
     # Algorithm Parameters
     dual_tolerance: float = 1e-6  # Tolerance for dual LP convergence
-    coverage_threshold: float = 0.15  # Minimum coverage threshold
+    # NOTE: coverage_threshold is for auxiliary pre-screen only, not p-value decisions
+    coverage_threshold: float = 0.15  # Auxiliary pre-screen threshold (not for p-value decisions)
 
     # Abstention Control (Section 4.6)
     early_abstain: bool = True  # Abstain early if LB_dual > B_ctx
@@ -97,6 +114,32 @@ class SafeCoverConfig:
     # P-Value Configuration
     pvalue_mode: str = "deterministic"  # "deterministic" or "randomized"
     label_noise_epsilon: float = 0.0  # ε for label-noise robust p-values
+
+    # Feasibility Policy for Deterministic P-Values (Section 3.4)
+    # When alpha_bar_f < 1/(n_b+1), apply in order:
+    # 1) Switch to randomized for that facet
+    # 2) Merge bins per policy (retriever_score → length → facet_type)
+    # 3) Abstain with reason="pvalue_infeasible_small_bin"
+    feasibility_auto_switch_to_randomized: bool = True  # Auto-switch to randomized when infeasible
+    feasibility_auto_merge_bins: bool = True  # Auto-merge bins when infeasible
+
+    # Facet Pre-Pruning (OFF by default - Section 11.3)
+    # NOTE: Pre-pruning drops hypotheses after seeing verifier evidence, which
+    # changes the multiple-testing family. It is OFF by default and out-of-scope
+    # for FWER guarantees. If enabled, treat it as part of the miner (pre-verification).
+    enable_spurious_facet_prepass: bool = False  # OFF by default
+    spurious_alpha: float = 1e-4  # Threshold for spurious facet filtering
+    spurious_max_tests: int = 3  # Max tests per facet in pre-pass
+
+    @property
+    def alpha_query(self) -> float:
+        """Alias for per_facet_alpha with correct semantic name."""
+        return self.per_facet_alpha
+
+    @alpha_query.setter
+    def alpha_query(self, value: float) -> None:
+        """Set the query-level FWER target."""
+        self.per_facet_alpha = value
 
 
 @dataclass
@@ -157,13 +200,22 @@ class CalibrationConfig:
 
 @dataclass
 class NLIConfig:
-    """Configuration for NLI/Cross-encoder scoring."""
+    """
+    Configuration for NLI/Cross-encoder scoring.
+
+    NOTE on score_threshold: This is used ONLY for optional computational
+    pre-screening (pruning candidates before full p-value computation).
+    All coverage decisions in Safe-Cover are made by CALIBRATED P-VALUES,
+    not raw NLI scores. Do not confuse this with coverage thresholds.
+    """
     model_name: str = "microsoft/deberta-v2-xlarge-mnli"
     batch_size: int = 32
     max_length: int = 512
     use_cache: bool = True
     cache_size: int = 10000
-    score_threshold: float = 0.9
+    # NOTE: score_threshold is for PRE-SCREEN only (computational pruning).
+    # Coverage decisions use calibrated p-values, NOT this threshold.
+    score_threshold: float = 0.9  # Pre-screen threshold (NOT for coverage decisions)
 
 
 @dataclass

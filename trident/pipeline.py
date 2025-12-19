@@ -263,13 +263,22 @@ class TridentPipeline:
         self.telemetry = TelemetryTracker(config.telemetry)
         
         # Initialize mode-specific components
+        #
+        # DISTRIBUTIONAL CONSTRAINT (Safe-Cover):
+        # VQC and BwK are DISABLED in Safe-Cover mode because they change the
+        # candidate distribution and would invalidate selection-conditional
+        # calibration. They may ONLY be used in Pareto mode (which is uncertified).
+        #
+        # The fallback path (Safe-Cover → Pareto) may use VQC/BwK, but the
+        # resulting answer is explicitly marked as uncertified (fallback_from='safe_cover').
+        #
         if config.mode in ["safe_cover", "both"]:
             self.safe_cover_algo = SafeCoverAlgorithm(
                 config=config.safe_cover,
                 calibrator=self.calibrator
             )
             self.drift_monitor = DriftMonitor(config.safe_cover) if config.safe_cover.monitor_drift else None
-            
+
         if config.mode in ["pareto", "both"]:
             self.pareto_optimizer = ParetoKnapsackOptimizer(config.pareto)
             if config.pareto.use_vqc:
@@ -277,11 +286,10 @@ class TridentPipeline:
             if config.pareto.use_bwk:
                 self.bwk = BwKController(config.pareto)
 
-        # CRITICAL FIX: Initialize VQC and BwK if Safe-Cover might fall back to Pareto and those features are enabled
-        # This ensures components are available even if the primary mode doesn't require them,
-        # but a fallback might.
+        # Initialize VQC/BwK for fallback path (Safe-Cover → Pareto).
+        # IMPORTANT: These are ONLY used in the fallback (uncertified) path.
+        # Safe-Cover certificates are NEVER generated when VQC/BwK are active.
         if config.mode == "safe_cover" and config.safe_cover.fallback_to_pareto:
-            # Initialize the optimizer if fallback is enabled, regardless of primary mode initialization
             if not hasattr(self, 'pareto_optimizer'):
                 self.pareto_optimizer = ParetoKnapsackOptimizer(config.pareto)
             if config.pareto.use_vqc and not hasattr(self, 'vqc'):

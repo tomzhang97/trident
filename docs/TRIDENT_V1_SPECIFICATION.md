@@ -13,7 +13,7 @@ This document is a **review-ready, self-contained specification** of TRIDENT v1.
     2. **Pareto (uncertified):** optimizes a quality–cost tradeoff under explicit budgets (`budget`, `max_evidence_tokens`, `max_units`) and reports **Pareto curves**.
 - **Engineering realism (aligned to code).**
     - Retrieval: dense `facebook/contriever` with top-k candidate pool (default: 100) + cross-encoder reranking (`cross-encoder/ms-marco-MiniLM-L-6-v2`, rerank_top_k=20).
-    - Verifier: NLI `microsoft/deberta-v2-xlarge-mnli` with thresholding (default: `score_threshold=0.9`) and LRU caching (10,000 entries).
+    - Verifier: NLI `microsoft/deberta-v2-xlarge-mnli` with thresholding (default: `score_threshold=0.9` for pre-screen only) and LRU caching (10,000 entries).
     - Calibration: **conformal** (v1.0) with **Mondrian bins** (6 facet types × 3 length buckets × 3 retriever score buckets = 54 bins); `n_min=50` controls bin feasibility.
     - Telemetry: latency/tokens, cache stats, GPU utilization, per-stage traces, and per-facet certificate logs.
 
@@ -48,6 +48,14 @@ For each facet–passage pair (f, p), define the sufficiency event:
 
 This is the event the verifier and calibration are trying to make auditable; it is **not** defined in terms of downstream EM/F1.
 
+**Operational Σ(p,f) Definition (Span-Level):**
+- **ENTITY:** Mention of entity e (canonical or alias) with correct type is present in passage.
+- **RELATION:** Span includes e₁, e₂ and predicates the typed relation (explicit or implicit).
+- **TEMPORAL:** Event + normalized time; ISO-8601 within ±δ tolerance.
+- **NUMERIC:** Quantity + value; unit-normalized within relative ε tolerance.
+- **BRIDGE_HOP1:** (e₁, r₁, e_bridge) is asserted in the passage.
+- **BRIDGE_HOP2:** (e_bridge, r₂, e₂) is asserted in the passage.
+
 ### 1.4 Verifier scores → calibrated p-values
 
 A verifier (NLI) produces a score `s(p, f)`. A conformal calibrator (with Mondrian binning) maps `s(p, f)` to a p-value `π(p, f)` estimating the risk of **false sufficiency** (i.e., `Pr[¬Σ(p, f)]`) under the bin's exchangeability assumptions.
@@ -60,35 +68,21 @@ A verifier (NLI) produces a score `s(p, f)`. A conformal calibrator (with Mondri
 
 Safe-Cover is the "auditable" regime: it aims to cover all mined facets when possible and produce a trace that a reviewer can follow.
 
-### 2.1 α semantics (code-aligned)
+### 2.1 Alpha semantics (authoritative, code-aligned)
 
-The code exposes the following configuration in `SafeCoverConfig`:
+The code exposes `safe_cover.per_facet_alpha` (legacy name). We interpret it as the **query-level** FWER target:
 
 ```python
-# trident/config.py
-@dataclass
-class SafeCoverConfig:
-    per_facet_alpha: float = 0.05      # Query-level FWER target (α_query)
-    token_cap: Optional[int] = 2000    # Hard context budget cap (B_ctx)
-    max_evidence_tokens: Optional[int] = None
-    max_units: Optional[int] = None
-    early_abstain: bool = True
-    abstain_on_infeasible: bool = False
-    stop_on_budget: bool = True
-    dual_tolerance: float = 1e-6
-    coverage_threshold: float = 0.15
-    fallback_to_pareto: bool = True
-    pvalue_mode: str = "deterministic"  # or "randomized"
-    monitor_drift: bool = False
-    psi_threshold: float = 0.25
+# trident/config.py - SafeCoverConfig
+# NOTE: per_facet_alpha is the QUERY-LEVEL FWER target (α_query).
+# The name is legacy; it does NOT mean each facet gets this budget.
+
+alpha_query := safe_cover.per_facet_alpha  # (legacy name; alias alpha_query exposed)
+alpha_f := alpha_query / |F(q)|             # per-facet allocation
+alpha_bar_f := alpha_f / T_f                # per-test threshold
 ```
 
-The interpretation is:
-- **Query-level target:** `α_query := safe_cover.per_facet_alpha`
-- **Per-facet allocation:** `αf := α_query / |F(q)|`
-- **Per-test threshold:** `ᾱf := αf / Tf`, where `Tf` is the **maximum number of verifier probes** allowed for that facet.
-
-This mapping is logged in certificates to prevent silent misconfiguration.
+These three values are logged in every certificate. Mis-tuning `per_facet_alpha` as a true "per-facet alpha" will inflate FWER.
 
 ### 2.2 Fixed coverage sets
 
@@ -100,12 +94,22 @@ C(p) = {f ∈ F : π(p, f) ≤ ᾱf}
 
 Coverage sets are **fixed ex-ante** because `ᾱf` and `Tf` are predeclared. This is what prevents "moving thresholds" and makes the selection trace stable and reviewable.
 
-### 2.3 Feasibility guard for deterministic p-values (must-have)
+### 2.3 Discrete feasibility policy for deterministic p-values (must-have)
 
-Safe-Cover must enforce a **discrete feasibility guard**:
+Safe-Cover enforces a **discrete feasibility guard**. For any facet f and active bin b:
 
-- If deterministic p-values are used, and `ᾱf < 1/(n_b + 1)` in any bin actually used for facet f, then certification is **impossible** for that facet under that bin.
-- The system must apply a policy: switch that facet to randomized p-values, or merge bins until feasible, or abstain with a clear reason (logged).
+**If `alpha_bar_f < 1/(|N_b|+1)` then apply, in order:**
+1. Switch `pvalue_mode="randomized"` for facet f; else
+2. Merge bins per `merge_order = retriever_score → length → facet_type` until feasible; else
+3. Abstain with `reason="pvalue_infeasible_small_bin"`
+
+We log the branch taken and the final `bin_size`.
+
+```python
+# trident/config.py - SafeCoverConfig
+feasibility_auto_switch_to_randomized: bool = True  # Auto-switch to randomized when infeasible
+feasibility_auto_merge_bins: bool = True  # Auto-merge bins when infeasible
+```
 
 This prevents "Safe-Cover fails everywhere" artifacts that look like algorithmic weakness but are actually calibration arithmetic.
 
@@ -123,14 +127,30 @@ Implementation uses **cost-effective greedy** with deterministic tie-breaks (inc
 - per-facet certificates for each covered facet,
 - and an abstention reason if infeasible or budget-exhausted.
 
-### 2.5 Early abstention with a dual lower bound
+### 2.5 Dual lower bound inside greedy (iteration-level)
 
-Safe-Cover computes a **dual lower bound** `LB_dual` on the remaining uncovered facets and compares it against the **remaining** budget each iteration. If `LB_dual > B_remaining`, the system abstains with an infeasibility certificate and logs the bound trace.
+At **each greedy iteration**, compute (or incrementally update) `LB_dual` on the **residual uncovered facets** and compare against `B_ctx - cost_ctx` (remaining budget).
 
-**Abstention reasons** (from code):
-- `NO_COVERING_PASSAGES` - No passage covers an uncovered facet
-- `INFEASIBILITY_PROVEN` - Dual lower bound exceeds budget
-- `BUDGET_EXHAUSTED` - No candidates fit within remaining budget
+If `LB_dual > B_ctx - cost_ctx`, abstain with `INFEASIBILITY_PROVEN`, logging `(LB_dual, B_remaining)`.
+
+### 2.6 Abstention reasons
+
+```python
+class AbstentionReason(Enum):
+    NONE = "none"
+    NO_COVERING_PASSAGES = "no_covering_passages"  # ∃f ∈ F_uncov with no p : f ∈ C(p)
+    INFEASIBILITY_PROVEN = "infeasibility_proven"  # LB_dual > B_ctx - cost_ctx
+    BUDGET_EXHAUSTED = "budget_exhausted"  # No candidates fit within remaining budget
+    PVALUE_INFEASIBLE_SMALL_BIN = "pvalue_infeasible_small_bin"  # α_bar_f < 1/(n_b+1) cannot resolve
+```
+
+### 2.7 Distributional constraint (Safe-Cover)
+
+**`use_vqc=False`, `use_bwk=False` in Safe-Cover mode.**
+
+VQC (Verifier-driven Query Compiler) and BwK (Bandits with Knapsacks) are **DISABLED** in Safe-Cover mode because they change the candidate distribution and invalidate selection-conditional calibration.
+
+They may be used in Pareto mode only. The fallback path (Safe-Cover → Pareto) may use VQC/BwK, but the resulting answer is explicitly marked as uncertified (`fallback_from='safe_cover'`).
 
 ---
 
@@ -138,7 +158,23 @@ Safe-Cover computes a **dual lower bound** `LB_dual` on the remaining uncovered 
 
 TRIDENT does **not** claim distribution-free validity under arbitrary adaptivity. Instead it makes the validity conditions explicit and auditable.
 
-### 3.1 Calibration configuration (code-aligned)
+### 3.1 BuildCalibrator (selection-conditional replay)
+
+Replay the deployed retrieval stack on a labeled corpus:
+
+1. For each query q in D_cal:
+   - a) Retrieve with the exact retriever + index snapshot
+   - b) Rerank/shortlist with the exact shortlister, T_f, and tie-breaks
+   - c) Score every shortlisted (p, f) with the deployed verifier
+   - d) Place negative scores (Σ=0) into the Mondrian bin b(p, f)
+
+2. Enforce `n_min` via the fixed merge order (score → length → type); store `|N_b|` and sorted scores
+
+**Versions recorded:** `retriever_hash`, `index_snapshot_id`, `shortlister_hash`, `verifier_hash`, `bin_spec_hash`, `calibration_corpus_hash`
+
+Certificates are **invalid** if any version differs.
+
+### 3.2 Calibration configuration (code-aligned)
 
 ```python
 # trident/calibration.py
@@ -152,7 +188,7 @@ class CalibrationConfig:
     label_noise_epsilon: float = 0.0
 ```
 
-### 3.2 Mondrian binning strategy (54-bin grid)
+### 3.3 Mondrian binning strategy (54-bin grid)
 
 ```python
 facet_types = ["ENTITY", "RELATION", "TEMPORAL", "NUMERIC", "BRIDGE_HOP1", "BRIDGE_HOP2"]
@@ -162,7 +198,7 @@ retriever_score_buckets = [(0.0, 0.33, "low"), (0.33, 0.67, "medium"), (0.67, 1.
 # Example: "ENTITY_short_high", "RELATION_medium_low"
 ```
 
-### 3.3 Conformal p-value computation
+### 3.4 Conformal p-value computation
 
 **Deterministic Mode** (Conservative):
 ```
@@ -180,18 +216,6 @@ Property: Exact super-uniformity (Pr[π_rand ≤ t | ¬Σ] = t)
 1. If `n_negatives < n_min` (50), merge to coarser bin
 2. **Order of Merging**: retriever_score → length → facet_type
 3. Recursively merge until all bins have ≥ n_min negatives
-
-### 3.4 Selection-conditional calibration (versioned)
-
-Calibration must be **selection-conditional** on the deployed retrieval/shortlisting policy. TRIDENT therefore treats the following as part of the certificate contract and logs versions/hashes:
-
-- retriever encoder + index snapshot,
-- reranker model/version,
-- verifier model/version,
-- bin specification + `n_min` policy,
-- calibration corpus identifier.
-
-Certificates are **invalid** if these versions differ at test time.
 
 ### 3.5 Monitoring is future-episode only
 
@@ -233,20 +257,7 @@ class ParetoConfig:
 
 Pareto reports empirical performance and cost curves; it does not emit coverage certificates.
 
-### 4.2 Named configuration families (from code)
-
-```python
-# trident/config_families.py
-PARETO_CHEAP_1500 = ParetoConfig(budget=1500, max_units=8, use_vqc=False, use_bwk=False)
-PARETO_CHEAP_2000 = ParetoConfig(budget=2000, max_units=10, use_vqc=False, use_bwk=False)
-PARETO_MID_2500 = ParetoConfig(budget=2500, max_units=12, use_vqc=True, use_bwk=True)
-
-SAFE_COVER_LOOSE_4000 = SafeCoverConfig(per_facet_alpha=0.05, max_evidence_tokens=4000, max_units=16)
-SAFE_COVER_EQUAL_2500 = SafeCoverConfig(per_facet_alpha=0.02, max_evidence_tokens=2500, max_units=12)
-SAFE_COVER_EQUAL_2000 = SafeCoverConfig(per_facet_alpha=0.02, max_evidence_tokens=2000, max_units=10)
-```
-
-### 4.3 Optional modules (explicitly scoped)
+### 4.2 Optional modules (explicitly scoped)
 
 **VQC (Verifier-driven Query Compiler):**
 - Triggers when: `use_vqc=True` AND uncovered_facets AND cost < 80% budget
@@ -258,13 +269,42 @@ SAFE_COVER_EQUAL_2000 = SafeCoverConfig(per_facet_alpha=0.02, max_evidence_token
 - Uses consumption-aware UCB
 - Exploration bonus: `bwk_exploration_bonus` (default: 0.1)
 
-These modules are **Pareto-only** unless explicitly redesigned for Safe-Cover with multi-round α-spending.
+These modules are **Pareto-only**. They must NOT be used with Safe-Cover unless explicitly redesigned for multi-round α-spending.
 
 ---
 
-## 5) Runtime System & SLO Controls (Implementation View)
+## 5) Certificate Schema (Explicit)
 
-### 5.1 Retrieval + reranking (current stack)
+Per covered facet, the certificate contains:
+
+```python
+@dataclass
+class CoverageCertificate:
+    facet_id: str           # Unique identifier for the facet
+    facet_type: str         # ENTITY, RELATION, TEMPORAL, NUMERIC, BRIDGE_HOP1, BRIDGE_HOP2
+    passage_id: str         # ID of the passage covering this facet
+    p_value: float          # Calibrated p-value for this (passage, facet) pair
+    threshold: float        # ᾱ_f used for this coverage decision
+    alpha_facet: float      # α_f (per-facet error budget = α_query / |F(q)|)
+    alpha_query: float      # Query-level FWER target
+    t_f: int               # Max tests per facet (Bonferroni budget T_f)
+    bin: str               # Calibration bin key used
+    bin_size: int          # Number of negatives in the calibration bin
+    pvalue_mode: str       # "deterministic" or "randomized"
+    calibrator_version: str
+    retriever_version: str
+    shortlister_version: str
+    verifier_version: str
+    timestamp: float       # Unix timestamp
+```
+
+Certificates are **INVALID** if any version differs from calibration time.
+
+---
+
+## 6) Runtime System & SLO Controls (Implementation View)
+
+### 6.1 Retrieval + reranking (current stack)
 
 ```python
 # trident/retrieval.py
@@ -283,7 +323,7 @@ class RetrievalConfig:
 - **Sparse**: BM25 (k1=1.2, b=0.75)
 - **Hybrid**: Reciprocal rank fusion (alpha=0.5)
 
-### 5.2 Verification and caching
+### 6.2 Verification and caching
 
 ```python
 # trident/nli_scorer.py
@@ -294,6 +334,8 @@ class NLIConfig:
     max_length: int = 512
     use_cache: bool = True
     cache_size: int = 10000
+    # NOTE: score_threshold is for PRE-SCREEN only (computational pruning).
+    # Coverage decisions use calibrated p-values, NOT this threshold.
     score_threshold: float = 0.9
 ```
 
@@ -304,7 +346,7 @@ sufficiency_score = entailment_score - 0.5 * contradiction_score
 
 **Cache:** LRU cache keyed by `(passage_id, facet_id, model_version)` to stabilize cost and enable fair comparisons.
 
-### 5.3 Token/latency accounting (must be explicit)
+### 6.3 Token/latency accounting and generation budget
 
 TRIDENT reports decomposed usage:
 
@@ -314,35 +356,8 @@ TRIDENT reports decomposed usage:
 - generation tokens,
 - and end-to-end latency percentiles.
 
-This avoids the common confusion where "token cap" is mistaken for total prompt+system tokens.
-
----
-
-## 6) Interfaces (Reproducibility and Audits)
-
-### 6.1 Inputs (conceptual)
-
-- Query + mined facets
-- Mode = {safe_cover, pareto, both}
-- Budgets and caps
-- Calibrator/version identifiers
-
-### 6.2 Outputs (from code)
-
-```python
-# trident/pipeline.py
-class PipelineOutput:
-    answer: str
-    selected_passages: List[Dict]  # pid, text, cost, covered_facets
-    certificates: Optional[List]   # For Safe-Cover only
-    abstained: bool
-    tokens_used: int
-    latency_ms: float
-    metrics: Dict[str, float]
-    mode: str                      # "safe_cover" or "pareto"
-    facets: List[Dict]
-    trace: Dict                    # Telemetry
-```
+**Generation budget (B_gen):**
+`B_gen` is enforced at decode time (`max_new_tokens`). It is NOT part of the covering LP and does not affect dual-LB soundness. We log `hit_max_new_tokens: {true|false}`.
 
 ---
 
@@ -350,8 +365,9 @@ class PipelineOutput:
 
 1. **Greedy approximation for set cover** holds for Safe-Cover **because** C(p) sets are fixed ex-ante.
 2. **Risk control semantics** apply to the calibrated sufficiency tests **under the stated calibration contract** (selection-conditional, version-matched).
-3. **Dual-LB abstention** is sound when computed on the residual uncovered facets and compared against remaining budget.
+3. **Dual-LB abstention** is sound when computed on the residual uncovered facets and compared against remaining budget at each iteration.
 4. Pareto is optimization-first and reports empirical Pareto curves; no formal certificates are claimed there.
+5. **Holm adjustment is reporting-only.** If mentioned, it is **post-hoc reporting** and does **NOT** alter coverage sets or greedy selection.
 
 ---
 
@@ -360,12 +376,10 @@ class PipelineOutput:
 ### 8.1 Supported datasets
 
 ```python
-# Loaded via HuggingFace or custom loaders
-# Auto-detection from data_path
 SUPPORTED_DATASETS = {
     'hotpot_qa': 'hotpot_qa',           # HotpotQA (fullwiki)
     'musique': 'musique',               # MuSiQue
-    '2wiki': '2WikiMultiHopQA',         # 2WikiMultiHopQA (NEW)
+    '2wiki': '2WikiMultiHopQA',         # 2WikiMultiHopQA
     'natural_questions': 'natural_questions',
     'trivia_qa': 'trivia_qa',
 }
@@ -374,7 +388,6 @@ SUPPORTED_DATASETS = {
 ### 8.2 Metrics computed
 
 ```python
-# trident/evaluation.py
 @dataclass
 class EvaluationMetrics:
     exact_match: float          # Exact match accuracy
@@ -388,45 +401,61 @@ class EvaluationMetrics:
     coverage_rate: float       # Average facet coverage
 ```
 
-### 8.3 Baselines (from code)
+### 8.3 Baselines
 
 ```python
-# baselines/full_baseline_interface.py
 BASELINES = {
-    'selfrag': FullSelfRAGAdapter,      # Self-RAG with reflection tokens
-    'graphrag': FullGraphRAGAdapter,    # Graph-based hierarchical RAG
-    'ketrag_reimpl': FullKETRAGReimplAdapter,  # KET-RAG (reimplemented)
-    'ketrag_official': FullKETRAGAdapter,      # KET-RAG (official wrapper)
-    'vanillarag': FullVanillaRAGAdapter,       # Simple dense retrieval
-    'hipporag': FullHippoRAGAdapter,           # HippoRAG
+    'selfrag': FullSelfRAGAdapter,
+    'graphrag': FullGraphRAGAdapter,
+    'ketrag_reimpl': FullKETRAGReimplAdapter,
+    'ketrag_official': FullKETRAGAdapter,
+    'vanillarag': FullVanillaRAGAdapter,
+    'hipporag': FullHippoRAGAdapter,
 }
 ```
 
-### 8.4 Primary evaluation benchmarks
+### 8.4 Evaluation/ablation additions (for reviewer trust)
 
-- **Benchmarks:** HotpotQA, 2WikiMultiHopQA, MuSiQue
-- **Models:** Meta-Llama-3-8B-Instruct and Qwen3-8B (configurable)
-- **Baselines:** VanillaRAG, Self-RAG, HippoRAG, GraphRAG, KET-RAG
-- **Metrics:** EM/F1 + abstention rate; cost (token decomposition) + latency (mean/median/p95)
-- **Safe-Cover audit:** certificate validity checks, infeasibility abstention analysis
-- **Pareto curves:** quality vs evidence tokens / end-to-end latency across budgets
+- **Miner recall estimate `R_miner`** on a labeled subset, reported next to EM/F1
+- **Bin feasibility rate** (fraction of facets that needed randomization/merge)
+- **Anti-conservativeness check:** simulate with oracle label buffer and report empirical FWER vs target
+- **Pareto reproducibility:** publish YAML configs & seeds for each Pareto point; show per-stage latency breakdown
 
 ---
 
-## 9) Practical Considerations & Risks (Reality-checked)
+## 9) Facet Pre-Pruning (§11.3) — Out of Scope for Guarantees
 
-- **Facet miner recall limits what Safe-Cover can certify.** Report miner recall estimate.
-- **Calibration bins can be too small.** Enforce feasibility guard; log bin sizes (n_min=50).
-- **Token caps must be unambiguous.** Separate evidence cap from total prompt tokens.
-- **Determinism matters.** Stable tie-breaks and version logging are required for paper-grade reproducibility.
+Facet pre-pruning drops hypotheses **after** seeing verifier evidence, which changes the multiple-testing family.
+
+**Policy (code-aligned):**
+```python
+# trident/config.py - SafeCoverConfig
+# Facet Pre-Pruning (OFF by default - Section 11.3)
+# NOTE: Pre-pruning drops hypotheses after seeing verifier evidence, which
+# changes the multiple-testing family. It is OFF by default and out-of-scope
+# for FWER guarantees. If enabled, treat it as part of the miner (pre-verification).
+enable_spurious_facet_prepass: bool = False  # OFF by default
+spurious_alpha: float = 1e-4
+spurious_max_tests: int = 3
+```
+
+If you keep it enabled, treat it as **part of the miner** (pre-verification) or require it to be monotone and external.
 
 ---
 
-## 10) What's New (Positioning, kept honest)
+## 10) Config ↔ Math Mapping Table
 
-- **Not just "verify then answer."** TRIDENT makes verification **calibrated and auditable**, and separates certified vs throughput regimes cleanly.
-- **Not just "graph/memory RAG."** TRIDENT's organizing principle is **budgeted, verifier-grounded selection**, compatible with many retrieval backends.
-- **Operational accountability.** Versioned calibration + certificate logs + dual-bound abstention make it suited to settings where "why did you trust this evidence?" matters.
+| Math Symbol | Config Field | Default | Description |
+|-------------|--------------|---------|-------------|
+| α_query | `safe_cover.per_facet_alpha` | 0.05 | Query-level FWER target |
+| α_f | Computed: `alpha_query / \|F(q)\|` | - | Per-facet allocation |
+| ᾱ_f | Computed: `alpha_f / T_f` | - | Per-test threshold |
+| T_f | `per_facet_configs[f].max_tests` | 10 | Max tests per facet |
+| B_ctx | `safe_cover.token_cap` | 2000 | Context budget cap |
+| N_min | `calibration.n_min` | 50 | Min negatives per bin |
+| ε | `calibration.label_noise_epsilon` | 0.0 | Label noise rate |
+| B_pareto | `pareto.budget` | 2000 | Pareto mode budget |
+| α_relaxed | `pareto.relaxed_alpha` | 0.3 | Relaxed coverage threshold |
 
 ---
 
@@ -436,20 +465,23 @@ BASELINES = {
 
 Priority is a tuple:
 ```
-(|C(p) \ Covered| / c(p), -c(p), -mean_{f ∈ C(p) \ Covered} π(p,f))
+(|C(p) \ Covered| / c(p), -c(p), -mean_{f ∈ C(p) \ Covered} π(p,f), pid)
 ```
-(i.e., coverage-per-token, then cheaper, then smaller mean p-value).
+(i.e., coverage-per-token, then cheaper, then smaller mean p-value, then ascending passage ID for determinism across shards).
 
-### 11.2 Facet definitions
+### 11.2 Named configuration families
 
-- **ENTITY:** canonical mention resolution present.
-- **RELATION:** typed predicate with subject/object roles.
-- **TEMPORAL/NUMERIC:** compatible units and normalization.
-- **BRIDGE:** existence of a 2-hop chain (E₁ → E' → E₂) with type-consistent schema and temporal compatibility.
+```python
+# Pareto configs
+PARETO_CHEAP_1500 = ParetoConfig(budget=1500, max_units=8, use_vqc=False, use_bwk=False)
+PARETO_CHEAP_2000 = ParetoConfig(budget=2000, max_units=10, use_vqc=False, use_bwk=False)
+PARETO_MID_2500 = ParetoConfig(budget=2500, max_units=12, use_vqc=True, use_bwk=True)
 
-### 11.3 Spurious facet pre-pass
-
-Allocate `α̃f << ᾱf` (e.g., 1e-4) with `Tf_pre ≤ 3`; drop facets failing all pre-tests; log drops.
+# Safe-Cover configs
+SAFE_COVER_LOOSE_4000 = SafeCoverConfig(per_facet_alpha=0.05, max_evidence_tokens=4000, max_units=16)
+SAFE_COVER_EQUAL_2500 = SafeCoverConfig(per_facet_alpha=0.02, max_evidence_tokens=2500, max_units=12)
+SAFE_COVER_EQUAL_2000 = SafeCoverConfig(per_facet_alpha=0.02, max_evidence_tokens=2000, max_units=10)
+```
 
 ---
 
@@ -458,12 +490,12 @@ Allocate `α̃f << ᾱf` (e.g., 1e-4) with `Tf_pre ≤ 3`; drop facets failing a
 | Component | Default Model/Parameter | Key Configurable | Range/Options |
 |-----------|------------------------|------------------|----------------|
 | **Retrieval** | facebook/contriever + ms-marco-MiniLM | top_k=100, rerank_top_k=20 | dense/sparse/hybrid |
-| **NLI/Verifier** | microsoft/deberta-v2-xlarge-mnli | batch_size=32, cache_size=10000 | score_threshold=0.9 |
+| **NLI/Verifier** | microsoft/deberta-v2-xlarge-mnli | batch_size=32, cache_size=10000 | Pre-screen threshold=0.9 |
 | **Calibration** | Mondrian conformal (54 bins) | pvalue_mode, n_min=50 | deterministic/randomized |
-| **Safe-Cover** | FWER α=0.05, token_cap=2000 | per_facet_alpha, token_cap | 50-4000 tokens |
+| **Safe-Cover** | FWER α=0.05, token_cap=2000 | per_facet_alpha, token_cap | No VQC/BwK |
 | **Pareto** | Lazy greedy, budget=2000 | relaxed_alpha=0.3, use_vqc/bwk | 400-2500 tokens |
 | **VQC** | Query rewriting | max_vqc_iterations=3 | Pareto-only |
-| **BwK** | Contextual bandits UCB | exploration_bonus=0.1 | 4 arms |
+| **BwK** | Contextual bandits UCB | exploration_bonus=0.1 | 4 arms, Pareto-only |
 | **Baselines** | Self-RAG 7B, GraphRAG, KET-RAG | ndocs, k values | Standardized interface |
 
 ---
