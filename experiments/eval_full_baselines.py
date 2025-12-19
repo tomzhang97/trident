@@ -123,40 +123,81 @@ def convert_2wiki_example(ex: Dict) -> Dict:
     - May have 'evidences' field instead of 'supporting_facts'
     - Context may be in different formats (dict or list)
     - Types: comparison, inference, compositional, bridge
+
+    IMPORTANT: This function normalizes context to sentence-level format
+    (matching HotpotQA) for optimal SelfRAG performance. SelfRAG was trained
+    on sentence-level passages and performs better with smaller text units.
     """
     # Handle context format - 2Wiki uses similar format to HotpotQA
-    context = ex.get('context', [])
-    if isinstance(context, dict):
+    raw_context = ex.get('context', [])
+
+    if isinstance(raw_context, dict):
         # Handle dict format: {'title': [...], 'sentences': [[...], ...]}
-        titles = context.get('title', [])
-        sentences_list = context.get('sentences', [])
-        context = list(zip(titles, sentences_list))
+        titles = raw_context.get('title', [])
+        sentences_list = raw_context.get('sentences', [])
+        # Use list comprehension to ensure we get lists, not tuples
+        raw_context = [[t, s] for t, s in zip(titles, sentences_list)]
     else:
-        # Ensure context is list of [title, sentences] pairs
+        # Ensure context is list of [title, sentences] pairs with consistent format
         normalized_context = []
-        for item in context:
+        for item in raw_context:
             if isinstance(item, (list, tuple)) and len(item) >= 2:
-                normalized_context.append([item[0], item[1]])
+                title = item[0]
+                sentences = item[1]
+                # Normalize sentences to list format
+                if isinstance(sentences, str):
+                    sentences = [sentences]
+                normalized_context.append([title, sentences])
             elif isinstance(item, dict):
                 title = item.get('title', '')
                 sentences = item.get('sentences', item.get('text', ''))
                 if isinstance(sentences, str):
                     sentences = [sentences]
                 normalized_context.append([title, sentences])
-        context = normalized_context
+        raw_context = normalized_context
+
+    # Split paragraphs into sentences for optimal SelfRAG performance
+    # This matches the sentence-level format SelfRAG was trained on (HotpotQA)
+    final_context = []
+    for title, sentences in raw_context:
+        if isinstance(sentences, str):
+            # Single paragraph string - split into sentences
+            split_sents = re.split(r'(?<=[.!?])\s+', sentences.strip())
+            split_sents = [s.strip() for s in split_sents if s.strip()]
+            final_context.append([title, split_sents if split_sents else [sentences]])
+        elif isinstance(sentences, list):
+            # Check if these are already sentence-level or paragraph-level
+            if sentences:
+                avg_words = sum(len(s.split()) for s in sentences if isinstance(s, str)) / max(len(sentences), 1)
+                # If average > 25 words, likely paragraphs - split them
+                if avg_words > 25:
+                    all_sentences = []
+                    for para in sentences:
+                        if isinstance(para, str):
+                            split_sents = re.split(r'(?<=[.!?])\s+', para.strip())
+                            split_sents = [s.strip() for s in split_sents if s.strip()]
+                            all_sentences.extend(split_sents)
+                    final_context.append([title, all_sentences if all_sentences else sentences])
+                else:
+                    # Already sentence-level
+                    final_context.append([title, sentences])
+            else:
+                final_context.append([title, sentences])
+        else:
+            final_context.append([title, [str(sentences)] if sentences else []])
 
     # Handle supporting_facts - 2Wiki may use 'evidences' or 'supporting_facts'
     sf = ex.get('supporting_facts', ex.get('evidences', []))
     if isinstance(sf, dict):
         sf_titles = sf.get('title', [])
         sf_sents = sf.get('sent_id', [])
-        sf = list(zip(sf_titles, sf_sents))
+        sf = [[t, s] for t, s in zip(sf_titles, sf_sents)]  # Use lists, not tuples
 
     return {
         '_id': ex.get('_id', ex.get('id', '')),
         'question': ex.get('question', ''),
         'answer': ex.get('answer', ''),
-        'context': context,
+        'context': final_context,
         'supporting_facts': sf,
         'type': ex.get('type', 'unknown'),
         'level': ex.get('level', 'unknown'),
