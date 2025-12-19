@@ -530,8 +530,8 @@ def main():
     parser.add_argument(
         "--selfrag_max_tokens",
         type=int,
-        default=100,
-        help="Max tokens for Self-RAG generation"
+        default=512,
+        help="Max tokens for Self-RAG generation (matches TRIDENT's max_new_tokens=512)"
     )
     parser.add_argument(
         "--selfrag_gpu_memory_utilization",
@@ -701,7 +701,7 @@ def main():
                     api_key=api_key,
                     model=args.ketrag_model,
                     temperature=0.0,
-                    max_tokens=500,
+                    max_tokens=512,  # Match TRIDENT's max_new_tokens
                     skeleton_ratio=0.3,
                     max_skeleton_triples=10,
                     max_keyword_chunks=5,
@@ -727,7 +727,7 @@ def main():
                     api_key=api_key,
                     model=args.ketrag_model,
                     temperature=0.0,
-                    max_tokens=500,
+                    max_tokens=512,  # Match TRIDENT's max_new_tokens
                     use_local_llm=args.use_local_llm,
                     local_llm_model=args.local_llm_model,
                     local_llm_device=args.local_llm_device,
@@ -740,7 +740,7 @@ def main():
                     api_key=api_key,
                     model=args.vanillarag_model,
                     temperature=0.0,
-                    max_tokens=500,
+                    max_tokens=512,  # Match TRIDENT's max_new_tokens
                     top_k=args.vanillarag_top_k,
                     use_local_llm=args.use_local_llm,
                     local_llm_model=args.local_llm_model,
@@ -755,7 +755,7 @@ def main():
                     model=args.hipporag_model,
                     embedding_model=args.hipporag_embedding_model,
                     temperature=0.0,
-                    max_tokens=500,
+                    max_tokens=512,  # Match TRIDENT's max_new_tokens
                     num_to_retrieve=args.hipporag_num_retrieve,
                     save_dir=args.hipporag_save_dir,
                     use_local_llm=args.use_local_llm,
