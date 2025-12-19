@@ -394,9 +394,6 @@ class EvaluationMetrics:
 # baselines/full_baseline_interface.py
 BASELINES = {
     'selfrag': FullSelfRAGAdapter,      # Self-RAG with reflection tokens
-    'graphrag': FullGraphRAGAdapter,    # Graph-based hierarchical RAG
-    'ketrag_reimpl': FullKETRAGReimplAdapter,  # KET-RAG (reimplemented)
-    'ketrag_official': FullKETRAGAdapter,      # KET-RAG (official wrapper)
     'vanillarag': FullVanillaRAGAdapter,       # Simple dense retrieval
     'hipporag': FullHippoRAGAdapter,           # HippoRAG
 }
@@ -406,7 +403,7 @@ BASELINES = {
 
 - **Benchmarks:** HotpotQA, 2WikiMultiHopQA, MuSiQue
 - **Models:** Meta-Llama-3-8B-Instruct and Qwen3-8B (configurable)
-- **Baselines:** VanillaRAG, Self-RAG, HippoRAG, GraphRAG, KET-RAG
+- **Baselines:** VanillaRAG, Self-RAG, HippoRAG
 - **Metrics:** EM/F1 + abstention rate; cost (token decomposition) + latency (mean/median/p95)
 - **Safe-Cover audit:** certificate validity checks, infeasibility abstention analysis
 - **Pareto curves:** quality vs evidence tokens / end-to-end latency across budgets
@@ -464,7 +461,7 @@ Allocate `α̃f << ᾱf` (e.g., 1e-4) with `Tf_pre ≤ 3`; drop facets failing a
 | **Pareto** | Lazy greedy, budget=2000 | relaxed_alpha=0.3, use_vqc/bwk | 400-2500 tokens |
 | **VQC** | Query rewriting | max_vqc_iterations=3 | Pareto-only |
 | **BwK** | Contextual bandits UCB | exploration_bonus=0.1 | 4 arms |
-| **Baselines** | Self-RAG 7B, GraphRAG, KET-RAG | ndocs, k values | Standardized interface |
+| **Baselines** | Self-RAG 7B | ndocs, k values | Standardized interface |
 
 ---
 
