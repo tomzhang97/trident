@@ -31,6 +31,7 @@ class AbstentionReason(Enum):
     NO_COVERING_PASSAGES = "no_covering_passages"  # ∃f ∈ F_uncov with no p : f ∈ C(p)
     INFEASIBILITY_PROVEN = "infeasibility_proven"  # LB_dual > B_ctx - cost_ctx
     BUDGET_EXHAUSTED = "budget_exhausted"  # No candidates fit within remaining budget
+    PVALUE_INFEASIBLE_SMALL_BIN = "pvalue_infeasible_small_bin"  # α_bar_f < 1/(n_b+1) and cannot resolve
 
 
 @dataclass
@@ -40,19 +41,42 @@ class CoverageCertificate:
 
     Per Section 4.7, emitted only for facets that enter Cov via selected passages.
     Contains full audit trail for reproducibility.
+
+    Explicit Schema (per reviewer request):
+    - facet_id: Unique identifier for the facet
+    - facet_type: Type of facet (ENTITY, RELATION, TEMPORAL, NUMERIC, BRIDGE_HOP1, BRIDGE_HOP2)
+    - passage_id: ID of the passage covering this facet
+    - p_value: Calibrated p-value for this (passage, facet) pair
+    - threshold: ᾱ_f used for this coverage decision
+    - alpha_f: Per-facet error budget (α_query / |F(q)|)
+    - alpha_query: Query-level FWER target
+    - t_f: Max tests per facet (Bonferroni budget T_f)
+    - bin: Calibration bin key used for p-value computation
+    - bin_size: Number of negatives in the calibration bin
+    - pvalue_mode: "deterministic" or "randomized"
+    - calibrator_version: Hash of calibrator state
+    - retriever_version: Hash of retriever model/index
+    - shortlister_version: Hash of shortlister
+    - verifier_version: Hash of verifier model
+    - timestamp: Unix timestamp when certificate was generated
+
+    Certificates are INVALID if any version differs from calibration time.
     """
     facet_id: str
     facet_type: str
     passage_id: str
     p_value: float
-    threshold: float  # ᾱ_f used for this coverage decision
+    threshold: float  # ᾱ_f used for this coverage decision
     alpha_facet: float  # α_f (per-facet error budget)
     alpha_query: float  # α_query (query-level FWER target)
     t_f: int  # Max tests per facet (Bonferroni budget)
     bin: str  # Calibration bin used
-    calibrator_version: str
-    verifier_version: str
-    retriever_version: str
+    bin_size: int = 0  # Number of negatives in calibration bin
+    pvalue_mode: str = "deterministic"  # "deterministic" or "randomized"
+    calibrator_version: str = ""
+    retriever_version: str = ""
+    shortlister_version: str = ""  # NEW: Hash of shortlister
+    verifier_version: str = ""
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -67,9 +91,12 @@ class CoverageCertificate:
             'alpha_query': self.alpha_query,
             't_f': self.t_f,
             'bin': self.bin,
+            'bin_size': self.bin_size,
+            'pvalue_mode': self.pvalue_mode,
             'calibrator_version': self.calibrator_version,
-            'verifier_version': self.verifier_version,
             'retriever_version': self.retriever_version,
+            'shortlister_version': self.shortlister_version,
+            'verifier_version': self.verifier_version,
             'timestamp': self.timestamp
         }
 
@@ -81,6 +108,9 @@ class EpisodeKnobs:
 
     Per Section 4.1: Per query, freeze these parameters.
     No mid-episode adaptation.
+
+    All these values are logged in certificates and used to validate
+    that test-time versions match calibration-time versions.
     """
     t_f: int  # Max tests per facet
     alpha_query: float  # Query-level FWER target
@@ -89,6 +119,8 @@ class EpisodeKnobs:
     calibrator_version: str
     verifier_version: str
     retriever_version: str
+    shortlister_version: str = ""  # Hash of shortlister for selection-conditional calibration
+    pvalue_mode: str = "deterministic"  # "deterministic" or "randomized"
     frozen_at: float = field(default_factory=time.time)
 
     def get_alpha_bar(self, facet_id: str) -> float:
@@ -156,9 +188,13 @@ class SafeCoverAlgorithm:
         self.fallback_active = False
         self.fallback_scale = 0.5  # Conservative fallback multiplier (ρ ∈ [0.5, 0.9])
 
-        # Version tracking for certificates
+        # Version tracking for certificates (selection-conditional)
         self.verifier_version = getattr(calibrator, 'verifier_hash', 'v1.0')
         self.retriever_version = getattr(calibrator, 'retriever_hash', 'v1.0')
+        self.shortlister_version = getattr(calibrator, 'shortlister_hash', 'v1.0')
+        self.pvalue_mode = getattr(calibrator, 'pvalue_mode', 'deterministic')
+        if hasattr(self.pvalue_mode, 'value'):
+            self.pvalue_mode = self.pvalue_mode.value
 
     def _get_budget_cap(self) -> Optional[int]:
         """Get the effective budget cap, preferring max_evidence_tokens over token_cap."""
@@ -216,6 +252,8 @@ class SafeCoverAlgorithm:
             calibrator_version=getattr(self.calibrator, 'version', 'v1.0'),
             verifier_version=self.verifier_version,
             retriever_version=self.retriever_version,
+            shortlister_version=self.shortlister_version,
+            pvalue_mode=self.pvalue_mode,
         )
 
     def run(
@@ -495,6 +533,12 @@ class SafeCoverAlgorithm:
                 key = (best_passage.pid, facet_id)
                 info = coverage_info.get(key, {})
 
+                # Get bin size from calibrator if available
+                bin_key = info.get('bin', 'default')
+                bin_size = 0
+                if hasattr(self.calibrator, 'bins') and bin_key in self.calibrator.bins:
+                    bin_size = self.calibrator.bins[bin_key].n_negatives
+
                 certificate = CoverageCertificate(
                     facet_id=facet_id,
                     facet_type=info.get('facet_type', 'unknown'),
@@ -504,9 +548,12 @@ class SafeCoverAlgorithm:
                     alpha_facet=info.get('alpha_facet', knobs.alpha_f.get(facet_id, knobs.alpha_query)),
                     alpha_query=knobs.alpha_query,
                     t_f=knobs.t_f,
-                    bin=info.get('bin', 'default'),
+                    bin=bin_key,
+                    bin_size=bin_size,
+                    pvalue_mode=knobs.pvalue_mode,
                     calibrator_version=knobs.calibrator_version,
                     verifier_version=knobs.verifier_version,
+                    shortlister_version=knobs.shortlister_version,
                     retriever_version=knobs.retriever_version,
                 )
                 certificates.append(certificate)

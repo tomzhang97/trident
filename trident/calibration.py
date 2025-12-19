@@ -398,6 +398,65 @@ class SelectionConditionalCalibrator:
 
         return True, "feasible"
 
+    def apply_feasibility_policy(
+        self,
+        alpha_bar: float,
+        facet_type: str,
+        text_length: int,
+        retriever_score: float = 0.5,
+        auto_switch_to_randomized: bool = True,
+        auto_merge_bins: bool = True,
+    ) -> Tuple[bool, str, Optional[PValueMode]]:
+        """
+        Apply the discrete feasibility policy for deterministic p-values.
+
+        Per Section 3.4 (Feasibility Policy):
+        If alpha_bar_f < 1/(n_b+1), apply in order:
+        1) Switch pvalue_mode="randomized" for this facet; else
+        2) Merge bins per merge_order (retriever_score → length → facet_type) until feasible; else
+        3) Return infeasible with reason="pvalue_infeasible_small_bin"
+
+        Returns: (is_feasible, reason, new_pvalue_mode_for_facet)
+        """
+        bin_key = self.bin_spec.get_bin_key(facet_type, text_length, retriever_score)
+        effective_key = self.get_effective_bin(bin_key)
+
+        if effective_key not in self.bins:
+            return True, "no_calibration_data", None
+
+        bin_obj = self.bins[effective_key]
+        min_pvalue = bin_obj.min_achievable_pvalue()
+
+        if alpha_bar >= min_pvalue:
+            return True, "feasible", None
+
+        # Policy Step 1: Try switching to randomized mode
+        if auto_switch_to_randomized:
+            return True, "switched_to_randomized", PValueMode.RANDOMIZED
+
+        # Policy Step 2: Try merging bins
+        if auto_merge_bins:
+            # Force merge until feasible
+            current_key = effective_key
+            while alpha_bar < min_pvalue:
+                coarser_key = self.bin_spec.get_coarser_bin(current_key)
+                if coarser_key is None or coarser_key == current_key:
+                    break
+
+                # Check if coarser bin is feasible
+                if coarser_key in self.bins:
+                    coarser_bin = self.bins[coarser_key]
+                    min_pvalue = coarser_bin.min_achievable_pvalue()
+                    if alpha_bar >= min_pvalue:
+                        # Track the forced merge
+                        self.merged_bins[effective_key] = coarser_key
+                        return True, f"merged_to_{coarser_key}", None
+
+                current_key = coarser_key
+
+        # Policy Step 3: Cannot resolve - return infeasible
+        return False, "pvalue_infeasible_small_bin", None
+
     def to_pvalue(
         self,
         score: float,
