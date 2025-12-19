@@ -14,7 +14,7 @@ except RuntimeError:
 """
 Evaluation script for full baseline systems (Self-RAG, KET-RAG, Vanilla RAG, HippoRAG).
 
-Supports multiple datasets: HotpotQA, MuSiQue, NarrativeQA
+Supports multiple datasets: HotpotQA, MuSiQue, 2WikiMultiHopQA
 Supports both OpenAI API and local LLMs via HuggingFace
 
 Baselines:
@@ -25,11 +25,24 @@ Baselines:
     - HippoRAG: Memory-enhanced RAG with personalized PageRank
 
 Usage with OpenAI:
-    # Run all baselines
+    # Run all baselines on HotpotQA
     python eval_full_baselines.py \
         --data_path data/hotpotqa_dev_shards/shard_0.jsonl \
         --output_dir results/full_baselines \
         --baselines ketrag_reimpl selfrag vanillarag hipporag
+
+    # Run Self-RAG on 2WikiMultiHopQA (auto-detected from path)
+    python eval_full_baselines.py \
+        --data_path data/2wikimultihop_dev.json \
+        --output_dir results/2wiki_baselines \
+        --baselines selfrag
+
+    # Explicit dataset specification
+    python eval_full_baselines.py \
+        --data_path data/my_data.json \
+        --output_dir results/baselines \
+        --dataset 2wiki \
+        --baselines selfrag
 
     # KET-RAG official (uses original KET-RAG prompts and outputs)
     python eval_full_baselines.py \
@@ -103,17 +116,78 @@ def convert_musique_example(ex: Dict) -> Dict:
     }
 
 
-def load_hotpotqa_data(data_path: str, max_samples: int = None) -> List[Dict[str, Any]]:
+def convert_2wiki_example(ex: Dict) -> Dict:
+    """Convert a single 2WikiMultiHopQA example to standard format.
+
+    2WikiMultiHop format is similar to HotpotQA with some differences:
+    - May have 'evidences' field instead of 'supporting_facts'
+    - Context may be in different formats (dict or list)
+    - Types: comparison, inference, compositional, bridge
+    """
+    # Handle context format - 2Wiki uses similar format to HotpotQA
+    context = ex.get('context', [])
+    if isinstance(context, dict):
+        # Handle dict format: {'title': [...], 'sentences': [[...], ...]}
+        titles = context.get('title', [])
+        sentences_list = context.get('sentences', [])
+        context = list(zip(titles, sentences_list))
+    else:
+        # Ensure context is list of [title, sentences] pairs
+        normalized_context = []
+        for item in context:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                normalized_context.append([item[0], item[1]])
+            elif isinstance(item, dict):
+                title = item.get('title', '')
+                sentences = item.get('sentences', item.get('text', ''))
+                if isinstance(sentences, str):
+                    sentences = [sentences]
+                normalized_context.append([title, sentences])
+        context = normalized_context
+
+    # Handle supporting_facts - 2Wiki may use 'evidences' or 'supporting_facts'
+    sf = ex.get('supporting_facts', ex.get('evidences', []))
+    if isinstance(sf, dict):
+        sf_titles = sf.get('title', [])
+        sf_sents = sf.get('sent_id', [])
+        sf = list(zip(sf_titles, sf_sents))
+
+    return {
+        '_id': ex.get('_id', ex.get('id', '')),
+        'question': ex.get('question', ''),
+        'answer': ex.get('answer', ''),
+        'context': context,
+        'supporting_facts': sf,
+        'type': ex.get('type', 'unknown'),
+        'level': ex.get('level', 'unknown'),
+    }
+
+
+def load_hotpotqa_data(data_path: str, max_samples: int = None, dataset: str = None) -> List[Dict[str, Any]]:
     """Load HotpotQA/MuSiQue/2WikiMultiHop data from JSONL or JSON array files.
 
     The loader skips empty lines in JSONL files and also supports files that
     contain a single JSON array (common when exporting small evaluation shards).
 
-    Automatically detects and converts MuSiQue format (which uses 'paragraphs'
-    instead of 'context').
+    Automatically detects and converts dataset formats:
+    - MuSiQue: uses 'paragraphs' instead of 'context'
+    - 2WikiMultiHop: similar to HotpotQA but may use 'evidences' instead of 'supporting_facts'
+
+    Args:
+        data_path: Path to the data file (JSON or JSONL)
+        max_samples: Maximum number of samples to load
+        dataset: Explicit dataset name ('hotpotqa', 'musique', '2wiki'). Auto-detected if None.
     """
     path_lower = data_path.lower()
-    is_musique = 'musique' in path_lower
+
+    # Auto-detect dataset from path if not specified
+    if dataset is None:
+        if 'musique' in path_lower:
+            dataset = 'musique'
+        elif '2wiki' in path_lower or 'wikimultihop' in path_lower:
+            dataset = '2wiki'
+        else:
+            dataset = 'hotpotqa'
 
     with open(data_path, 'r') as f:
         # Peek at the first non-empty line to determine file shape
@@ -139,10 +213,14 @@ def load_hotpotqa_data(data_path: str, max_samples: int = None) -> List[Dict[str
                     continue
                 data.append(json.loads(line))
 
-    # Detect MuSiQue format: has 'paragraphs' but no 'context'
-    if data and ('paragraphs' in data[0] or is_musique):
+    # Convert based on dataset type
+    if dataset == 'musique' or (data and 'paragraphs' in data[0]):
         print(f"Detected MuSiQue format, converting {len(data)} examples...")
         data = [convert_musique_example(ex) for ex in data]
+    elif dataset == '2wiki':
+        print(f"Detected 2WikiMultiHop format, converting {len(data)} examples...")
+        data = [convert_2wiki_example(ex) for ex in data]
+    # HotpotQA format is already in the correct format, no conversion needed
 
     return data
 
@@ -352,6 +430,13 @@ def main():
         default=None,
         help="Maximum number of samples to evaluate (for testing)"
     )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=['hotpotqa', 'musique', '2wiki'],
+        default=None,
+        help="Dataset type (auto-detected from path if not specified)"
+    )
 
     # KET-RAG options
     parser.add_argument(
@@ -529,7 +614,7 @@ def main():
 
     # Load data
     print(f"Loading data from: {args.data_path}")
-    data = load_hotpotqa_data(args.data_path, args.max_samples)
+    data = load_hotpotqa_data(args.data_path, args.max_samples, args.dataset)
     print(f"Loaded {len(data)} examples")
 
     # Check API keys (only if not using local LLM)
