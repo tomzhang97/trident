@@ -9,6 +9,12 @@ from typing import Dict, List, Any
 import numpy as np
 import pandas as pd
 
+try:
+    from trident.experimental_utils import aggregate_certificate_audit
+    EXPERIMENTAL_UTILS_AVAILABLE = True
+except Exception:
+    EXPERIMENTAL_UTILS_AVAILABLE = False
+
 
 def load_shard_results(results_dir: Path) -> List[Dict[str, Any]]:
     """Load results from all shard directories."""
@@ -87,8 +93,29 @@ def aggregate_metrics(shard_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         metrics['f1_score'] = np.mean(f1_scores) if f1_scores else 0.0
         
         # Token and latency metrics
-        metrics['avg_tokens'] = np.mean([p.get('tokens_used', 0) for p in valid_predictions])
-        metrics['avg_latency_ms'] = np.mean([p.get('latency_ms', 0) for p in valid_predictions])
+        token_values = [p.get('tokens_used', 0) for p in valid_predictions]
+        evidence_values = [
+            p.get('metrics', {}).get('evidence_tokens', p.get('stats', {}).get('evidence_tokens', 0))
+            for p in valid_predictions
+        ]
+        overhead_values = [
+            max(p.get('tokens_used', 0) - p.get('metrics', {}).get('evidence_tokens', 0), 0)
+            for p in valid_predictions
+        ]
+
+        metrics['avg_tokens'] = float(np.mean(token_values)) if token_values else 0.0
+        metrics['avg_latency_ms'] = float(np.mean([p.get('latency_ms', 0) for p in valid_predictions]))
+        metrics['avg_evidence_tokens'] = float(np.mean(evidence_values)) if evidence_values else 0.0
+        metrics['avg_overhead_tokens'] = float(np.mean(overhead_values)) if overhead_values else 0.0
+
+        if token_values:
+            metrics['tokens_p50'] = float(np.percentile(token_values, 50))
+            metrics['tokens_p90'] = float(np.percentile(token_values, 90))
+            metrics['tokens_p95'] = float(np.percentile(token_values, 95))
+        if evidence_values:
+            metrics['evidence_p50'] = float(np.percentile(evidence_values, 50))
+            metrics['evidence_p90'] = float(np.percentile(evidence_values, 90))
+            metrics['evidence_p95'] = float(np.percentile(evidence_values, 95))
         
         # Mode-specific metrics
         if valid_predictions[0].get('mode') == 'safe_cover':
@@ -116,6 +143,17 @@ def aggregate_metrics(shard_results: List[Dict[str, Any]]) -> Dict[str, Any]:
     metrics['abstention_rate'] = metrics['abstained'] / metrics['total_queries']
     metrics['error_rate'] = metrics['errors'] / metrics['total_queries']
     
+    if EXPERIMENTAL_UTILS_AVAILABLE and valid_predictions:
+        mode = valid_predictions[0].get('mode', '')
+        if mode in ('safe_cover', 'trident_safe_cover'):
+            budget_cap = None
+            if shard_results and 'config' in shard_results[0]:
+                config = shard_results[0]['config']
+                safe_cover_cfg = config.get('safe_cover', {})
+                budget_cap = safe_cover_cfg.get('max_evidence_tokens') or safe_cover_cfg.get('token_cap')
+            audit_metrics = aggregate_certificate_audit(valid_predictions, budget_cap)
+            metrics['certificate_audit'] = audit_metrics.to_audit_table()
+
     return metrics
 
 
@@ -147,6 +185,12 @@ def generate_report(
     # Efficiency metrics
     report.append("\nEFFICIENCY METRICS:")
     report.append(f"  Avg Tokens Used: {metrics.get('avg_tokens', 0):.1f}")
+    report.append(f"  Tokens p50/p90/p95: {metrics.get('tokens_p50', 0):.1f}/"
+                  f"{metrics.get('tokens_p90', 0):.1f}/{metrics.get('tokens_p95', 0):.1f}")
+    report.append(f"  Avg Evidence Tokens: {metrics.get('avg_evidence_tokens', 0):.1f}")
+    report.append(f"  Evidence p50/p90/p95: {metrics.get('evidence_p50', 0):.1f}/"
+                  f"{metrics.get('evidence_p90', 0):.1f}/{metrics.get('evidence_p95', 0):.1f}")
+    report.append(f"  Avg Overhead Tokens: {metrics.get('avg_overhead_tokens', 0):.1f}")
     report.append(f"  Avg Latency (ms): {metrics.get('avg_latency_ms', 0):.1f}")
     
     # Mode-specific metrics
@@ -154,6 +198,17 @@ def generate_report(
         report.append("\nSAFE-COVER METRICS:")
         report.append(f"  Avg Coverage Rate: {metrics['avg_coverage_rate']:.3f}")
         report.append(f"  Queries with Certificates: {metrics.get('queries_with_certificates', 0)}")
+        if 'certificate_audit' in metrics:
+            audit = metrics['certificate_audit']
+            report.append("  Certificate Audit:")
+            report.append(f"    - Certificate rate: {audit['certificate_metrics']['certificate_rate']:.1%}")
+            report.append(f"    - Randomized p-values: {audit['pvalue_modes']['randomized_fraction']:.1%}")
+            report.append(f"    - Min/Median n_b: {audit['bin_coverage']['min_n_b_across_bins']:.0f}/"
+                          f"{audit['bin_coverage']['median_n_b_across_bins']:.0f}")
+            report.append(f"    - Near-threshold count: {audit['threshold_analysis']['near_threshold_count']}")
+            report.append(f"    - Abstentions (dual-LB/no-cover): {audit['abstention_breakdown']['dual_lb']:.1f}%/"
+                          f"{audit['abstention_breakdown']['no_cover']:.1f}%")
+            report.append(f"    - Avg LB margin: {audit['lb_margin']['avg_margin']:.2f}")
     
     if 'avg_utility' in metrics:
         report.append("\nPARETO METRICS:")

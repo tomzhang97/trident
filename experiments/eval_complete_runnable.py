@@ -57,6 +57,7 @@ try:
     _spec.loader.exec_module(_exp_module)
     compute_statistical_results = _exp_module.compute_statistical_results
     aggregate_certificate_audit = _exp_module.aggregate_certificate_audit
+    CalibrationProvenance = _exp_module.CalibrationProvenance
     EXPERIMENTAL_UTILS_AVAILABLE = True
 except Exception:
     EXPERIMENTAL_UTILS_AVAILABLE = False
@@ -322,6 +323,22 @@ class ExperimentRunner:
         self.logger.info("Step 5/5: Setting up evaluator...")
         self.evaluator = BenchmarkEvaluator(self.config.evaluation)
         self.logger.info("Initialization complete!")
+        self.calibration_provenance = self._load_calibration_provenance()
+
+    def _load_calibration_provenance(self) -> Optional[Dict[str, Any]]:
+        """Load optional calibration provenance metadata."""
+        if not getattr(self.args, "calibration_provenance", None):
+            return None
+        provenance_path = Path(self.args.calibration_provenance)
+        if not provenance_path.exists():
+            self.logger.warning(f"Calibration provenance not found: {provenance_path}")
+            return None
+        try:
+            with open(provenance_path, "r") as f:
+                return json.load(f)
+        except Exception as exc:
+            self.logger.warning(f"Failed to load calibration provenance: {exc}")
+            return None
         
     def _load_config(self) -> TridentConfig:
         """Load or create configuration."""
@@ -731,6 +748,7 @@ class ExperimentRunner:
     def _compute_summary(self, results: List[Dict]) -> Dict:
         """Compute summary statistics."""
         valid_results = [r for r in results if 'error' not in r]
+        non_error_results = valid_results
 
         if not valid_results:
             return {'error': 'No valid results'}
@@ -740,6 +758,7 @@ class ExperimentRunner:
         f1_scores = []
         tokens_used = []
         evidence_tokens = []
+        overhead_tokens = []
         num_units = []
         latencies = []
         abstained_count = 0
@@ -769,6 +788,7 @@ class ExperimentRunner:
             metrics = result.get('metrics', {})
             if 'evidence_tokens' in metrics:
                 evidence_tokens.append(metrics['evidence_tokens'])
+                overhead_tokens.append(max(result.get('tokens_used', 0) - metrics['evidence_tokens'], 0))
             if 'num_units' in metrics:
                 num_units.append(metrics['num_units'])
 
@@ -787,13 +807,15 @@ class ExperimentRunner:
                     seed=42,
                 )
                 statistical_metrics = {
-                    'em_ci_lower': round(stats.em_ci_lower, 4),
-                    'em_ci_upper': round(stats.em_ci_upper, 4),
-                    'f1_ci_lower': round(stats.f1_ci_lower, 4),
-                    'f1_ci_upper': round(stats.f1_ci_upper, 4),
-                    'latency_p50': round(stats.latency_p50, 4),
-                    'latency_p90': round(stats.latency_p90, 4),
-                    'latency_p95': round(stats.latency_p95, 4),
+                    'em_ci_lower': round(stats.em_ci_lower, 2),
+                    'em_ci_upper': round(stats.em_ci_upper, 2),
+                    'f1_ci_lower': round(stats.f1_ci_lower, 2),
+                    'f1_ci_upper': round(stats.f1_ci_upper, 2),
+                    'latency_p50': round(stats.latency_p50, 1),
+                    'latency_p90': round(stats.latency_p90, 1),
+                    'latency_p95': round(stats.latency_p95, 1),
+                    'tokens_p50': round(stats.tokens_p50, 0),
+                    'tokens_p95': round(stats.tokens_p95, 0),
                     'n_bootstrap': stats.n_bootstrap,
                     'n_seeds': stats.n_seeds,
                 }
@@ -805,23 +827,38 @@ class ExperimentRunner:
             'num_valid': len(valid_results),
             'num_abstained': abstained_count,
             'abstention_rate': round(abstained_count / len(valid_results), 4) if valid_results else 0,
-            'avg_em': round(np.mean(em_scores), 4) if em_scores else 0,
-            'avg_f1': round(np.mean(f1_scores), 4) if f1_scores else 0,
+            'avg_em': round(np.mean(em_scores), 2) if em_scores else 0,
+            'avg_f1': round(np.mean(f1_scores), 2) if f1_scores else 0,
             **statistical_metrics,
-            'avg_tokens_total': round(np.mean(tokens_used), 4) if tokens_used else 0,
-            'avg_latency_ms': round(np.mean(latencies), 4) if latencies else 0,
-            'total_tokens': sum(tokens_used),
+            'avg_total_tokens': round(np.mean(tokens_used), 0) if tokens_used else 0,
+            'avg_latency_ms': round(np.mean(latencies), 1) if latencies else 0,
+            'total_tokens': int(sum(tokens_used)),
             'mode': self.config.mode
         }
 
         # Add evidence token metrics if available
         if evidence_tokens:
-            summary['avg_evidence_tokens'] = round(np.mean(evidence_tokens), 4)
-            summary['total_evidence_tokens'] = sum(evidence_tokens)
+            summary['avg_evidence_tokens'] = round(np.mean(evidence_tokens), 0)
+            summary['median_evidence_tokens'] = round(float(np.median(evidence_tokens)), 0)
+            summary['p95_evidence_tokens'] = round(float(np.percentile(evidence_tokens, 95)), 0)
+            summary['total_evidence_tokens'] = int(sum(evidence_tokens))
+            summary['avg_overhead_tokens'] = round(np.mean(overhead_tokens), 0) if overhead_tokens else 0
 
         # Add num_units metrics if available
         if num_units:
             summary['avg_num_units'] = round(np.mean(num_units), 4)
+
+        if EXPERIMENTAL_UTILS_AVAILABLE and self.config.mode == "safe_cover":
+            budget_cap = (
+                self.config.safe_cover.max_evidence_tokens
+                if self.config.safe_cover.max_evidence_tokens is not None
+                else self.config.safe_cover.token_cap
+            )
+            audit_metrics = aggregate_certificate_audit(non_error_results, budget_cap)
+            summary['certificate_audit'] = audit_metrics.to_audit_table()
+
+        if self.calibration_provenance:
+            summary['calibration_provenance'] = self.calibration_provenance
 
         return summary
 
@@ -1087,6 +1124,12 @@ Examples:
     parser.add_argument("--budget_tokens", type=int, default=2000, help="Token budget (legacy, use --config_family instead)")
     parser.add_argument("--config_family", type=str, help="Named config family (e.g., pareto_cheap_1500, safe_cover_equal_2500, selfrag_base)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--calibration_provenance",
+        type=str,
+        default=None,
+        help="Optional JSON file with calibration provenance/audit metadata"
+    )
     
     # Retrieval configuration
     parser.add_argument("--retrieval_method", choices=["dense", "hybrid", "sparse"], default="dense")

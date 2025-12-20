@@ -138,6 +138,7 @@ class CertificateAuditMetrics:
                 "min_n_b_across_bins": round(float(np.min(all_mins)), 1),
                 "median_n_b_across_bins": round(float(np.median(all_medians)), 1),
                 "bins_with_data": len(bin_stats),
+                "per_bin": bin_stats,
             },
             "threshold_analysis": {
                 "near_threshold_count": self.near_threshold_count,
@@ -206,6 +207,8 @@ def aggregate_certificate_audit(
 
         # Certificate analysis
         certificates = result.get("certificates", [])
+        if not certificates:
+            certificates = result.get("metrics", {}).get("certificates_detail", [])
         if certificates:
             metrics.queries_with_certificates += 1
             metrics.total_certificates += len(certificates)
@@ -235,7 +238,10 @@ def aggregate_certificate_audit(
                         metrics.near_threshold_count += 1
 
         # Abstention analysis
-        abstention_reason = result.get("abstention_reason", "none")
+        abstention_reason = result.get(
+            "abstention_reason",
+            result.get("metrics", {}).get("abstention_reason", "none"),
+        )
         if abstention_reason == "infeasibility_proven":
             metrics.abstentions_dual_lb += 1
         elif abstention_reason == "no_covering_passages":
@@ -246,7 +252,10 @@ def aggregate_certificate_audit(
             metrics.abstentions_pvalue_infeasible += 1
 
         # LB margin
-        dual_lb = result.get("dual_lower_bound", 0.0)
+        dual_lb = result.get(
+            "dual_lower_bound",
+            result.get("metrics", {}).get("dual_lower_bound", 0.0),
+        )
         if budget_cap is not None and dual_lb < float('inf'):
             margin = budget_cap - dual_lb
             metrics.lb_margins.append(margin)
@@ -360,6 +369,9 @@ class CalibrationProvenance:
     def to_provenance_record(self) -> Dict[str, Any]:
         """Generate provenance record for documentation."""
         bin_summary = self.get_bin_summary()
+        leakage_result = (
+            self.leakage_check_result if self.leakage_check_performed else "not_checked"
+        )
         return {
             "corpus": {
                 "name": self.corpus_name,
@@ -377,7 +389,7 @@ class CalibrationProvenance:
             },
             "leakage_validation": {
                 "performed": self.leakage_check_performed,
-                "result": self.leakage_check_result,
+                "result": leakage_result,
                 "overlapping_count": len(self.overlapping_ids),
             },
             "bin_summary": bin_summary,
@@ -714,13 +726,13 @@ BASELINE_PROTOCOLS = {
         evidence_cap_tokens=0,  # No explicit cap
         evidence_cap_passages=10,
         iterative_retrieval=True,
-        total_evidence_if_iterative="Per-step, may exceed cap",
+        total_evidence_if_iterative="Total across steps (report cumulative evidence tokens)",
         generator_model="SelfRAG-Llama2-7B",
         generator_size="7B",
         max_new_tokens=512,
         temperature=0.0,
         special_modes=["Adaptive retrieval", "Critique tokens"],
-        notes="Uses [Retrieval], [Relevant], [Supported] special tokens",
+        notes="Uses [Retrieval], [Relevant], [Supported] special tokens; report cumulative evidence tokens",
     ),
     "VanillaRAG": BaselineProtocol(
         name="VanillaRAG",
@@ -783,8 +795,8 @@ def generate_baseline_protocol_table(
     lines = [
         "## Baseline Protocol Table",
         "",
-        "| Method | Retriever | k | Reranker | Evidence Cap | Generator | max_tokens | Special |",
-        "|--------|-----------|---|----------|--------------|-----------|------------|---------|",
+        "| Method | Retriever | k | Reranker | Evidence Cap | Generator | max_tokens | Decode (T/top_p) | Special |",
+        "|--------|-----------|---|----------|--------------|-----------|------------|------------------|---------|",
     ]
 
     for name, proto in protocols.items():
@@ -795,11 +807,12 @@ def generate_baseline_protocol_table(
             evidence += "*"
 
         special = ", ".join(proto.special_modes[:2]) if proto.special_modes else "-"
+        decode = f"{proto.temperature:.1f}/{proto.top_p:.2f}"
 
         lines.append(
             f"| {name} | {proto.retriever} | {proto.retriever_k} | "
             f"{proto.reranker[:15]}... | {evidence} | "
-            f"{proto.generator_size} | {proto.max_new_tokens} | {special} |"
+            f"{proto.generator_size} | {proto.max_new_tokens} | {decode} | {special} |"
         )
 
     lines.extend([
