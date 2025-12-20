@@ -417,15 +417,17 @@ def evaluate_baseline(
             seed=42,
         )
         statistical_metrics = {
-            'em_mean': round(stats.em_mean, 4),
-            'em_ci_lower': round(stats.em_ci_lower, 4),
-            'em_ci_upper': round(stats.em_ci_upper, 4),
-            'f1_mean': round(stats.f1_mean, 4),
-            'f1_ci_lower': round(stats.f1_ci_lower, 4),
-            'f1_ci_upper': round(stats.f1_ci_upper, 4),
-            'latency_p50': round(stats.latency_p50, 4),
-            'latency_p90': round(stats.latency_p90, 4),
-            'latency_p95': round(stats.latency_p95, 4),
+            'em_mean': round(stats.em_mean, 2),
+            'em_ci_lower': round(stats.em_ci_lower, 2),
+            'em_ci_upper': round(stats.em_ci_upper, 2),
+            'f1_mean': round(stats.f1_mean, 2),
+            'f1_ci_lower': round(stats.f1_ci_lower, 2),
+            'f1_ci_upper': round(stats.f1_ci_upper, 2),
+            'latency_p50': round(stats.latency_p50, 1),
+            'latency_p90': round(stats.latency_p90, 1),
+            'latency_p95': round(stats.latency_p95, 1),
+            'tokens_p50': round(stats.tokens_p50, 0),
+            'tokens_p95': round(stats.tokens_p95, 0),
             'n_bootstrap': stats.n_bootstrap,
             'n_seeds': stats.n_seeds,
         }
@@ -440,27 +442,27 @@ def evaluate_baseline(
         'abstention_rate': abstention_count / len(results) if results else 0.0,
 
         # Accuracy metrics (with proper precision: <= 2 decimals)
-        'avg_em': round(np.mean(em_scores), 4) if em_scores else 0.0,
-        'avg_f1': round(np.mean(f1_scores), 4) if f1_scores else 0.0,
+        'avg_em': round(np.mean(em_scores), 2) if em_scores else 0.0,
+        'avg_f1': round(np.mean(f1_scores), 2) if f1_scores else 0.0,
 
         # Statistical uncertainty (bootstrap 95% CIs)
         **statistical_metrics,
 
         # Query-only metrics (PRIMARY - matches original papers)
-        'avg_query_tokens': round(np.mean(query_tokens), 4) if query_tokens else 0.0,
-        'median_query_tokens': round(np.median(query_tokens), 4) if query_tokens else 0.0,
-        'avg_query_latency_ms': round(np.mean(query_latencies), 4) if query_latencies else 0.0,
-        'median_query_latency_ms': round(np.median(query_latencies), 4) if query_latencies else 0.0,
+        'avg_query_tokens': round(np.mean(query_tokens), 0) if query_tokens else 0.0,
+        'median_query_tokens': round(np.median(query_tokens), 0) if query_tokens else 0.0,
+        'avg_query_latency_ms': round(np.mean(query_latencies), 1) if query_latencies else 0.0,
+        'median_query_latency_ms': round(np.median(query_latencies), 1) if query_latencies else 0.0,
 
         # Total metrics (includes indexing)
-        'avg_total_tokens': round(np.mean(total_tokens), 4) if total_tokens else 0.0,
-        'median_total_tokens': round(np.median(total_tokens), 4) if total_tokens else 0.0,
-        'avg_total_latency_ms': round(np.mean(total_latencies), 4) if total_latencies else 0.0,
-        'median_total_latency_ms': round(np.median(total_latencies), 4) if total_latencies else 0.0,
+        'avg_total_tokens': round(np.mean(total_tokens), 0) if total_tokens else 0.0,
+        'median_total_tokens': round(np.median(total_tokens), 0) if total_tokens else 0.0,
+        'avg_total_latency_ms': round(np.mean(total_latencies), 1) if total_latencies else 0.0,
+        'median_total_latency_ms': round(np.median(total_latencies), 1) if total_latencies else 0.0,
 
         # Indexing overhead (for reference)
-        'avg_indexing_tokens': round(np.mean(indexing_tokens), 4) if indexing_tokens else 0.0,
-        'avg_indexing_latency_ms': round(np.mean(indexing_latencies), 4) if indexing_latencies else 0.0,
+        'avg_indexing_tokens': round(np.mean(indexing_tokens), 0) if indexing_tokens else 0.0,
+        'avg_indexing_latency_ms': round(np.mean(indexing_latencies), 1) if indexing_latencies else 0.0,
     }
 
     # Save results
@@ -477,18 +479,25 @@ def evaluate_baseline(
     with open(summary_file, 'w') as f:
         json.dump(summary, f, indent=2)
 
+    if EXPERIMENTAL_UTILS_AVAILABLE:
+        protocol_path = output_file.parent / "baseline_protocols.md"
+        if not protocol_path.exists():
+            protocol_table = generate_baseline_protocol_table(BASELINE_PROTOCOLS)
+            with open(protocol_path, "w") as f:
+                f.write(protocol_table)
+
     print(f"\n{baseline_name.upper()} Results:")
     # Report with proper precision (<=2 decimals) and 95% CIs per reviewer feedback
     if 'em_ci_lower' in summary:
-        print(f"  EM: {summary['avg_em']:.4f} [95% CI: {summary['em_ci_lower']:.4f}, {summary['em_ci_upper']:.4f}]")
-        print(f"  F1: {summary['avg_f1']:.4f} [95% CI: {summary['f1_ci_lower']:.4f}, {summary['f1_ci_upper']:.4f}]")
+        print(f"  EM: {summary['avg_em']:.2f} [95% CI: {summary['em_ci_lower']:.2f}, {summary['em_ci_upper']:.2f}]")
+        print(f"  F1: {summary['avg_f1']:.2f} [95% CI: {summary['f1_ci_lower']:.2f}, {summary['f1_ci_upper']:.2f}]")
     else:
-        print(f"  EM: {summary['avg_em']:.4f}")
-        print(f"  F1: {summary['avg_f1']:.4f}")
-    print(f"  Query Tokens: {summary['avg_query_tokens']:.4f}")
+        print(f"  EM: {summary['avg_em']:.2f}")
+        print(f"  F1: {summary['avg_f1']:.2f}")
+    print(f"  Query Tokens: {summary['avg_query_tokens']:.0f}")
     # Report latency percentiles p50/p90/p95 per reviewer feedback
     if 'latency_p50' in summary:
-        print(f"  Latency (p50/p90/p95): {summary['latency_p50']:.4f}/{summary['latency_p90']:.4f}/{summary['latency_p95']:.4f} ms")
+        print(f"  Latency (p50/p90/p95): {summary['latency_p50']:.1f}/{summary['latency_p90']:.1f}/{summary['latency_p95']:.1f} ms")
     else:
         print(f"  Query Latency: {summary['avg_query_latency_ms']:.1f}ms")
     print(f"  Abstention Rate: {summary['abstention_rate']:.2%}")

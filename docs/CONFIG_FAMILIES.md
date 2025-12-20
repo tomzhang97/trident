@@ -124,8 +124,9 @@ When running experiments with these configs, make sure to log:
 ### For all configs:
 - `avg_em` - Exact match accuracy
 - `avg_f1` - Token-level F1 score
-- `avg_tokens_total` - Total tokens used (evidence + answer)
-- `avg_evidence_tokens` - Evidence tokens only
+- `avg_total_tokens` - Total tokens (prompt + generation)
+- `avg_evidence_tokens` - Evidence tokens only (bounded by `max_evidence_tokens`/`token_cap`)
+- `avg_overhead_tokens` - Prompt overhead + generation tokens beyond evidence
 - `avg_latency_ms` - End-to-end latency
 
 ### For Safe-Cover configs:
@@ -204,12 +205,20 @@ The pipeline now tracks evidence tokens separately:
 result = pipeline.process_query(query, mode="pareto")
 
 # Access metrics
-total_tokens = result.tokens_used  # Evidence + answer generation
-evidence_tokens = result.metrics.get("evidence_tokens", 0)  # Evidence only
-answer_tokens = total_tokens - evidence_tokens  # Answer generation only
+total_tokens = result.tokens_used  # Prompt + completion tokens
+evidence_tokens = result.metrics.get("evidence_tokens", 0)  # Evidence only (budgeted)
+overhead_tokens = result.metrics.get("overhead_tokens", 0)  # Prompt overhead + generation
 ```
 
-This allows fair comparisons where answer budget is held constant.
+This allows fair comparisons where evidence budgets are fixed and overhead is reported separately.
+
+### Percentiles for Existing Results
+
+You can compute p50/p90/p95 for total and evidence tokens using:
+
+```bash
+python experiments/aggregate_results.py --results_dir path/to/results --output_dir path/to/results
+```
 
 ## Extending Config Families
 
