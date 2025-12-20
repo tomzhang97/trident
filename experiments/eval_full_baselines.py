@@ -80,6 +80,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from baselines.full_baseline_interface import compute_exact_match, compute_f1
 
+# Import experimental utilities for statistical reporting
+try:
+    from trident.experimental_utils import (
+        compute_statistical_results,
+        StatisticalResults,
+        BASELINE_PROTOCOLS,
+        generate_baseline_protocol_table,
+    )
+    EXPERIMENTAL_UTILS_AVAILABLE = True
+except ImportError:
+    EXPERIMENTAL_UTILS_AVAILABLE = False
+
 # Note: Baseline adapters are imported lazily in the evaluation loop
 # to avoid loading heavy dependencies (like HippoRAG) when not needed.
 # This prevents multiprocessing conflicts with libraries that initialize
@@ -386,7 +398,35 @@ def evaluate_baseline(
             traceback.print_exc()
             continue
 
-    # Compute summary statistics
+    # Compute summary statistics with bootstrap CIs (per reviewer feedback)
+    # Use <= 2 decimals for EM/F1, include latency percentiles p50/p90/p95
+    if EXPERIMENTAL_UTILS_AVAILABLE and em_scores:
+        stats = compute_statistical_results(
+            em_scores=em_scores,
+            f1_scores=f1_scores,
+            latencies_ms=query_latencies,
+            tokens=query_tokens,
+            n_bootstrap=1000,
+            confidence_level=0.95,
+            n_seeds=1,
+            seed=42,
+        )
+        statistical_metrics = {
+            'em_mean': round(stats.em_mean, 2),
+            'em_ci_lower': round(stats.em_ci_lower, 2),
+            'em_ci_upper': round(stats.em_ci_upper, 2),
+            'f1_mean': round(stats.f1_mean, 2),
+            'f1_ci_lower': round(stats.f1_ci_lower, 2),
+            'f1_ci_upper': round(stats.f1_ci_upper, 2),
+            'latency_p50': round(stats.latency_p50, 1),
+            'latency_p90': round(stats.latency_p90, 1),
+            'latency_p95': round(stats.latency_p95, 1),
+            'n_bootstrap': stats.n_bootstrap,
+            'n_seeds': stats.n_seeds,
+        }
+    else:
+        statistical_metrics = {}
+
     summary = {
         'baseline': baseline_name,
         'num_examples': len(data),
@@ -394,25 +434,28 @@ def evaluate_baseline(
         'num_abstained': abstention_count,
         'abstention_rate': abstention_count / len(results) if results else 0.0,
 
-        # Accuracy metrics
-        'avg_em': np.mean(em_scores) if em_scores else 0.0,
-        'avg_f1': np.mean(f1_scores) if f1_scores else 0.0,
+        # Accuracy metrics (with proper precision: <= 2 decimals)
+        'avg_em': round(np.mean(em_scores), 2) if em_scores else 0.0,
+        'avg_f1': round(np.mean(f1_scores), 2) if f1_scores else 0.0,
+
+        # Statistical uncertainty (bootstrap 95% CIs)
+        **statistical_metrics,
 
         # Query-only metrics (PRIMARY - matches original papers)
-        'avg_query_tokens': np.mean(query_tokens) if query_tokens else 0.0,
-        'median_query_tokens': np.median(query_tokens) if query_tokens else 0.0,
-        'avg_query_latency_ms': np.mean(query_latencies) if query_latencies else 0.0,
-        'median_query_latency_ms': np.median(query_latencies) if query_latencies else 0.0,
+        'avg_query_tokens': round(np.mean(query_tokens), 0) if query_tokens else 0.0,
+        'median_query_tokens': round(np.median(query_tokens), 0) if query_tokens else 0.0,
+        'avg_query_latency_ms': round(np.mean(query_latencies), 1) if query_latencies else 0.0,
+        'median_query_latency_ms': round(np.median(query_latencies), 1) if query_latencies else 0.0,
 
         # Total metrics (includes indexing)
-        'avg_total_tokens': np.mean(total_tokens) if total_tokens else 0.0,
-        'median_total_tokens': np.median(total_tokens) if total_tokens else 0.0,
-        'avg_total_latency_ms': np.mean(total_latencies) if total_latencies else 0.0,
-        'median_total_latency_ms': np.median(total_latencies) if total_latencies else 0.0,
+        'avg_total_tokens': round(np.mean(total_tokens), 0) if total_tokens else 0.0,
+        'median_total_tokens': round(np.median(total_tokens), 0) if total_tokens else 0.0,
+        'avg_total_latency_ms': round(np.mean(total_latencies), 1) if total_latencies else 0.0,
+        'median_total_latency_ms': round(np.median(total_latencies), 1) if total_latencies else 0.0,
 
         # Indexing overhead (for reference)
-        'avg_indexing_tokens': np.mean(indexing_tokens) if indexing_tokens else 0.0,
-        'avg_indexing_latency_ms': np.mean(indexing_latencies) if indexing_latencies else 0.0,
+        'avg_indexing_tokens': round(np.mean(indexing_tokens), 0) if indexing_tokens else 0.0,
+        'avg_indexing_latency_ms': round(np.mean(indexing_latencies), 1) if indexing_latencies else 0.0,
     }
 
     # Save results
@@ -430,13 +473,22 @@ def evaluate_baseline(
         json.dump(summary, f, indent=2)
 
     print(f"\n{baseline_name.upper()} Results:")
-    print(f"  EM: {summary['avg_em']:.4f}")
-    print(f"  F1: {summary['avg_f1']:.4f}")
-    print(f"  Query Tokens (PRIMARY): {summary['avg_query_tokens']:.1f}")
-    print(f"  Total Tokens (w/ indexing): {summary['avg_total_tokens']:.1f}")
-    print(f"  Query Latency (PRIMARY): {summary['avg_query_latency_ms']:.1f}ms")
-    print(f"  Total Latency (w/ indexing): {summary['avg_total_latency_ms']:.1f}ms")
+    # Report with proper precision (<=2 decimals) and 95% CIs per reviewer feedback
+    if 'em_ci_lower' in summary:
+        print(f"  EM: {summary['avg_em']:.2f} [95% CI: {summary['em_ci_lower']:.2f}, {summary['em_ci_upper']:.2f}]")
+        print(f"  F1: {summary['avg_f1']:.2f} [95% CI: {summary['f1_ci_lower']:.2f}, {summary['f1_ci_upper']:.2f}]")
+    else:
+        print(f"  EM: {summary['avg_em']:.2f}")
+        print(f"  F1: {summary['avg_f1']:.2f}")
+    print(f"  Query Tokens: {summary['avg_query_tokens']:.0f}")
+    # Report latency percentiles p50/p90/p95 per reviewer feedback
+    if 'latency_p50' in summary:
+        print(f"  Latency (p50/p90/p95): {summary['latency_p50']:.0f}/{summary['latency_p90']:.0f}/{summary['latency_p95']:.0f} ms")
+    else:
+        print(f"  Query Latency: {summary['avg_query_latency_ms']:.1f}ms")
     print(f"  Abstention Rate: {summary['abstention_rate']:.2%}")
+    if 'n_seeds' in summary:
+        print(f"  (Bootstrap: {summary['n_bootstrap']} iterations, {summary['n_seeds']} seed)")
     print(f"\nResults saved to: {output_file}")
     print(f"Summary saved to: {summary_file}")
 
