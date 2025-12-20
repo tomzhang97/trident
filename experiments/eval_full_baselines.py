@@ -80,16 +80,21 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from baselines.full_baseline_interface import compute_exact_match, compute_f1
 
-# Import experimental utilities for statistical reporting
+# Import experimental utilities for statistical reporting (direct import to avoid spacy dependency)
 try:
-    from trident.experimental_utils import (
-        compute_statistical_results,
-        StatisticalResults,
-        BASELINE_PROTOCOLS,
-        generate_baseline_protocol_table,
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "experimental_utils",
+        Path(__file__).parent.parent / "trident" / "experimental_utils.py"
     )
+    experimental_utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(experimental_utils)
+    compute_statistical_results = experimental_utils.compute_statistical_results
+    StatisticalResults = experimental_utils.StatisticalResults
+    BASELINE_PROTOCOLS = experimental_utils.BASELINE_PROTOCOLS
+    generate_baseline_protocol_table = experimental_utils.generate_baseline_protocol_table
     EXPERIMENTAL_UTILS_AVAILABLE = True
-except ImportError:
+except Exception:
     EXPERIMENTAL_UTILS_AVAILABLE = False
 
 # Note: Baseline adapters are imported lazily in the evaluation loop

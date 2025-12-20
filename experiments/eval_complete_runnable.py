@@ -49,14 +49,20 @@ from trident.llm_instrumentation import InstrumentedLLM
 from trident.retrieval import DenseRetriever, HybridRetriever, BM25Retriever
 from trident.logging_utils import setup_logger, log_metrics
 
-# Import experimental utilities for statistical reporting
+# Import experimental utilities for statistical reporting (direct import to avoid spacy dependency)
 try:
-    from trident.experimental_utils import (
-        compute_statistical_results,
-        aggregate_certificate_audit,
+    import sys
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "experimental_utils",
+        Path(__file__).parent.parent / "trident" / "experimental_utils.py"
     )
+    experimental_utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(experimental_utils)
+    compute_statistical_results = experimental_utils.compute_statistical_results
+    aggregate_certificate_audit = experimental_utils.aggregate_certificate_audit
     EXPERIMENTAL_UTILS_AVAILABLE = True
-except ImportError:
+except Exception:
     EXPERIMENTAL_UTILS_AVAILABLE = False
 
 # Import baseline systems
