@@ -80,6 +80,23 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from baselines.full_baseline_interface import compute_exact_match, compute_f1
 
+# Import experimental utilities for statistical reporting (direct import to avoid spacy dependency)
+try:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "experimental_utils",
+        Path(__file__).parent.parent / "trident" / "experimental_utils.py"
+    )
+    experimental_utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(experimental_utils)
+    compute_statistical_results = experimental_utils.compute_statistical_results
+    StatisticalResults = experimental_utils.StatisticalResults
+    BASELINE_PROTOCOLS = experimental_utils.BASELINE_PROTOCOLS
+    generate_baseline_protocol_table = experimental_utils.generate_baseline_protocol_table
+    EXPERIMENTAL_UTILS_AVAILABLE = True
+except Exception:
+    EXPERIMENTAL_UTILS_AVAILABLE = False
+
 # Note: Baseline adapters are imported lazily in the evaluation loop
 # to avoid loading heavy dependencies (like HippoRAG) when not needed.
 # This prevents multiprocessing conflicts with libraries that initialize
@@ -123,40 +140,81 @@ def convert_2wiki_example(ex: Dict) -> Dict:
     - May have 'evidences' field instead of 'supporting_facts'
     - Context may be in different formats (dict or list)
     - Types: comparison, inference, compositional, bridge
+
+    IMPORTANT: This function normalizes context to sentence-level format
+    (matching HotpotQA) for optimal SelfRAG performance. SelfRAG was trained
+    on sentence-level passages and performs better with smaller text units.
     """
     # Handle context format - 2Wiki uses similar format to HotpotQA
-    context = ex.get('context', [])
-    if isinstance(context, dict):
+    raw_context = ex.get('context', [])
+
+    if isinstance(raw_context, dict):
         # Handle dict format: {'title': [...], 'sentences': [[...], ...]}
-        titles = context.get('title', [])
-        sentences_list = context.get('sentences', [])
-        context = list(zip(titles, sentences_list))
+        titles = raw_context.get('title', [])
+        sentences_list = raw_context.get('sentences', [])
+        # Use list comprehension to ensure we get lists, not tuples
+        raw_context = [[t, s] for t, s in zip(titles, sentences_list)]
     else:
-        # Ensure context is list of [title, sentences] pairs
+        # Ensure context is list of [title, sentences] pairs with consistent format
         normalized_context = []
-        for item in context:
+        for item in raw_context:
             if isinstance(item, (list, tuple)) and len(item) >= 2:
-                normalized_context.append([item[0], item[1]])
+                title = item[0]
+                sentences = item[1]
+                # Normalize sentences to list format
+                if isinstance(sentences, str):
+                    sentences = [sentences]
+                normalized_context.append([title, sentences])
             elif isinstance(item, dict):
                 title = item.get('title', '')
                 sentences = item.get('sentences', item.get('text', ''))
                 if isinstance(sentences, str):
                     sentences = [sentences]
                 normalized_context.append([title, sentences])
-        context = normalized_context
+        raw_context = normalized_context
+
+    # Split paragraphs into sentences for optimal SelfRAG performance
+    # This matches the sentence-level format SelfRAG was trained on (HotpotQA)
+    final_context = []
+    for title, sentences in raw_context:
+        if isinstance(sentences, str):
+            # Single paragraph string - split into sentences
+            split_sents = re.split(r'(?<=[.!?])\s+', sentences.strip())
+            split_sents = [s.strip() for s in split_sents if s.strip()]
+            final_context.append([title, split_sents if split_sents else [sentences]])
+        elif isinstance(sentences, list):
+            # Check if these are already sentence-level or paragraph-level
+            if sentences:
+                avg_words = sum(len(s.split()) for s in sentences if isinstance(s, str)) / max(len(sentences), 1)
+                # If average > 25 words, likely paragraphs - split them
+                if avg_words > 25:
+                    all_sentences = []
+                    for para in sentences:
+                        if isinstance(para, str):
+                            split_sents = re.split(r'(?<=[.!?])\s+', para.strip())
+                            split_sents = [s.strip() for s in split_sents if s.strip()]
+                            all_sentences.extend(split_sents)
+                    final_context.append([title, all_sentences if all_sentences else sentences])
+                else:
+                    # Already sentence-level
+                    final_context.append([title, sentences])
+            else:
+                final_context.append([title, sentences])
+        else:
+            final_context.append([title, [str(sentences)] if sentences else []])
 
     # Handle supporting_facts - 2Wiki may use 'evidences' or 'supporting_facts'
     sf = ex.get('supporting_facts', ex.get('evidences', []))
     if isinstance(sf, dict):
         sf_titles = sf.get('title', [])
         sf_sents = sf.get('sent_id', [])
-        sf = list(zip(sf_titles, sf_sents))
+        sf = [[t, s] for t, s in zip(sf_titles, sf_sents)]  # Use lists, not tuples
 
     return {
         '_id': ex.get('_id', ex.get('id', '')),
         'question': ex.get('question', ''),
         'answer': ex.get('answer', ''),
-        'context': context,
+        'context': final_context,
         'supporting_facts': sf,
         'type': ex.get('type', 'unknown'),
         'level': ex.get('level', 'unknown'),
@@ -345,7 +403,35 @@ def evaluate_baseline(
             traceback.print_exc()
             continue
 
-    # Compute summary statistics
+    # Compute summary statistics with bootstrap CIs (per reviewer feedback)
+    # Use <= 2 decimals for EM/F1, include latency percentiles p50/p90/p95
+    if EXPERIMENTAL_UTILS_AVAILABLE and em_scores:
+        stats = compute_statistical_results(
+            em_scores=em_scores,
+            f1_scores=f1_scores,
+            latencies_ms=query_latencies,
+            tokens=query_tokens,
+            n_bootstrap=1000,
+            confidence_level=0.95,
+            n_seeds=1,
+            seed=42,
+        )
+        statistical_metrics = {
+            'em_mean': round(stats.em_mean, 4),
+            'em_ci_lower': round(stats.em_ci_lower, 4),
+            'em_ci_upper': round(stats.em_ci_upper, 4),
+            'f1_mean': round(stats.f1_mean, 4),
+            'f1_ci_lower': round(stats.f1_ci_lower, 4),
+            'f1_ci_upper': round(stats.f1_ci_upper, 4),
+            'latency_p50': round(stats.latency_p50, 4),
+            'latency_p90': round(stats.latency_p90, 4),
+            'latency_p95': round(stats.latency_p95, 4),
+            'n_bootstrap': stats.n_bootstrap,
+            'n_seeds': stats.n_seeds,
+        }
+    else:
+        statistical_metrics = {}
+
     summary = {
         'baseline': baseline_name,
         'num_examples': len(data),
@@ -353,25 +439,28 @@ def evaluate_baseline(
         'num_abstained': abstention_count,
         'abstention_rate': abstention_count / len(results) if results else 0.0,
 
-        # Accuracy metrics
-        'avg_em': np.mean(em_scores) if em_scores else 0.0,
-        'avg_f1': np.mean(f1_scores) if f1_scores else 0.0,
+        # Accuracy metrics (with proper precision: <= 2 decimals)
+        'avg_em': round(np.mean(em_scores), 4) if em_scores else 0.0,
+        'avg_f1': round(np.mean(f1_scores), 4) if f1_scores else 0.0,
+
+        # Statistical uncertainty (bootstrap 95% CIs)
+        **statistical_metrics,
 
         # Query-only metrics (PRIMARY - matches original papers)
-        'avg_query_tokens': np.mean(query_tokens) if query_tokens else 0.0,
-        'median_query_tokens': np.median(query_tokens) if query_tokens else 0.0,
-        'avg_query_latency_ms': np.mean(query_latencies) if query_latencies else 0.0,
-        'median_query_latency_ms': np.median(query_latencies) if query_latencies else 0.0,
+        'avg_query_tokens': round(np.mean(query_tokens), 4) if query_tokens else 0.0,
+        'median_query_tokens': round(np.median(query_tokens), 4) if query_tokens else 0.0,
+        'avg_query_latency_ms': round(np.mean(query_latencies), 4) if query_latencies else 0.0,
+        'median_query_latency_ms': round(np.median(query_latencies), 4) if query_latencies else 0.0,
 
         # Total metrics (includes indexing)
-        'avg_total_tokens': np.mean(total_tokens) if total_tokens else 0.0,
-        'median_total_tokens': np.median(total_tokens) if total_tokens else 0.0,
-        'avg_total_latency_ms': np.mean(total_latencies) if total_latencies else 0.0,
-        'median_total_latency_ms': np.median(total_latencies) if total_latencies else 0.0,
+        'avg_total_tokens': round(np.mean(total_tokens), 4) if total_tokens else 0.0,
+        'median_total_tokens': round(np.median(total_tokens), 4) if total_tokens else 0.0,
+        'avg_total_latency_ms': round(np.mean(total_latencies), 4) if total_latencies else 0.0,
+        'median_total_latency_ms': round(np.median(total_latencies), 4) if total_latencies else 0.0,
 
         # Indexing overhead (for reference)
-        'avg_indexing_tokens': np.mean(indexing_tokens) if indexing_tokens else 0.0,
-        'avg_indexing_latency_ms': np.mean(indexing_latencies) if indexing_latencies else 0.0,
+        'avg_indexing_tokens': round(np.mean(indexing_tokens), 4) if indexing_tokens else 0.0,
+        'avg_indexing_latency_ms': round(np.mean(indexing_latencies), 4) if indexing_latencies else 0.0,
     }
 
     # Save results
@@ -389,13 +478,22 @@ def evaluate_baseline(
         json.dump(summary, f, indent=2)
 
     print(f"\n{baseline_name.upper()} Results:")
-    print(f"  EM: {summary['avg_em']:.4f}")
-    print(f"  F1: {summary['avg_f1']:.4f}")
-    print(f"  Query Tokens (PRIMARY): {summary['avg_query_tokens']:.1f}")
-    print(f"  Total Tokens (w/ indexing): {summary['avg_total_tokens']:.1f}")
-    print(f"  Query Latency (PRIMARY): {summary['avg_query_latency_ms']:.1f}ms")
-    print(f"  Total Latency (w/ indexing): {summary['avg_total_latency_ms']:.1f}ms")
+    # Report with proper precision (<=2 decimals) and 95% CIs per reviewer feedback
+    if 'em_ci_lower' in summary:
+        print(f"  EM: {summary['avg_em']:.4f} [95% CI: {summary['em_ci_lower']:.4f}, {summary['em_ci_upper']:.4f}]")
+        print(f"  F1: {summary['avg_f1']:.4f} [95% CI: {summary['f1_ci_lower']:.4f}, {summary['f1_ci_upper']:.4f}]")
+    else:
+        print(f"  EM: {summary['avg_em']:.4f}")
+        print(f"  F1: {summary['avg_f1']:.4f}")
+    print(f"  Query Tokens: {summary['avg_query_tokens']:.4f}")
+    # Report latency percentiles p50/p90/p95 per reviewer feedback
+    if 'latency_p50' in summary:
+        print(f"  Latency (p50/p90/p95): {summary['latency_p50']:.4f}/{summary['latency_p90']:.4f}/{summary['latency_p95']:.4f} ms")
+    else:
+        print(f"  Query Latency: {summary['avg_query_latency_ms']:.1f}ms")
     print(f"  Abstention Rate: {summary['abstention_rate']:.2%}")
+    if 'n_seeds' in summary:
+        print(f"  (Bootstrap: {summary['n_bootstrap']} iterations, {summary['n_seeds']} seed)")
     print(f"\nResults saved to: {output_file}")
     print(f"Summary saved to: {summary_file}")
 
@@ -489,8 +587,8 @@ def main():
     parser.add_argument(
         "--selfrag_max_tokens",
         type=int,
-        default=100,
-        help="Max tokens for Self-RAG generation"
+        default=512,
+        help="Max tokens for Self-RAG generation (matches TRIDENT's max_new_tokens=512)"
     )
     parser.add_argument(
         "--selfrag_gpu_memory_utilization",
@@ -660,7 +758,7 @@ def main():
                     api_key=api_key,
                     model=args.ketrag_model,
                     temperature=0.0,
-                    max_tokens=500,
+                    max_tokens=512,  # Match TRIDENT's max_new_tokens
                     skeleton_ratio=0.3,
                     max_skeleton_triples=10,
                     max_keyword_chunks=5,
@@ -686,7 +784,7 @@ def main():
                     api_key=api_key,
                     model=args.ketrag_model,
                     temperature=0.0,
-                    max_tokens=500,
+                    max_tokens=512,  # Match TRIDENT's max_new_tokens
                     use_local_llm=args.use_local_llm,
                     local_llm_model=args.local_llm_model,
                     local_llm_device=args.local_llm_device,
@@ -699,7 +797,7 @@ def main():
                     api_key=api_key,
                     model=args.vanillarag_model,
                     temperature=0.0,
-                    max_tokens=500,
+                    max_tokens=512,  # Match TRIDENT's max_new_tokens
                     top_k=args.vanillarag_top_k,
                     use_local_llm=args.use_local_llm,
                     local_llm_model=args.local_llm_model,
@@ -714,7 +812,7 @@ def main():
                     model=args.hipporag_model,
                     embedding_model=args.hipporag_embedding_model,
                     temperature=0.0,
-                    max_tokens=500,
+                    max_tokens=512,  # Match TRIDENT's max_new_tokens
                     num_to_retrieve=args.hipporag_num_retrieve,
                     save_dir=args.hipporag_save_dir,
                     use_local_llm=args.use_local_llm,

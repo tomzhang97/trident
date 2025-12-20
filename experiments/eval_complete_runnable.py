@@ -49,6 +49,18 @@ from trident.llm_instrumentation import InstrumentedLLM
 from trident.retrieval import DenseRetriever, HybridRetriever, BM25Retriever
 from trident.logging_utils import setup_logger, log_metrics
 
+# Import experimental utilities for statistical reporting
+try:
+    _exp_utils_path = Path(__file__).parent.parent / "trident" / "experimental_utils.py"
+    _spec = importlib.util.spec_from_file_location("experimental_utils", _exp_utils_path)
+    _exp_module = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_exp_module)
+    compute_statistical_results = _exp_module.compute_statistical_results
+    aggregate_certificate_audit = _exp_module.aggregate_certificate_audit
+    EXPERIMENTAL_UTILS_AVAILABLE = True
+except Exception:
+    EXPERIMENTAL_UTILS_AVAILABLE = False
+
 # Import baseline systems
 from baselines.self_rag_system import SelfRAGSystem
 from baselines.graphrag_system import GraphRAGSystem
@@ -760,27 +772,56 @@ class ExperimentRunner:
             if 'num_units' in metrics:
                 num_units.append(metrics['num_units'])
 
+        # Compute statistical metrics if available
+        statistical_metrics = {}
+        if EXPERIMENTAL_UTILS_AVAILABLE and em_scores:
+            try:
+                stats = compute_statistical_results(
+                    em_scores=em_scores,
+                    f1_scores=f1_scores,
+                    latencies_ms=latencies,
+                    tokens=tokens_used,
+                    n_bootstrap=1000,
+                    confidence_level=0.95,
+                    n_seeds=1,
+                    seed=42,
+                )
+                statistical_metrics = {
+                    'em_ci_lower': round(stats.em_ci_lower, 4),
+                    'em_ci_upper': round(stats.em_ci_upper, 4),
+                    'f1_ci_lower': round(stats.f1_ci_lower, 4),
+                    'f1_ci_upper': round(stats.f1_ci_upper, 4),
+                    'latency_p50': round(stats.latency_p50, 4),
+                    'latency_p90': round(stats.latency_p90, 4),
+                    'latency_p95': round(stats.latency_p95, 4),
+                    'n_bootstrap': stats.n_bootstrap,
+                    'n_seeds': stats.n_seeds,
+                }
+            except Exception:
+                pass  # Fall back to no statistical metrics
+
         summary = {
             'num_examples': len(results),
             'num_valid': len(valid_results),
             'num_abstained': abstained_count,
-            'abstention_rate': abstained_count / len(valid_results) if valid_results else 0,
-            'avg_em': np.mean(em_scores) if em_scores else 0,
-            'avg_f1': np.mean(f1_scores) if f1_scores else 0,
-            'avg_tokens_total': np.mean(tokens_used) if tokens_used else 0,
-            'avg_latency_ms': np.mean(latencies) if latencies else 0,
+            'abstention_rate': round(abstained_count / len(valid_results), 4) if valid_results else 0,
+            'avg_em': round(np.mean(em_scores), 4) if em_scores else 0,
+            'avg_f1': round(np.mean(f1_scores), 4) if f1_scores else 0,
+            **statistical_metrics,
+            'avg_tokens_total': round(np.mean(tokens_used), 4) if tokens_used else 0,
+            'avg_latency_ms': round(np.mean(latencies), 4) if latencies else 0,
             'total_tokens': sum(tokens_used),
             'mode': self.config.mode
         }
 
         # Add evidence token metrics if available
         if evidence_tokens:
-            summary['avg_evidence_tokens'] = np.mean(evidence_tokens)
+            summary['avg_evidence_tokens'] = round(np.mean(evidence_tokens), 4)
             summary['total_evidence_tokens'] = sum(evidence_tokens)
 
         # Add num_units metrics if available
         if num_units:
-            summary['avg_num_units'] = np.mean(num_units)
+            summary['avg_num_units'] = round(np.mean(num_units), 4)
 
         return summary
 
@@ -926,15 +967,44 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
         tokens_used.append(result.get('tokens_used', 0))
         latencies.append(result.get('latency_ms', 0))
 
+    # Compute statistical metrics if available
+    statistical_metrics = {}
+    if EXPERIMENTAL_UTILS_AVAILABLE and em_scores:
+        try:
+            stats = compute_statistical_results(
+                em_scores=em_scores,
+                f1_scores=f1_scores,
+                latencies_ms=latencies,
+                tokens=tokens_used,
+                n_bootstrap=1000,
+                confidence_level=0.95,
+                n_seeds=1,
+                seed=42,
+            )
+            statistical_metrics = {
+                'em_ci_lower': round(stats.em_ci_lower, 4),
+                'em_ci_upper': round(stats.em_ci_upper, 4),
+                'f1_ci_lower': round(stats.f1_ci_lower, 4),
+                'f1_ci_upper': round(stats.f1_ci_upper, 4),
+                'latency_p50': round(stats.latency_p50, 4),
+                'latency_p90': round(stats.latency_p90, 4),
+                'latency_p95': round(stats.latency_p95, 4),
+                'n_bootstrap': stats.n_bootstrap,
+                'n_seeds': stats.n_seeds,
+            }
+        except Exception:
+            pass  # Fall back to no statistical metrics
+
     summary = {
         'total': len(all_results),
         'valid': len(all_results) - abstained,
         'abstained': abstained,
-        'abstention_rate': abstained / len(all_results) if all_results else 0,
-        'avg_em': np.mean(em_scores) if em_scores else 0,
-        'avg_f1': np.mean(f1_scores) if f1_scores else 0,
-        'avg_tokens': np.mean(tokens_used) if tokens_used else 0,
-        'avg_latency_ms': np.mean(latencies) if latencies else 0,
+        'abstention_rate': round(abstained / len(all_results), 4) if all_results else 0,
+        'avg_em': round(np.mean(em_scores), 4) if em_scores else 0,
+        'avg_f1': round(np.mean(f1_scores), 4) if f1_scores else 0,
+        **statistical_metrics,
+        'avg_tokens': round(np.mean(tokens_used), 4) if tokens_used else 0,
+        'avg_latency_ms': round(np.mean(latencies), 4) if latencies else 0,
     }
 
     # Save aggregated results
@@ -947,10 +1017,16 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
 
     print(f"\nResults:")
     print(f"  Total examples: {summary['total']}")
-    print(f"  EM: {summary['avg_em']:.4f}")
-    print(f"  F1: {summary['avg_f1']:.4f}")
+    if 'em_ci_lower' in summary:
+        print(f"  EM: {summary['avg_em']:.4f} [95% CI: {summary['em_ci_lower']:.4f}, {summary['em_ci_upper']:.4f}]")
+        print(f"  F1: {summary['avg_f1']:.4f} [95% CI: {summary['f1_ci_lower']:.4f}, {summary['f1_ci_upper']:.4f}]")
+        print(f"  Latency (p50/p90/p95): {summary['latency_p50']:.4f}/{summary['latency_p90']:.4f}/{summary['latency_p95']:.4f} ms")
+        print(f"  (Bootstrap: {summary['n_bootstrap']} iterations, {summary['n_seeds']} seed)")
+    else:
+        print(f"  EM: {summary['avg_em']:.4f}")
+        print(f"  F1: {summary['avg_f1']:.4f}")
+        print(f"  Avg latency: {summary['avg_latency_ms']:.4f}ms")
     print(f"  Abstention rate: {summary['abstention_rate']:.4f}")
-    print(f"  Avg latency: {summary['avg_latency_ms']:.1f}ms")
     print(f"\nSaved to: {aggregated_path}")
 
 
