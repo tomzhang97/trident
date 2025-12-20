@@ -89,8 +89,8 @@ def aggregate_metrics(shard_results: List[Dict[str, Any]]) -> Dict[str, Any]:
                             best_f1 = max(best_f1, f1)
                 f1_scores.append(best_f1)
         
-        metrics['exact_match'] = round(float(np.mean(em_scores)), 2) if em_scores else 0.0
-        metrics['f1_score'] = round(float(np.mean(f1_scores)), 2) if f1_scores else 0.0
+        metrics['exact_match'] = round(float(np.mean(em_scores)), 4) if em_scores else 0.0
+        metrics['f1_score'] = round(float(np.mean(f1_scores)), 4) if f1_scores else 0.0
         
         # Token and latency metrics
         token_values = [p.get('tokens_used', 0) for p in valid_predictions]
@@ -103,27 +103,27 @@ def aggregate_metrics(shard_results: List[Dict[str, Any]]) -> Dict[str, Any]:
             for p in valid_predictions
         ]
 
-        metrics['avg_tokens'] = round(float(np.mean(token_values)), 1) if token_values else 0.0
+        metrics['avg_tokens'] = round(float(np.mean(token_values)), 2) if token_values else 0.0
         metrics['avg_latency_ms'] = round(
-            float(np.mean([p.get('latency_ms', 0) for p in valid_predictions])), 1
+            float(np.mean([p.get('latency_ms', 0) for p in valid_predictions])), 2
         )
-        metrics['avg_evidence_tokens'] = round(float(np.mean(evidence_values)), 1) if evidence_values else 0.0
-        metrics['avg_overhead_tokens'] = round(float(np.mean(overhead_values)), 1) if overhead_values else 0.0
+        metrics['avg_evidence_tokens'] = round(float(np.mean(evidence_values)), 2) if evidence_values else 0.0
+        metrics['avg_overhead_tokens'] = round(float(np.mean(overhead_values)), 2) if overhead_values else 0.0
 
         if token_values:
-            metrics['tokens_p50'] = round(float(np.percentile(token_values, 50)), 1)
-            metrics['tokens_p90'] = round(float(np.percentile(token_values, 90)), 1)
-            metrics['tokens_p95'] = round(float(np.percentile(token_values, 95)), 1)
+            metrics['tokens_p50'] = round(float(np.percentile(token_values, 50)), 2)
+            metrics['tokens_p90'] = round(float(np.percentile(token_values, 90)), 2)
+            metrics['tokens_p95'] = round(float(np.percentile(token_values, 95)), 2)
         if evidence_values:
-            metrics['evidence_p50'] = round(float(np.percentile(evidence_values, 50)), 1)
-            metrics['evidence_p90'] = round(float(np.percentile(evidence_values, 90)), 1)
-            metrics['evidence_p95'] = round(float(np.percentile(evidence_values, 95)), 1)
+            metrics['evidence_p50'] = round(float(np.percentile(evidence_values, 50)), 2)
+            metrics['evidence_p90'] = round(float(np.percentile(evidence_values, 90)), 2)
+            metrics['evidence_p95'] = round(float(np.percentile(evidence_values, 95)), 2)
 
         latencies = [p.get('latency_ms', 0) for p in valid_predictions]
         if latencies:
-            metrics['latency_p50'] = round(float(np.percentile(latencies, 50)), 1)
-            metrics['latency_p90'] = round(float(np.percentile(latencies, 90)), 1)
-            metrics['latency_p95'] = round(float(np.percentile(latencies, 95)), 1)
+            metrics['latency_p50'] = round(float(np.percentile(latencies, 50)), 2)
+            metrics['latency_p90'] = round(float(np.percentile(latencies, 90)), 2)
+            metrics['latency_p95'] = round(float(np.percentile(latencies, 95)), 2)
 
         if EXPERIMENTAL_UTILS_AVAILABLE and em_scores:
             stats = compute_statistical_results(
@@ -137,16 +137,16 @@ def aggregate_metrics(shard_results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 seed=42,
             )
             metrics.update({
-                'em_ci_lower': round(stats.em_ci_lower, 2),
-                'em_ci_upper': round(stats.em_ci_upper, 2),
-                'f1_ci_lower': round(stats.f1_ci_lower, 2),
-                'f1_ci_upper': round(stats.f1_ci_upper, 2),
-                'tokens_mean': round(stats.tokens_mean, 0),
-                'tokens_p50': round(stats.tokens_p50, 0),
-                'tokens_p95': round(stats.tokens_p95, 0),
-                'latency_p50': round(stats.latency_p50, 1),
-                'latency_p90': round(stats.latency_p90, 1),
-                'latency_p95': round(stats.latency_p95, 1),
+                'em_ci_lower': round(stats.em_ci_lower, 4),
+                'em_ci_upper': round(stats.em_ci_upper, 4),
+                'f1_ci_lower': round(stats.f1_ci_lower, 4),
+                'f1_ci_upper': round(stats.f1_ci_upper, 4),
+                'tokens_mean': round(stats.tokens_mean, 2),
+                'tokens_p50': round(stats.tokens_p50, 2),
+                'tokens_p95': round(stats.tokens_p95, 2),
+                'latency_p50': round(stats.latency_p50, 2),
+                'latency_p90': round(stats.latency_p90, 2),
+                'latency_p95': round(stats.latency_p95, 2),
                 'n_bootstrap': stats.n_bootstrap,
                 'n_seeds': stats.n_seeds,
             })
@@ -214,32 +214,32 @@ def generate_report(
     report.append("\nPERFORMANCE METRICS:")
     if 'em_ci_lower' in metrics:
         report.append(
-            f"  Exact Match: {metrics.get('exact_match', 0):.2f} "
-            f"[95% CI: {metrics.get('em_ci_lower', 0):.2f}, {metrics.get('em_ci_upper', 0):.2f}]"
+            f"  Exact Match: {metrics.get('exact_match', 0):.4f} "
+            f"[95% CI: {metrics.get('em_ci_lower', 0):.4f}, {metrics.get('em_ci_upper', 0):.4f}]"
         )
         report.append(
-            f"  F1 Score: {metrics.get('f1_score', 0):.2f} "
-            f"[95% CI: {metrics.get('f1_ci_lower', 0):.2f}, {metrics.get('f1_ci_upper', 0):.2f}]"
+            f"  F1 Score: {metrics.get('f1_score', 0):.4f} "
+            f"[95% CI: {metrics.get('f1_ci_lower', 0):.4f}, {metrics.get('f1_ci_upper', 0):.4f}]"
         )
         report.append(
             f"  (Bootstrap: {metrics.get('n_bootstrap', 0)} iterations, {metrics.get('n_seeds', 0)} seed)"
         )
     else:
-        report.append(f"  Exact Match: {metrics.get('exact_match', 0):.2f}")
-        report.append(f"  F1 Score: {metrics.get('f1_score', 0):.2f}")
+        report.append(f"  Exact Match: {metrics.get('exact_match', 0):.4f}")
+        report.append(f"  F1 Score: {metrics.get('f1_score', 0):.4f}")
     report.append(f"  Abstention Rate: {metrics.get('abstention_rate', 0):.3f}")
     
     # Efficiency metrics
     report.append("\nEFFICIENCY METRICS:")
-    report.append(f"  Avg Tokens Used: {metrics.get('avg_tokens', 0):.1f}")
-    report.append(f"  Tokens p50/p90/p95: {metrics.get('tokens_p50', 0):.1f}/"
-                  f"{metrics.get('tokens_p90', 0):.1f}/{metrics.get('tokens_p95', 0):.1f}")
-    report.append(f"  Avg Evidence Tokens: {metrics.get('avg_evidence_tokens', 0):.1f}")
-    report.append(f"  Evidence p50/p90/p95: {metrics.get('evidence_p50', 0):.1f}/"
-                  f"{metrics.get('evidence_p90', 0):.1f}/{metrics.get('evidence_p95', 0):.1f}")
-    report.append(f"  Avg Overhead Tokens: {metrics.get('avg_overhead_tokens', 0):.1f}")
-    report.append(f"  Latency p50/p90/p95 (ms): {metrics.get('latency_p50', 0):.1f}/"
-                  f"{metrics.get('latency_p90', 0):.1f}/{metrics.get('latency_p95', 0):.1f}")
+    report.append(f"  Avg Tokens Used: {metrics.get('avg_tokens', 0):.2f}")
+    report.append(f"  Tokens p50/p90/p95: {metrics.get('tokens_p50', 0):.2f}/"
+                  f"{metrics.get('tokens_p90', 0):.2f}/{metrics.get('tokens_p95', 0):.2f}")
+    report.append(f"  Avg Evidence Tokens: {metrics.get('avg_evidence_tokens', 0):.2f}")
+    report.append(f"  Evidence p50/p90/p95: {metrics.get('evidence_p50', 0):.2f}/"
+                  f"{metrics.get('evidence_p90', 0):.2f}/{metrics.get('evidence_p95', 0):.2f}")
+    report.append(f"  Avg Overhead Tokens: {metrics.get('avg_overhead_tokens', 0):.2f}")
+    report.append(f"  Latency p50/p90/p95 (ms): {metrics.get('latency_p50', 0):.2f}/"
+                  f"{metrics.get('latency_p90', 0):.2f}/{metrics.get('latency_p95', 0):.2f}")
     
     # Mode-specific metrics
     if 'avg_coverage_rate' in metrics:

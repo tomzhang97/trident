@@ -800,15 +800,15 @@ class ExperimentRunner:
                 seed=42,
             )
             statistical_metrics = {
-                'em_ci_lower': round(stats.em_ci_lower, 2),
-                'em_ci_upper': round(stats.em_ci_upper, 2),
-                'f1_ci_lower': round(stats.f1_ci_lower, 2),
-                'f1_ci_upper': round(stats.f1_ci_upper, 2),
-                'latency_p50': round(stats.latency_p50, 1),
-                'latency_p90': round(stats.latency_p90, 1),
-                'latency_p95': round(stats.latency_p95, 1),
-                'tokens_p50': round(stats.tokens_p50, 0),
-                'tokens_p95': round(stats.tokens_p95, 0),
+                'em_ci_lower': round(stats.em_ci_lower, 4),
+                'em_ci_upper': round(stats.em_ci_upper, 4),
+                'f1_ci_lower': round(stats.f1_ci_lower, 4),
+                'f1_ci_upper': round(stats.f1_ci_upper, 4),
+                'latency_p50': round(stats.latency_p50, 2),
+                'latency_p90': round(stats.latency_p90, 2),
+                'latency_p95': round(stats.latency_p95, 2),
+                'tokens_p50': round(stats.tokens_p50, 2),
+                'tokens_p95': round(stats.tokens_p95, 2),
                 'n_bootstrap': stats.n_bootstrap,
                 'n_seeds': stats.n_seeds,
             }
@@ -818,22 +818,22 @@ class ExperimentRunner:
             'num_valid': len(valid_results),
             'num_abstained': abstained_count,
             'abstention_rate': round(abstained_count / len(valid_results), 4) if valid_results else 0,
-            'avg_em': round(np.mean(em_scores), 2) if em_scores else 0,
-            'avg_f1': round(np.mean(f1_scores), 2) if f1_scores else 0,
+            'avg_em': round(np.mean(em_scores), 4) if em_scores else 0,
+            'avg_f1': round(np.mean(f1_scores), 4) if f1_scores else 0,
             **statistical_metrics,
-            'avg_total_tokens': round(np.mean(tokens_used), 0) if tokens_used else 0,
-            'avg_latency_ms': round(np.mean(latencies), 1) if latencies else 0,
+            'avg_total_tokens': round(np.mean(tokens_used), 2) if tokens_used else 0,
+            'avg_latency_ms': round(np.mean(latencies), 2) if latencies else 0,
             'total_tokens': int(sum(tokens_used)),
             'mode': self.config.mode
         }
 
         # Add evidence token metrics if available
         if evidence_tokens:
-            summary['avg_evidence_tokens'] = round(np.mean(evidence_tokens), 0)
-            summary['median_evidence_tokens'] = round(float(np.median(evidence_tokens)), 0)
-            summary['p95_evidence_tokens'] = round(float(np.percentile(evidence_tokens, 95)), 0)
+            summary['avg_evidence_tokens'] = round(np.mean(evidence_tokens), 2)
+            summary['median_evidence_tokens'] = round(float(np.median(evidence_tokens)), 2)
+            summary['p95_evidence_tokens'] = round(float(np.percentile(evidence_tokens, 95)), 2)
             summary['total_evidence_tokens'] = int(sum(evidence_tokens))
-            summary['avg_overhead_tokens'] = round(np.mean(overhead_tokens), 0) if overhead_tokens else 0
+            summary['avg_overhead_tokens'] = round(np.mean(overhead_tokens), 2) if overhead_tokens else 0
 
         # Add num_units metrics if available
         if num_units:
@@ -1016,15 +1016,15 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
             seed=42,
         )
         statistical_metrics = {
-            'em_ci_lower': round(stats.em_ci_lower, 2),
-            'em_ci_upper': round(stats.em_ci_upper, 2),
-            'f1_ci_lower': round(stats.f1_ci_lower, 2),
-            'f1_ci_upper': round(stats.f1_ci_upper, 2),
-            'latency_p50': round(stats.latency_p50, 1),
-            'latency_p90': round(stats.latency_p90, 1),
-            'latency_p95': round(stats.latency_p95, 1),
-            'tokens_p50': round(stats.tokens_p50, 0),
-            'tokens_p95': round(stats.tokens_p95, 0),
+            'em_ci_lower': round(stats.em_ci_lower, 4),
+            'em_ci_upper': round(stats.em_ci_upper, 4),
+            'f1_ci_lower': round(stats.f1_ci_lower, 4),
+            'f1_ci_upper': round(stats.f1_ci_upper, 4),
+            'latency_p50': round(stats.latency_p50, 2),
+            'latency_p90': round(stats.latency_p90, 2),
+            'latency_p95': round(stats.latency_p95, 2),
+            'tokens_p50': round(stats.tokens_p50, 2),
+            'tokens_p95': round(stats.tokens_p95, 2),
             'n_bootstrap': stats.n_bootstrap,
             'n_seeds': stats.n_seeds,
         }
@@ -1034,18 +1034,18 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
         'num_valid': len(all_results) - abstained,
         'num_abstained': abstained,
         'abstention_rate': round(abstained / len(all_results), 4) if all_results else 0,
-        'avg_em': round(np.mean(em_scores), 2) if em_scores else 0,
-        'avg_f1': round(np.mean(f1_scores), 2) if f1_scores else 0,
+        'avg_em': round(np.mean(em_scores), 4) if em_scores else 0,
+        'avg_f1': round(np.mean(f1_scores), 4) if f1_scores else 0,
         **statistical_metrics,
-        'avg_total_tokens': round(np.mean(tokens_used), 0) if tokens_used else 0,
-        'avg_latency_ms': round(np.mean(latencies), 1) if latencies else 0,
+        'avg_total_tokens': round(np.mean(tokens_used), 2) if tokens_used else 0,
+        'avg_latency_ms': round(np.mean(latencies), 2) if latencies else 0,
     }
 
     if evidence_tokens:
-        summary['avg_evidence_tokens'] = round(np.mean(evidence_tokens), 0)
-        summary['median_evidence_tokens'] = round(float(np.median(evidence_tokens)), 0)
-        summary['p95_evidence_tokens'] = round(float(np.percentile(evidence_tokens, 95)), 0)
-        summary['avg_overhead_tokens'] = round(np.mean(overhead_tokens), 0) if overhead_tokens else 0
+        summary['avg_evidence_tokens'] = round(np.mean(evidence_tokens), 2)
+        summary['median_evidence_tokens'] = round(float(np.median(evidence_tokens)), 2)
+        summary['p95_evidence_tokens'] = round(float(np.percentile(evidence_tokens, 95)), 2)
+        summary['avg_overhead_tokens'] = round(np.mean(overhead_tokens), 2) if overhead_tokens else 0
 
     # Save aggregated results
     aggregated_path = output_dir / "aggregated_results.json"
