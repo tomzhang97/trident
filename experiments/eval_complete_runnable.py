@@ -33,8 +33,6 @@ from concurrent.futures import ThreadPoolExecutor
 from queue import Queue, Empty
 from threading import Lock
 
-import importlib
-import importlib.util
 import numpy as np
 
 # Add parent directory to path
@@ -50,17 +48,12 @@ from trident.retrieval import DenseRetriever, HybridRetriever, BM25Retriever
 from trident.logging_utils import setup_logger, log_metrics
 
 # Import experimental utilities for statistical reporting
-try:
-    _exp_utils_path = Path(__file__).parent.parent / "trident" / "experimental_utils.py"
-    _spec = importlib.util.spec_from_file_location("experimental_utils", _exp_utils_path)
-    _exp_module = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(_exp_module)
-    compute_statistical_results = _exp_module.compute_statistical_results
-    aggregate_certificate_audit = _exp_module.aggregate_certificate_audit
-    CalibrationProvenance = _exp_module.CalibrationProvenance
-    EXPERIMENTAL_UTILS_AVAILABLE = True
-except Exception:
-    EXPERIMENTAL_UTILS_AVAILABLE = False
+from trident.experimental_utils import (
+    compute_statistical_results,
+    aggregate_certificate_audit,
+    CalibrationProvenance,
+)
+EXPERIMENTAL_UTILS_AVAILABLE = True
 
 # Import baseline systems
 from baselines.self_rag_system import SelfRAGSystem
@@ -795,32 +788,29 @@ class ExperimentRunner:
         # Compute statistical metrics if available
         statistical_metrics = {}
         if EXPERIMENTAL_UTILS_AVAILABLE and em_scores:
-            try:
-                stats = compute_statistical_results(
-                    em_scores=em_scores,
-                    f1_scores=f1_scores,
-                    latencies_ms=latencies,
-                    tokens=tokens_used,
-                    n_bootstrap=1000,
-                    confidence_level=0.95,
-                    n_seeds=1,
-                    seed=42,
-                )
-                statistical_metrics = {
-                    'em_ci_lower': round(stats.em_ci_lower, 2),
-                    'em_ci_upper': round(stats.em_ci_upper, 2),
-                    'f1_ci_lower': round(stats.f1_ci_lower, 2),
-                    'f1_ci_upper': round(stats.f1_ci_upper, 2),
-                    'latency_p50': round(stats.latency_p50, 1),
-                    'latency_p90': round(stats.latency_p90, 1),
-                    'latency_p95': round(stats.latency_p95, 1),
-                    'tokens_p50': round(stats.tokens_p50, 0),
-                    'tokens_p95': round(stats.tokens_p95, 0),
-                    'n_bootstrap': stats.n_bootstrap,
-                    'n_seeds': stats.n_seeds,
-                }
-            except Exception:
-                pass  # Fall back to no statistical metrics
+            stats = compute_statistical_results(
+                em_scores=em_scores,
+                f1_scores=f1_scores,
+                latencies_ms=latencies,
+                tokens=tokens_used,
+                n_bootstrap=1000,
+                confidence_level=0.95,
+                n_seeds=1,
+                seed=42,
+            )
+            statistical_metrics = {
+                'em_ci_lower': round(stats.em_ci_lower, 2),
+                'em_ci_upper': round(stats.em_ci_upper, 2),
+                'f1_ci_lower': round(stats.f1_ci_lower, 2),
+                'f1_ci_upper': round(stats.f1_ci_upper, 2),
+                'latency_p50': round(stats.latency_p50, 1),
+                'latency_p90': round(stats.latency_p90, 1),
+                'latency_p95': round(stats.latency_p95, 1),
+                'tokens_p50': round(stats.tokens_p50, 0),
+                'tokens_p95': round(stats.tokens_p95, 0),
+                'n_bootstrap': stats.n_bootstrap,
+                'n_seeds': stats.n_seeds,
+            }
 
         summary = {
             'num_examples': len(results),
@@ -1014,32 +1004,29 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
     # Compute statistical metrics if available
     statistical_metrics = {}
     if EXPERIMENTAL_UTILS_AVAILABLE and em_scores:
-        try:
-            stats = compute_statistical_results(
-                em_scores=em_scores,
-                f1_scores=f1_scores,
-                latencies_ms=latencies,
-                tokens=tokens_used,
-                n_bootstrap=1000,
-                confidence_level=0.95,
-                n_seeds=1,
-                seed=42,
-            )
-            statistical_metrics = {
-                'em_ci_lower': round(stats.em_ci_lower, 2),
-                'em_ci_upper': round(stats.em_ci_upper, 2),
-                'f1_ci_lower': round(stats.f1_ci_lower, 2),
-                'f1_ci_upper': round(stats.f1_ci_upper, 2),
-                'latency_p50': round(stats.latency_p50, 1),
-                'latency_p90': round(stats.latency_p90, 1),
-                'latency_p95': round(stats.latency_p95, 1),
-                'tokens_p50': round(stats.tokens_p50, 0),
-                'tokens_p95': round(stats.tokens_p95, 0),
-                'n_bootstrap': stats.n_bootstrap,
-                'n_seeds': stats.n_seeds,
-            }
-        except Exception:
-            pass  # Fall back to no statistical metrics
+        stats = compute_statistical_results(
+            em_scores=em_scores,
+            f1_scores=f1_scores,
+            latencies_ms=latencies,
+            tokens=tokens_used,
+            n_bootstrap=1000,
+            confidence_level=0.95,
+            n_seeds=1,
+            seed=42,
+        )
+        statistical_metrics = {
+            'em_ci_lower': round(stats.em_ci_lower, 2),
+            'em_ci_upper': round(stats.em_ci_upper, 2),
+            'f1_ci_lower': round(stats.f1_ci_lower, 2),
+            'f1_ci_upper': round(stats.f1_ci_upper, 2),
+            'latency_p50': round(stats.latency_p50, 1),
+            'latency_p90': round(stats.latency_p90, 1),
+            'latency_p95': round(stats.latency_p95, 1),
+            'tokens_p50': round(stats.tokens_p50, 0),
+            'tokens_p95': round(stats.tokens_p95, 0),
+            'n_bootstrap': stats.n_bootstrap,
+            'n_seeds': stats.n_seeds,
+        }
 
     summary = {
         'num_examples': len(all_results),
