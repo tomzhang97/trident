@@ -986,6 +986,8 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
     f1_scores = []
     abstained = 0
     tokens_used = []
+    evidence_tokens = []
+    overhead_tokens = []
     latencies = []
 
     for result in all_results:
@@ -1002,6 +1004,11 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
             f1_scores.append(best_f1)
 
         tokens_used.append(result.get('tokens_used', 0))
+        metrics = result.get('metrics', {})
+        evidence = metrics.get('evidence_tokens')
+        if evidence is not None:
+            evidence_tokens.append(evidence)
+            overhead_tokens.append(max(result.get('tokens_used', 0) - evidence, 0))
         latencies.append(result.get('latency_ms', 0))
 
     # Compute statistical metrics if available
@@ -1019,13 +1026,15 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
                 seed=42,
             )
             statistical_metrics = {
-                'em_ci_lower': round(stats.em_ci_lower, 4),
-                'em_ci_upper': round(stats.em_ci_upper, 4),
-                'f1_ci_lower': round(stats.f1_ci_lower, 4),
-                'f1_ci_upper': round(stats.f1_ci_upper, 4),
-                'latency_p50': round(stats.latency_p50, 4),
-                'latency_p90': round(stats.latency_p90, 4),
-                'latency_p95': round(stats.latency_p95, 4),
+                'em_ci_lower': round(stats.em_ci_lower, 2),
+                'em_ci_upper': round(stats.em_ci_upper, 2),
+                'f1_ci_lower': round(stats.f1_ci_lower, 2),
+                'f1_ci_upper': round(stats.f1_ci_upper, 2),
+                'latency_p50': round(stats.latency_p50, 1),
+                'latency_p90': round(stats.latency_p90, 1),
+                'latency_p95': round(stats.latency_p95, 1),
+                'tokens_p50': round(stats.tokens_p50, 0),
+                'tokens_p95': round(stats.tokens_p95, 0),
                 'n_bootstrap': stats.n_bootstrap,
                 'n_seeds': stats.n_seeds,
             }
@@ -1033,16 +1042,22 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
             pass  # Fall back to no statistical metrics
 
     summary = {
-        'total': len(all_results),
-        'valid': len(all_results) - abstained,
-        'abstained': abstained,
+        'num_examples': len(all_results),
+        'num_valid': len(all_results) - abstained,
+        'num_abstained': abstained,
         'abstention_rate': round(abstained / len(all_results), 4) if all_results else 0,
-        'avg_em': round(np.mean(em_scores), 4) if em_scores else 0,
-        'avg_f1': round(np.mean(f1_scores), 4) if f1_scores else 0,
+        'avg_em': round(np.mean(em_scores), 2) if em_scores else 0,
+        'avg_f1': round(np.mean(f1_scores), 2) if f1_scores else 0,
         **statistical_metrics,
-        'avg_tokens': round(np.mean(tokens_used), 4) if tokens_used else 0,
-        'avg_latency_ms': round(np.mean(latencies), 4) if latencies else 0,
+        'avg_total_tokens': round(np.mean(tokens_used), 0) if tokens_used else 0,
+        'avg_latency_ms': round(np.mean(latencies), 1) if latencies else 0,
     }
+
+    if evidence_tokens:
+        summary['avg_evidence_tokens'] = round(np.mean(evidence_tokens), 0)
+        summary['median_evidence_tokens'] = round(float(np.median(evidence_tokens)), 0)
+        summary['p95_evidence_tokens'] = round(float(np.percentile(evidence_tokens, 95)), 0)
+        summary['avg_overhead_tokens'] = round(np.mean(overhead_tokens), 0) if overhead_tokens else 0
 
     # Save aggregated results
     aggregated_path = output_dir / "aggregated_results.json"
@@ -1053,16 +1068,16 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
         }, f, indent=2)
 
     print(f"\nResults:")
-    print(f"  Total examples: {summary['total']}")
+    print(f"  Total examples: {summary['num_examples']}")
     if 'em_ci_lower' in summary:
-        print(f"  EM: {summary['avg_em']:.4f} [95% CI: {summary['em_ci_lower']:.4f}, {summary['em_ci_upper']:.4f}]")
-        print(f"  F1: {summary['avg_f1']:.4f} [95% CI: {summary['f1_ci_lower']:.4f}, {summary['f1_ci_upper']:.4f}]")
-        print(f"  Latency (p50/p90/p95): {summary['latency_p50']:.4f}/{summary['latency_p90']:.4f}/{summary['latency_p95']:.4f} ms")
+        print(f"  EM: {summary['avg_em']:.2f} [95% CI: {summary['em_ci_lower']:.2f}, {summary['em_ci_upper']:.2f}]")
+        print(f"  F1: {summary['avg_f1']:.2f} [95% CI: {summary['f1_ci_lower']:.2f}, {summary['f1_ci_upper']:.2f}]")
+        print(f"  Latency (p50/p90/p95): {summary['latency_p50']:.1f}/{summary['latency_p90']:.1f}/{summary['latency_p95']:.1f} ms")
         print(f"  (Bootstrap: {summary['n_bootstrap']} iterations, {summary['n_seeds']} seed)")
     else:
-        print(f"  EM: {summary['avg_em']:.4f}")
-        print(f"  F1: {summary['avg_f1']:.4f}")
-        print(f"  Avg latency: {summary['avg_latency_ms']:.4f}ms")
+        print(f"  EM: {summary['avg_em']:.2f}")
+        print(f"  F1: {summary['avg_f1']:.2f}")
+        print(f"  Avg latency: {summary['avg_latency_ms']:.1f}ms")
     print(f"  Abstention rate: {summary['abstention_rate']:.4f}")
     print(f"\nSaved to: {aggregated_path}")
 
