@@ -706,7 +706,7 @@ class ExperimentRunner:
                 # Log progress
                 if (idx + 1) % 10 == 0:
                     avg_time = total_time / (idx + 1)
-                    self.logger.info(f"Progress: {idx+1}/{len(data)}, Avg time: {avg_time:.2f}ms")
+                    self.logger.info(f"Progress: {idx+1}/{len(data)}, Avg time: {avg_time:.4f}ms")
                 
             except Exception as e:
                 self.logger.error(f"Error processing {example['_id']}: {str(e)}")
@@ -789,15 +789,15 @@ class ExperimentRunner:
                 seed=42,
             )
             statistical_metrics = {
-                'em_mean': round(stats.em_mean, 2),
-                'em_ci_lower': round(stats.em_ci_lower, 2),
-                'em_ci_upper': round(stats.em_ci_upper, 2),
-                'f1_mean': round(stats.f1_mean, 2),
-                'f1_ci_lower': round(stats.f1_ci_lower, 2),
-                'f1_ci_upper': round(stats.f1_ci_upper, 2),
-                'latency_p50': round(stats.latency_p50, 1),
-                'latency_p90': round(stats.latency_p90, 1),
-                'latency_p95': round(stats.latency_p95, 1),
+                'em_mean': round(stats.em_mean, 4),
+                'em_ci_lower': round(stats.em_ci_lower, 4),
+                'em_ci_upper': round(stats.em_ci_upper, 4),
+                'f1_mean': round(stats.f1_mean, 4),
+                'f1_ci_lower': round(stats.f1_ci_lower, 4),
+                'f1_ci_upper': round(stats.f1_ci_upper, 4),
+                'latency_p50': round(stats.latency_p50, 4),
+                'latency_p90': round(stats.latency_p90, 4),
+                'latency_p95': round(stats.latency_p95, 4),
                 'n_bootstrap': stats.n_bootstrap,
                 'n_seeds': stats.n_seeds,
             }
@@ -808,26 +808,26 @@ class ExperimentRunner:
             'num_examples': len(results),
             'num_valid': len(valid_results),
             'num_abstained': abstained_count,
-            'abstention_rate': round(abstained_count / len(valid_results), 3) if valid_results else 0,
+            'abstention_rate': round(abstained_count / len(valid_results), 4) if valid_results else 0,
             # Accuracy metrics with proper precision (<=2 decimals)
-            'avg_em': round(np.mean(em_scores), 2) if em_scores else 0,
-            'avg_f1': round(np.mean(f1_scores), 2) if f1_scores else 0,
+            'avg_em': round(np.mean(em_scores), 4) if em_scores else 0,
+            'avg_f1': round(np.mean(f1_scores), 4) if f1_scores else 0,
             # Statistical uncertainty (bootstrap 95% CIs)
             **statistical_metrics,
-            'avg_tokens_total': round(np.mean(tokens_used), 0) if tokens_used else 0,
-            'avg_latency_ms': round(np.mean(latencies), 1) if latencies else 0,
+            'avg_tokens_total': round(np.mean(tokens_used), 4) if tokens_used else 0,
+            'avg_latency_ms': round(np.mean(latencies), 4) if latencies else 0,
             'total_tokens': sum(tokens_used),
             'mode': self.config.mode
         }
 
         # Add evidence token metrics if available
         if evidence_tokens:
-            summary['avg_evidence_tokens'] = round(np.mean(evidence_tokens), 0)
+            summary['avg_evidence_tokens'] = round(np.mean(evidence_tokens), 4)
             summary['total_evidence_tokens'] = sum(evidence_tokens)
 
         # Add num_units metrics if available
         if num_units:
-            summary['avg_num_units'] = round(np.mean(num_units), 1)
+            summary['avg_num_units'] = round(np.mean(num_units), 4)
 
         # Add certificate audit for Safe-Cover mode
         if self.config.mode == 'safe_cover' and EXPERIMENTAL_UTILS_AVAILABLE:
@@ -1001,15 +1001,15 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
             seed=42,
         )
         statistical_metrics = {
-            'em_mean': round(stats.em_mean, 2),
-            'em_ci_lower': round(stats.em_ci_lower, 2),
-            'em_ci_upper': round(stats.em_ci_upper, 2),
-            'f1_mean': round(stats.f1_mean, 2),
-            'f1_ci_lower': round(stats.f1_ci_lower, 2),
-            'f1_ci_upper': round(stats.f1_ci_upper, 2),
-            'latency_p50': round(stats.latency_p50, 1),
-            'latency_p90': round(stats.latency_p90, 1),
-            'latency_p95': round(stats.latency_p95, 1),
+            'em_mean': round(stats.em_mean, 4),
+            'em_ci_lower': round(stats.em_ci_lower, 4),
+            'em_ci_upper': round(stats.em_ci_upper, 4),
+            'f1_mean': round(stats.f1_mean, 4),
+            'f1_ci_lower': round(stats.f1_ci_lower, 4),
+            'f1_ci_upper': round(stats.f1_ci_upper, 4),
+            'latency_p50': round(stats.latency_p50, 4),
+            'latency_p90': round(stats.latency_p90, 4),
+            'latency_p95': round(stats.latency_p95, 4),
             'n_bootstrap': stats.n_bootstrap,
             'n_seeds': stats.n_seeds,
         }
@@ -1020,14 +1020,14 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
         'total': len(all_results),
         'valid': len(all_results) - abstained,
         'abstained': abstained,
-        'abstention_rate': round(abstained / len(all_results), 3) if all_results else 0,
+        'abstention_rate': round(abstained / len(all_results), 4) if all_results else 0,
         # Accuracy with proper precision (<=2 decimals)
-        'avg_em': round(np.mean(em_scores), 2) if em_scores else 0,
-        'avg_f1': round(np.mean(f1_scores), 2) if f1_scores else 0,
+        'avg_em': round(np.mean(em_scores), 4) if em_scores else 0,
+        'avg_f1': round(np.mean(f1_scores), 4) if f1_scores else 0,
         # Statistical uncertainty (bootstrap 95% CIs)
         **statistical_metrics,
-        'avg_tokens': round(np.mean(tokens_used), 0) if tokens_used else 0,
-        'avg_latency_ms': round(np.mean(latencies), 1) if latencies else 0,
+        'avg_tokens': round(np.mean(tokens_used), 4) if tokens_used else 0,
+        'avg_latency_ms': round(np.mean(latencies), 4) if latencies else 0,
     }
 
     # Save aggregated results
@@ -1042,14 +1042,14 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
     print(f"\nResults:")
     print(f"  Total examples: {summary['total']}")
     if 'em_ci_lower' in summary:
-        print(f"  EM: {summary['avg_em']:.2f} [95% CI: {summary['em_ci_lower']:.2f}, {summary['em_ci_upper']:.2f}]")
-        print(f"  F1: {summary['avg_f1']:.2f} [95% CI: {summary['f1_ci_lower']:.2f}, {summary['f1_ci_upper']:.2f}]")
+        print(f"  EM: {summary['avg_em']:.4f} [95% CI: {summary['em_ci_lower']:.4f}, {summary['em_ci_upper']:.4f}]")
+        print(f"  F1: {summary['avg_f1']:.4f} [95% CI: {summary['f1_ci_lower']:.4f}, {summary['f1_ci_upper']:.4f}]")
     else:
-        print(f"  EM: {summary['avg_em']:.2f}")
-        print(f"  F1: {summary['avg_f1']:.2f}")
+        print(f"  EM: {summary['avg_em']:.4f}")
+        print(f"  F1: {summary['avg_f1']:.4f}")
     print(f"  Abstention rate: {summary['abstention_rate']:.2%}")
     if 'latency_p50' in summary:
-        print(f"  Latency (p50/p90/p95): {summary['latency_p50']:.0f}/{summary['latency_p90']:.0f}/{summary['latency_p95']:.0f} ms")
+        print(f"  Latency (p50/p90/p95): {summary['latency_p50']:.4f}/{summary['latency_p90']:.4f}/{summary['latency_p95']:.4f} ms")
     else:
         print(f"  Avg latency: {summary['avg_latency_ms']:.1f}ms")
     if 'n_seeds' in summary:
