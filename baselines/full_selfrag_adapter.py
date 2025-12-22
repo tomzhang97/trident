@@ -189,15 +189,6 @@ class FullSelfRAGAdapter(BaselineSystem):
         """
         evidences = []
 
-        def add_evidence(title: str, text_value: Any) -> None:
-            if isinstance(text_value, list):
-                for entry in text_value:
-                    if entry and str(entry).strip():
-                        evidences.append({"title": str(title), "text": str(entry).strip()})
-            else:
-                if text_value and str(text_value).strip():
-                    evidences.append({"title": str(title), "text": str(text_value).strip()})
-
         for idx, item in enumerate(context):
             try:
                 # Handle different context formats
@@ -216,7 +207,12 @@ class FullSelfRAGAdapter(BaselineSystem):
                     title = f'doc_{idx}'
                     text = str(item) if item else ''
 
-                add_evidence(title, text)
+                if isinstance(text, list):
+                    if any(str(entry).strip() for entry in text):
+                        evidences.append({"title": str(title), "text": text})
+                else:
+                    if text and str(text).strip():
+                        evidences.append({"title": str(title), "text": str(text).strip()})
             except Exception as e:
                 # Skip malformed entries but continue processing
                 print(f"Warning: Skipping malformed context entry {idx}: {e}")
@@ -323,6 +319,8 @@ class FullSelfRAGAdapter(BaselineSystem):
             if evidences and do_retrieve:
                 for evidence in evidences:
                     evidence_text = evidence.get("text", "")
+                    if isinstance(evidence_text, list):
+                        evidence_text = " ".join(str(entry) for entry in evidence_text)
                     evidence_tokens += self._count_evidence_tokens(evidence_text)
 
             # Total tokens = LLM tokens + evidence tokens
