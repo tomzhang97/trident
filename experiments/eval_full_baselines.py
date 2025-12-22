@@ -583,6 +583,12 @@ def main():
         help="GPU memory utilization fraction for Self-RAG (default 0.5)"
     )
     parser.add_argument(
+        "--selfrag_device",
+        type=str,
+        default=None,
+        help="Device for Self-RAG (e.g., cuda:0, cuda:2, 0, 2). Defaults to --local_llm_device."
+    )
+    parser.add_argument(
         "--selfrag_mode",
         type=str,
         default="adaptive_retrieval",
@@ -692,6 +698,11 @@ def main():
     if args.local_llm_device and args.local_llm_device.isdigit():
         args.local_llm_device = f"cuda:{args.local_llm_device}"
 
+    if args.selfrag_device is None:
+        args.selfrag_device = args.local_llm_device
+    elif args.selfrag_device and args.selfrag_device.isdigit():
+        args.selfrag_device = f"cuda:{args.selfrag_device}"
+
     # Expand 'all' to all baselines
     if 'all' in args.baselines:
         args.baselines = ['selfrag', 'ketrag_reimpl', 'ketrag_official', 'vanillarag', 'hipporag', 'graphrag']
@@ -723,13 +734,17 @@ def main():
             # Initialize baseline system with lazy imports
             # (avoids loading unused dependencies that may conflict with multiprocessing)
             if baseline_name == 'selfrag':
+                if args.selfrag_device:
+                    device_id = args.selfrag_device.split(":")[-1]
+                    print(f"Setting CUDA_VISIBLE_DEVICES={device_id} for Self-RAG")
+                    os.environ["CUDA_VISIBLE_DEVICES"] = device_id
                 from baselines.full_selfrag_adapter import FullSelfRAGAdapter
                 baseline_system = FullSelfRAGAdapter(
                     model_name=args.selfrag_model,
                     max_tokens=args.selfrag_max_tokens,
                     temperature=0.0,
                     gpu_memory_utilization=args.selfrag_gpu_memory_utilization,
-                    device=args.local_llm_device,
+                    device=args.selfrag_device,
                     # Vanilla Self-RAG settings
                     mode=args.selfrag_mode,
                     threshold=args.selfrag_threshold,
