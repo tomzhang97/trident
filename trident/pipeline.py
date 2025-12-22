@@ -711,6 +711,7 @@ class TridentPipeline:
             max(total_cost - budget_cap, 0) if budget_cap is not None else 0
         )
 
+        candidate_cost = sum(p.cost for p in passages)
         return {
             'selected_passages': selected,
             'certificates': certificates,
@@ -724,6 +725,8 @@ class TridentPipeline:
                 'utility': len(result.covered_facets),
                 'efficiency': len(result.covered_facets) / max(total_cost, 1) if total_cost > 0 else 0,
                 'num_units': len(selected),
+                'candidate_units': len(passages),
+                'candidate_evidence_tokens': candidate_cost,
                 'num_facets': len(facets),  # CRITICAL FIX: Track num_facets
                 'num_violated_facets': len(result.uncovered_facets),
                 'abstention_reason': result.abstention_reason.value if is_abstained else None,  # Track reason
@@ -848,6 +851,7 @@ class TridentPipeline:
                 'utility_contribution': passage.metadata.get('utility', 0)
             })
 
+        candidate_cost = sum(p.cost for p in passages)
         budget_cap = (
             self.config.pareto.max_evidence_tokens
             if self.config.pareto.max_evidence_tokens is not None
@@ -873,6 +877,8 @@ class TridentPipeline:
                 'efficiency': result.achieved_utility / max(result.total_cost, 1),
                 'vqc_iterations': vqc_iterations,
                 'num_units': len(selected),
+                'candidate_units': len(passages),
+                'candidate_evidence_tokens': candidate_cost,
                 'evidence_token_cap': budget_cap,
                 'evidence_tokens_raw': result.total_cost,
                 'evidence_tokens_over_budget': evidence_over_budget,

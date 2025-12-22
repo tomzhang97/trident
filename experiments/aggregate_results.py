@@ -98,6 +98,16 @@ def aggregate_metrics(shard_results: List[Dict[str, Any]]) -> Dict[str, Any]:
             p.get('metrics', {}).get('evidence_tokens', p.get('stats', {}).get('evidence_tokens', 0))
             for p in valid_predictions
         ]
+        candidate_values = [
+            p.get('metrics', {}).get('candidate_evidence_tokens')
+            for p in valid_predictions
+            if p.get('metrics', {}).get('candidate_evidence_tokens') is not None
+        ]
+        candidate_unit_values = [
+            p.get('metrics', {}).get('candidate_units')
+            for p in valid_predictions
+            if p.get('metrics', {}).get('candidate_units') is not None
+        ]
         overhead_values = [
             max(p.get('tokens_used', 0) - p.get('metrics', {}).get('evidence_tokens', 0), 0)
             for p in valid_predictions
@@ -109,6 +119,12 @@ def aggregate_metrics(shard_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         )
         metrics['avg_evidence_tokens'] = round(float(np.mean(evidence_values)), 2) if evidence_values else 0.0
         metrics['avg_overhead_tokens'] = round(float(np.mean(overhead_values)), 2) if overhead_values else 0.0
+        metrics['avg_candidate_evidence_tokens'] = (
+            round(float(np.mean(candidate_values)), 2) if candidate_values else 0.0
+        )
+        metrics['avg_candidate_units'] = (
+            round(float(np.mean(candidate_unit_values)), 2) if candidate_unit_values else 0.0
+        )
 
         if token_values:
             metrics['tokens_p50'] = round(float(np.percentile(token_values, 50)), 2)
@@ -118,6 +134,8 @@ def aggregate_metrics(shard_results: List[Dict[str, Any]]) -> Dict[str, Any]:
             metrics['evidence_p50'] = round(float(np.percentile(evidence_values, 50)), 2)
             metrics['evidence_p90'] = round(float(np.percentile(evidence_values, 90)), 2)
             metrics['evidence_p95'] = round(float(np.percentile(evidence_values, 95)), 2)
+        if candidate_values:
+            metrics['candidate_evidence_p95'] = round(float(np.percentile(candidate_values, 95)), 2)
 
         latencies = [p.get('latency_ms', 0) for p in valid_predictions]
         if latencies:
@@ -238,6 +256,11 @@ def generate_report(
     report.append(f"  Evidence p50/p90/p95: {metrics.get('evidence_p50', 0):.2f}/"
                   f"{metrics.get('evidence_p90', 0):.2f}/{metrics.get('evidence_p95', 0):.2f}")
     report.append(f"  Avg Overhead Tokens: {metrics.get('avg_overhead_tokens', 0):.2f}")
+    if metrics.get('avg_candidate_evidence_tokens'):
+        report.append(f"  Avg Candidate Evidence Tokens: {metrics.get('avg_candidate_evidence_tokens', 0):.2f}")
+        report.append(f"  Candidate Evidence p95: {metrics.get('candidate_evidence_p95', 0):.2f}")
+    if metrics.get('avg_candidate_units'):
+        report.append(f"  Avg Candidate Units: {metrics.get('avg_candidate_units', 0):.2f}")
     report.append(f"  Latency p50/p90/p95 (ms): {metrics.get('latency_p50', 0):.2f}/"
                   f"{metrics.get('latency_p90', 0):.2f}/{metrics.get('latency_p95', 0):.2f}")
     

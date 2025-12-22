@@ -845,6 +845,22 @@ class ExperimentRunner:
             summary['total_evidence_tokens'] = int(sum(evidence_tokens))
             summary['avg_overhead_tokens'] = round(np.mean(overhead_tokens), 2) if overhead_tokens else 0
 
+        candidate_tokens = [
+            result.get('metrics', {}).get('candidate_evidence_tokens')
+            for result in valid_results
+            if result.get('metrics', {}).get('candidate_evidence_tokens') is not None
+        ]
+        candidate_units = [
+            result.get('metrics', {}).get('candidate_units')
+            for result in valid_results
+            if result.get('metrics', {}).get('candidate_units') is not None
+        ]
+        if candidate_tokens:
+            summary['avg_candidate_evidence_tokens'] = round(float(np.mean(candidate_tokens)), 2)
+            summary['p95_candidate_evidence_tokens'] = round(float(np.percentile(candidate_tokens, 95)), 2)
+        if candidate_units:
+            summary['avg_candidate_units'] = round(float(np.mean(candidate_units)), 2)
+
         # Add num_units metrics if available
         if num_units:
             summary['avg_num_units'] = round(np.mean(num_units), 4)
