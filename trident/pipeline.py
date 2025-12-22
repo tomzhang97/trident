@@ -419,23 +419,37 @@ class TridentPipeline:
             raw_answer = llm_output.text
             # Use the new, more robust extraction function
             answer = extract_final_answer(raw_answer, query)
-            tokens_used = llm_output.tokens_used
+            total_tokens = llm_output.tokens_used
+            prompt_tokens = self.llm.compute_token_cost(prompt)
+            completion_tokens = max(total_tokens - prompt_tokens, 0)
         else:
             answer = "ABSTAINED" if result['abstained'] else ""
-            tokens_used = 0
+            total_tokens = 0
+            prompt_tokens = 0
+            completion_tokens = 0
         
         # Calculate total latency
         latency_ms = (time.time() - start_time) * 1000
         
         # Prepare output
+        metrics = result.get('metrics', {})
+        evidence_tokens = result.get('evidence_tokens', 0)
+        metrics.update({
+            'evidence_tokens': evidence_tokens,
+            'prompt_tokens': prompt_tokens,
+            'completion_tokens': completion_tokens,
+            'total_tokens': total_tokens,
+            'overhead_tokens': max(total_tokens - evidence_tokens, 0),
+        })
+
         return PipelineOutput(
             answer=answer,
             selected_passages=result['selected_passages'],
             certificates=result.get('certificates'),
             abstained=result['abstained'],
-            tokens_used=tokens_used + result.get('retrieval_tokens', 0),
+            tokens_used=total_tokens,
             latency_ms=latency_ms,
-            metrics=result.get('metrics', {}),
+            metrics=metrics,
             mode=mode,
             facets=[f.to_dict() for f in facets],
             trace=self.telemetry.get_trace()
@@ -654,6 +668,11 @@ class TridentPipeline:
         # Convert to output format
         selected = []
         total_cost = 0
+        budget_cap = (
+            self.config.safe_cover.max_evidence_tokens
+            if self.config.safe_cover.max_evidence_tokens is not None
+            else self.config.safe_cover.token_cap
+        )
         for passage in result.selected_passages:
             selected.append({
                 'pid': passage.pid,
@@ -681,6 +700,13 @@ class TridentPipeline:
         is_infeasible = result.infeasible
         is_abstained = result.abstained
 
+        capped_evidence_tokens = (
+            min(total_cost, budget_cap) if budget_cap is not None else total_cost
+        )
+        evidence_over_budget = (
+            max(total_cost - budget_cap, 0) if budget_cap is not None else 0
+        )
+
         return {
             'selected_passages': selected,
             'certificates': certificates,
@@ -688,7 +714,7 @@ class TridentPipeline:
             'infeasible': is_infeasible,
             'dual_lower_bound': getattr(result, 'dual_lower_bound', None),
             'retrieval_tokens': total_cost,
-            'evidence_tokens': total_cost,
+            'evidence_tokens': capped_evidence_tokens,
             'metrics': {
                 'coverage': len(result.covered_facets) / len(facets) if facets else 0,
                 'utility': len(result.covered_facets),
@@ -697,6 +723,10 @@ class TridentPipeline:
                 'num_facets': len(facets),  # CRITICAL FIX: Track num_facets
                 'num_violated_facets': len(result.uncovered_facets),
                 'abstention_reason': result.abstention_reason.value if is_abstained else None,  # Track reason
+                'evidence_token_cap': budget_cap,
+                'evidence_tokens_raw': total_cost,
+                'evidence_tokens_over_budget': evidence_over_budget,
+                'dual_lower_bound': getattr(result, 'dual_lower_bound', None),
             }
         }
     
@@ -814,19 +844,34 @@ class TridentPipeline:
                 'utility_contribution': passage.metadata.get('utility', 0)
             })
 
+        budget_cap = (
+            self.config.pareto.max_evidence_tokens
+            if self.config.pareto.max_evidence_tokens is not None
+            else self.config.pareto.budget
+        )
+        capped_evidence_tokens = (
+            min(result.total_cost, budget_cap) if budget_cap is not None else result.total_cost
+        )
+        evidence_over_budget = (
+            max(result.total_cost - budget_cap, 0) if budget_cap is not None else 0
+        )
+
         return {
             'selected_passages': selected,
             'certificates': None,
             'abstained': False, # Pareto mode typically does not abstain
             'infeasible': False, # Pareto mode typically is feasible
             'retrieval_tokens': result.total_cost,
-            'evidence_tokens': result.total_cost,  # Track evidence tokens separately
+            'evidence_tokens': capped_evidence_tokens,  # Track evidence tokens separately
             'metrics': {
                 'utility': result.achieved_utility,
                 'coverage': len(result.covered_facets) / len(facets) if facets else 0,
                 'efficiency': result.achieved_utility / max(result.total_cost, 1),
                 'vqc_iterations': vqc_iterations,
                 'num_units': len(selected),
+                'evidence_token_cap': budget_cap,
+                'evidence_tokens_raw': result.total_cost,
+                'evidence_tokens_over_budget': evidence_over_budget,
             }
         }
     

@@ -10,16 +10,21 @@ import argparse
 import json
 import pickle
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional, Sequence
 
 import numpy as np
 from sklearn.model_selection import train_test_split
 
-from trident.calibration import ReliabilityCalibrator
+from trident.calibration import ReliabilityCalibrator, SelectionConditionalCalibrator
 from trident.facets import FacetType
+try:
+    from trident.experimental_utils import CalibrationProvenance
+    EXPERIMENTAL_UTILS_AVAILABLE = True
+except Exception:
+    EXPERIMENTAL_UTILS_AVAILABLE = False
 
 
-def load_calibration_data(path: str) -> Tuple[List[float], List[int], List[Dict]]:
+def load_calibration_data(path: str) -> Tuple[List[float], List[int], List[Dict], List[str]]:
     """
     Load calibration dataset.
     
@@ -31,6 +36,7 @@ def load_calibration_data(path: str) -> Tuple[List[float], List[int], List[Dict]
     scores = []
     labels = []
     metadata = []
+    ids = []
     
     with open(path) as f:
         for line in f:
@@ -38,17 +44,21 @@ def load_calibration_data(path: str) -> Tuple[List[float], List[int], List[Dict]
             scores.append(item['score'])
             labels.append(item['label'])
             metadata.append(item.get('metadata', {}))
+            ids.append(str(item.get('id', item.get('query_id', item.get('example_id', '')))))
     
-    return scores, labels, metadata
+    return scores, labels, metadata, ids
 
 
-def generate_synthetic_calibration_data(n_samples: int = 1000) -> Tuple[List[float], List[int], List[Dict]]:
+def generate_synthetic_calibration_data(
+    n_samples: int = 1000
+) -> Tuple[List[float], List[int], List[Dict], List[str]]:
     """Generate synthetic calibration data for testing."""
     
     np.random.seed(42)
     scores = []
     labels = []
     metadata = []
+    ids = []
     
     facet_types = ["ENTITY", "RELATION", "TEMPORAL", "NUMERIC", "BRIDGE"]
     
@@ -72,8 +82,92 @@ def generate_synthetic_calibration_data(n_samples: int = 1000) -> Tuple[List[flo
         scores.append(score)
         labels.append(label)
         metadata.append(meta)
+        ids.append(meta["facet_id"])
     
-    return scores, labels, metadata
+    return scores, labels, metadata, ids
+
+
+def load_eval_ids(path: str) -> List[str]:
+    """Load evaluation IDs from JSON or JSONL."""
+    eval_ids: List[str] = []
+    with open(path) as f:
+        first_line = f.readline()
+        f.seek(0)
+        if first_line.lstrip().startswith("["):
+            data = json.load(f)
+            for item in data:
+                if isinstance(item, dict):
+                    eval_ids.append(str(item.get('_id', item.get('id', ''))))
+        else:
+            for line in f:
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                if isinstance(item, dict):
+                    eval_ids.append(str(item.get('_id', item.get('id', ''))))
+    return [eid for eid in eval_ids if eid]
+
+
+def build_calibration_provenance(
+    scores: Sequence[float],
+    labels: Sequence[int],
+    metadata: Sequence[Dict[str, Any]],
+    ids: Sequence[str],
+    args: argparse.Namespace
+) -> Optional[Dict[str, Any]]:
+    """Build calibration provenance record with bin statistics."""
+    if not EXPERIMENTAL_UTILS_AVAILABLE:
+        return None
+
+    provenance = CalibrationProvenance(
+        corpus_name=args.corpus_name or "",
+        corpus_version=args.corpus_version or "",
+        corpus_size=len(scores),
+        calibration_split=args.calibration_split,
+        retriever_version=args.retriever_version or "",
+        reranker_version=args.reranker_version or "",
+        shortlister_version=args.shortlister_version or "",
+        verifier_version=args.verifier_version or "",
+    )
+
+    if ids:
+        provenance.compute_corpus_hash([cid for cid in ids if cid])
+
+    if args.eval_ids_path:
+        eval_ids = load_eval_ids(args.eval_ids_path)
+        if ids and eval_ids:
+            provenance.validate_no_leakage(ids, eval_ids)
+
+    calibrator = SelectionConditionalCalibrator(n_min=args.calibration_n_min)
+    for score, label, meta in zip(scores, labels, metadata):
+        calibrator.add_calibration_sample(
+            score=score,
+            is_sufficient=bool(label),
+            facet_type=meta.get('facet_type', 'UNKNOWN'),
+            text_length=int(meta.get('text_length', 100)),
+            retriever_score=float(meta.get('retriever_score', 0.5)),
+        )
+    calibrator.finalize()
+
+    merged_bins = set(calibrator.merged_bins.keys())
+    for bin_key, bin_obj in calibrator.bins.items():
+        if bin_key in merged_bins:
+            continue
+        score_percentiles = None
+        if bin_obj.negative_scores:
+            score_percentiles = {
+                "p50": float(np.percentile(bin_obj.negative_scores, 50)),
+                "p5": float(np.percentile(bin_obj.negative_scores, 5)),
+                "p95": float(np.percentile(bin_obj.negative_scores, 95)),
+            }
+        provenance.add_bin_statistics(
+            bin_key=bin_key,
+            n_negatives=bin_obj.n_negatives,
+            n_positives=bin_obj.n_positives,
+            score_percentiles=score_percentiles,
+        )
+
+    return provenance.to_provenance_record()
 
 
 def train_calibrator(
@@ -254,6 +348,26 @@ def main():
         default=0.2,
         help="Fraction of data to use for testing"
     )
+    parser.add_argument(
+        "--output_provenance",
+        type=str,
+        default=None,
+        help="Optional path to save calibration provenance metadata (JSON)"
+    )
+    parser.add_argument("--corpus_name", type=str, default="", help="Calibration corpus name")
+    parser.add_argument("--corpus_version", type=str, default="", help="Calibration corpus version")
+    parser.add_argument("--calibration_split", type=str, default="train", help="Calibration split name")
+    parser.add_argument("--retriever_version", type=str, default="", help="Retriever version/hash")
+    parser.add_argument("--reranker_version", type=str, default="", help="Reranker version/hash")
+    parser.add_argument("--shortlister_version", type=str, default="", help="Shortlister version/hash")
+    parser.add_argument("--verifier_version", type=str, default="", help="Verifier version/hash")
+    parser.add_argument("--eval_ids_path", type=str, default=None, help="Optional eval IDs for leakage check")
+    parser.add_argument(
+        "--calibration_n_min",
+        type=int,
+        default=50,
+        help="Minimum negatives per bin before merging (for provenance audit)"
+    )
     
     args = parser.parse_args()
     
@@ -264,10 +378,10 @@ def main():
     # Load or generate data
     if args.use_synthetic or not args.data_path:
         print("\nGenerating synthetic calibration data...")
-        scores, labels, metadata = generate_synthetic_calibration_data(2000)
+        scores, labels, metadata, ids = generate_synthetic_calibration_data(2000)
     else:
         print(f"\nLoading calibration data from {args.data_path}...")
-        scores, labels, metadata = load_calibration_data(args.data_path)
+        scores, labels, metadata, ids = load_calibration_data(args.data_path)
     
     print(f"Total samples: {len(scores)}")
     print(f"Positive rate: {sum(labels) / len(labels):.3f}")
@@ -343,6 +457,12 @@ def main():
     json_path = output_path.with_suffix('.json')
     calibrator.save(str(json_path))
     print(f"Calibrator JSON saved to {json_path}")
+
+    provenance_record = build_calibration_provenance(scores, labels, metadata, ids, args)
+    if provenance_record and args.output_provenance:
+        with open(args.output_provenance, "w") as f:
+            json.dump(provenance_record, f, indent=2)
+        print(f"Calibration provenance saved to {args.output_provenance}")
     
     # Print usage instructions
     print("\n" + "=" * 40)

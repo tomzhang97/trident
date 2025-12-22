@@ -69,6 +69,7 @@ class TridentSystemWrapper:
             "tokens_used": output.tokens_used,
             "latency_ms": output.latency_ms,
             "selected_passages": output.selected_passages,
+            "certificates": output.certificates,
             "abstained": output.abstained,
             "mode": f"trident_{self.mode}",
             "stats": {
