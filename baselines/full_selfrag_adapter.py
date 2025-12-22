@@ -188,6 +188,16 @@ class FullSelfRAGAdapter(BaselineSystem):
             List of evidence dicts with 'title' and 'text' keys
         """
         evidences = []
+
+        def add_evidence(title: str, text_value: Any) -> None:
+            if isinstance(text_value, list):
+                for entry in text_value:
+                    if entry and str(entry).strip():
+                        evidences.append({"title": str(title), "text": str(entry).strip()})
+            else:
+                if text_value and str(text_value).strip():
+                    evidences.append({"title": str(title), "text": str(text_value).strip()})
+
         for idx, item in enumerate(context):
             try:
                 # Handle different context formats
@@ -196,20 +206,17 @@ class FullSelfRAGAdapter(BaselineSystem):
                     title = item.get('title', f'doc_{idx}')
                     text = item.get('text', '')
                     if not text:
-                        sentences = item.get('sentences', [])
-                        text = " ".join(sentences) if isinstance(sentences, list) else str(sentences)
+                        text = item.get('sentences', [])
                 elif isinstance(item, (list, tuple)) and len(item) >= 2:
                     # List/tuple format: [title, sentences] or (title, sentences)
                     title, sentences = item[0], item[1]
-                    text = " ".join(sentences) if isinstance(sentences, list) else str(sentences)
+                    text = sentences
                 else:
                     # Single string or other format - use as text directly
                     title = f'doc_{idx}'
                     text = str(item) if item else ''
 
-                # Skip empty texts
-                if text and text.strip():
-                    evidences.append({"title": str(title), "text": text.strip()})
+                add_evidence(title, text)
             except Exception as e:
                 # Skip malformed entries but continue processing
                 print(f"Warning: Skipping malformed context entry {idx}: {e}")
@@ -263,15 +270,10 @@ class FullSelfRAGAdapter(BaselineSystem):
             # Format evidences from context
             evidences = self._format_evidences(context) if context else []
 
-            # Limit evidences to ndocs
-            evidences = evidences[:self.ndocs]
-
-            # CRITICAL FIX: Handle empty evidences case
-            # Self-RAG requires at least some evidence to avoid index errors
-            if not evidences:
-                print(f"Warning: No valid evidences for question, using no-retrieval mode")
-                # Create a minimal placeholder evidence to avoid crashes
-                evidences = [{"title": "no_context", "text": "No context available."}]
+            effective_mode = self.mode
+            if not evidences and self.mode != "no_retrieval":
+                print("Warning: No valid evidences for question; switching to no-retrieval mode")
+                effective_mode = "no_retrieval"
 
             # Generate using vanilla Self-RAG function
             query_latency_tracker.start()
@@ -289,7 +291,7 @@ class FullSelfRAGAdapter(BaselineSystem):
                 w_rel=self.w_rel,
                 w_sup=self.w_sup,
                 w_use=self.w_use,
-                mode=self.mode,
+                mode=effective_mode,
                 closed=False,  # HotpotQA is open-domain QA
             )
             query_latency_tracker.stop("generation")

@@ -67,7 +67,6 @@ Environment variables:
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 from typing import Dict, Any, List
@@ -141,9 +140,8 @@ def convert_2wiki_example(ex: Dict) -> Dict:
     - Context may be in different formats (dict or list)
     - Types: comparison, inference, compositional, bridge
 
-    IMPORTANT: This function normalizes context to sentence-level format
-    (matching HotpotQA) for optimal SelfRAG performance. SelfRAG was trained
-    on sentence-level passages and performs better with smaller text units.
+    IMPORTANT: This function keeps context as-is and only normalizes types
+    for consistent list-based handling.
     """
     # Handle context format - 2Wiki uses similar format to HotpotQA
     raw_context = ex.get('context', [])
@@ -173,33 +171,12 @@ def convert_2wiki_example(ex: Dict) -> Dict:
                 normalized_context.append([title, sentences])
         raw_context = normalized_context
 
-    # Split paragraphs into sentences for optimal SelfRAG performance
-    # This matches the sentence-level format SelfRAG was trained on (HotpotQA)
     final_context = []
     for title, sentences in raw_context:
         if isinstance(sentences, str):
-            # Single paragraph string - split into sentences
-            split_sents = re.split(r'(?<=[.!?])\s+', sentences.strip())
-            split_sents = [s.strip() for s in split_sents if s.strip()]
-            final_context.append([title, split_sents if split_sents else [sentences]])
+            final_context.append([title, [sentences]])
         elif isinstance(sentences, list):
-            # Check if these are already sentence-level or paragraph-level
-            if sentences:
-                avg_words = sum(len(s.split()) for s in sentences if isinstance(s, str)) / max(len(sentences), 1)
-                # If average > 25 words, likely paragraphs - split them
-                if avg_words > 25:
-                    all_sentences = []
-                    for para in sentences:
-                        if isinstance(para, str):
-                            split_sents = re.split(r'(?<=[.!?])\s+', para.strip())
-                            split_sents = [s.strip() for s in split_sents if s.strip()]
-                            all_sentences.extend(split_sents)
-                    final_context.append([title, all_sentences if all_sentences else sentences])
-                else:
-                    # Already sentence-level
-                    final_context.append([title, sentences])
-            else:
-                final_context.append([title, sentences])
+            final_context.append([title, sentences])
         else:
             final_context.append([title, [str(sentences)] if sentences else []])
 
@@ -620,13 +597,13 @@ def main():
     )
     parser.add_argument(
         "--selfrag_use_groundness",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Use groundedness/support tokens for scoring (default: True)"
     )
     parser.add_argument(
         "--selfrag_use_utility",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Use utility tokens for scoring (default: True)"
     )
