@@ -541,9 +541,13 @@ class TridentPipeline:
     
     def _estimate_token_cost(self, text: str) -> int:
         """Estimate token cost more accurately."""
-        # More realistic estimate: ~1.3 tokens per word + overhead
-        words = len(text.split())
-        return int(words * 1.3) + 10  # Add overhead for special tokens
+        # Prefer tokenizer-based counts when available for budget accuracy
+        try:
+            return int(self.llm.compute_token_cost(text))
+        except Exception:
+            # Fallback: ~1.3 tokens per word + overhead
+            words = len(text.split())
+            return int(words * 1.3) + 10  # Add overhead for special tokens
     
     def _two_stage_scoring(
         self,
