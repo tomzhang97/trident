@@ -68,6 +68,7 @@ Environment variables:
 import argparse
 import json
 import sys
+import re
 from pathlib import Path
 from typing import Dict, Any, List
 import time
@@ -173,12 +174,9 @@ def convert_2wiki_example(ex: Dict) -> Dict:
 
     final_context = []
     for title, sentences in raw_context:
-        if isinstance(sentences, str):
-            final_context.append([title, [sentences]])
-        elif isinstance(sentences, list):
-            final_context.append([title, sentences])
-        else:
-            final_context.append([title, [str(sentences)] if sentences else []])
+        # Normalize everything into a true sentence list (Hotpot-style)
+        sent_list = _normalize_to_sentence_list(sentences, max_sents=60)
+        final_context.append([title, sent_list])
 
     # Handle supporting_facts - 2Wiki may use 'evidences' or 'supporting_facts'
     sf = ex.get('supporting_facts', ex.get('evidences', []))
@@ -880,3 +878,49 @@ def main():
 
 if __name__ == "__main__":
     main()
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _normalize_to_sentence_list(x: Any, *, max_sents: int = 60) -> List[str]:
+    """
+    Convert a 2Wiki 'sentences' field into a clean List[str].
+    - If it's a long paragraph-like string, split into sentences.
+    - If it's a list, flatten + split paragraph-like entries when needed.
+    """
+    if x is None:
+        return []
+
+    def _split_if_paragraph(s: str) -> List[str]:
+        s = s.strip()
+        if not s:
+            return []
+        # Heuristic: if very long, treat as paragraph and split.
+        word_count = len(s.split())
+        if word_count >= 35:
+            parts = _SENT_SPLIT_RE.split(s)
+            parts = [p.strip() for p in parts if p.strip()]
+            return parts if parts else [s]
+        return [s]
+
+    out: List[str] = []
+    if isinstance(x, str):
+        out = _split_if_paragraph(x)
+    elif isinstance(x, list):
+        flat: List[Any] = []
+        for it in x:
+            if isinstance(it, list):
+                flat.extend(it)
+            else:
+                flat.append(it)
+        for it in flat:
+            if it is None:
+                continue
+            if isinstance(it, str):
+                out.extend(_split_if_paragraph(it))
+            else:
+                out.append(str(it).strip())
+        out = [s for s in out if s]
+    else:
+        out = [str(x).strip()] if str(x).strip() else []
+
+    return out[:max_sents]

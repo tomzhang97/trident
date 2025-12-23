@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 import os
+import re
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
@@ -17,6 +18,8 @@ from baselines.full_baseline_interface import (
     TokenTracker,
     LatencyTracker,
 )
+
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 # Add the self-rag folder to path for imports
 SELFRAG_PATH = Path(__file__).parent.parent / "external_baselines" / "self-rag" / "retrieval_lm"
@@ -174,7 +177,45 @@ class FullSelfRAGAdapter(BaselineSystem):
 
         print(f"Self-RAG initialized with mode={mode}, threshold={threshold}")
 
-    def _format_evidences(self, context: List) -> List[Dict[str, str]]:
+    def _to_sentence_list(self, x: Any, *, max_sents: int = 60) -> List[str]:
+        if x is None:
+            return []
+
+        def _split_if_paragraph(s: str) -> List[str]:
+            s = s.strip()
+            if not s:
+                return []
+            if len(s.split()) >= 35:
+                parts = _SENT_SPLIT_RE.split(s)
+                parts = [p.strip() for p in parts if p.strip()]
+                return parts if parts else [s]
+            return [s]
+
+        out: List[str] = []
+        if isinstance(x, str):
+            out = _split_if_paragraph(x)
+        elif isinstance(x, list):
+            flat: List[Any] = []
+            for it in x:
+                if isinstance(it, list):
+                    flat.extend(it)
+                else:
+                    flat.append(it)
+            for it in flat:
+                if it is None:
+                    continue
+                if isinstance(it, str):
+                    out.extend(_split_if_paragraph(it))
+                else:
+                    t = str(it).strip()
+                    if t:
+                        out.append(t)
+        else:
+            t = str(x).strip()
+            out = [t] if t else []
+        return out[:max_sents]
+
+    def _format_evidences(self, context: List) -> List[Dict[str, Any]]:
         """
         Format context into Self-RAG evidence format.
 
@@ -207,12 +248,9 @@ class FullSelfRAGAdapter(BaselineSystem):
                     title = f'doc_{idx}'
                     text = str(item) if item else ''
 
-                if isinstance(text, list):
-                    if any(str(entry).strip() for entry in text):
-                        evidences.append({"title": str(title), "text": text})
-                else:
-                    if text and str(text).strip():
-                        evidences.append({"title": str(title), "text": str(text).strip()})
+                sent_list = self._to_sentence_list(text, max_sents=60)
+                if sent_list:
+                    evidences.append({"title": str(title), "text": sent_list})
             except Exception as e:
                 # Skip malformed entries but continue processing
                 print(f"Warning: Skipping malformed context entry {idx}: {e}")
