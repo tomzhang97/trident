@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from trident.facets import FacetMiner
 from trident.nli_scorer import NLIScorer
+from trident.candidates import Passage
 from trident.config import TridentConfig, NLIConfig
 
 
@@ -84,14 +85,17 @@ def extract_calibration_samples(
             # Determine if this passage is in supporting facts
             is_supporting = title in supporting_titles
 
+            # Create Passage object for NLI scoring
+            passage = Passage(
+                pid=passage_id,
+                text=passage_text,
+                cost=len(passage_text.split())  # Approximate token count
+            )
+
             # Score each facet against this passage
             for facet in facets:
-                # Get NLI score
-                score = nli_scorer.score_passage_for_facet(
-                    passage_text,
-                    facet.query_text,
-                    facet.facet_type.value
-                )
+                # Get NLI score using the correct API
+                score = nli_scorer.score(passage, facet)
 
                 # Create calibration sample
                 sample = {
