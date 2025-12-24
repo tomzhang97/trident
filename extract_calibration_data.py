@@ -110,7 +110,7 @@ def extract_calibration_samples(
                         'passage_id': passage_id,
                         'facet_id': facet.facet_id,
                         'question': question,
-                        'facet_query': facet.query_text,
+                        'facet_hypothesis': facet.to_hypothesis(),  # Use to_hypothesis() method
                     }
                 }
                 samples.append(sample)
