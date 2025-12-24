@@ -33,6 +33,24 @@ from trident.candidates import Passage
 from trident.config import TridentConfig, NLIConfig
 
 
+def facet_to_query_text(facet) -> str:
+    """Safely extract query text from facet, trying common attribute names."""
+    for attr in ("to_hypothesis", "query_text", "query", "text", "facet_text", "statement", "value"):
+        v = getattr(facet, attr, None)
+        # If it's a method, try calling it
+        if callable(v):
+            try:
+                result = v()
+                if isinstance(result, str) and result.strip():
+                    return result
+            except:
+                continue
+        # If it's a string attribute
+        elif isinstance(v, str) and v.strip():
+            return v
+    return str(facet)
+
+
 def load_hotpotqa_data(path: str, limit: int = None) -> List[Dict[str, Any]]:
     """Load HotpotQA data."""
     with open(path) as f:
@@ -97,6 +115,10 @@ def extract_calibration_samples(
                 # Get NLI score using the correct API
                 score = nli_scorer.score(passage, facet)
 
+                # Safely extract facet type
+                facet_type = getattr(facet, "facet_type", None)
+                facet_type_str = getattr(facet_type, "value", None) or str(facet_type) if facet_type is not None else "UNKNOWN"
+
                 # Create calibration sample
                 sample = {
                     'id': f"{example['_id']}_{passage_id}_{facet.facet_id}",
@@ -104,13 +126,13 @@ def extract_calibration_samples(
                     'score': float(score),
                     'label': 1 if is_supporting else 0,  # Binary label
                     'metadata': {
-                        'facet_type': facet.facet_type.value,
+                        'facet_type': facet_type_str,
                         'text_length': len(passage_text),
                         'retriever_score': 1.0,  # Perfect retrieval (oracle context)
                         'passage_id': passage_id,
                         'facet_id': facet.facet_id,
                         'question': question,
-                        'facet_hypothesis': facet.to_hypothesis(),  # Use to_hypothesis() method
+                        'facet_query': facet_to_query_text(facet),  # Defensive extraction
                     }
                 }
                 samples.append(sample)
