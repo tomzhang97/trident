@@ -155,6 +155,20 @@ PARETO_MATCH_400 = ParetoConfig(
     bwk_exploration_bonus=0.1,
 )
 
+# Ablation: Pareto 500 without reranker
+PARETO_MATCH_500_NO_RERANK = ParetoConfig(
+    budget=500,
+    max_evidence_tokens=500,
+    max_units=5,
+    stop_on_budget=True,
+    relaxed_alpha=0.6,
+    weight_default=1.0,
+    use_vqc=False,
+    use_bwk=False,
+    max_vqc_iterations=0,
+    bwk_exploration_bonus=0.1,
+)
+
 # =============================================================================
 # Safe-Cover configs: Strict risk control
 # =============================================================================
@@ -201,6 +215,40 @@ SAFE_COVER_EQUAL_2000 = SafeCoverConfig(
     stop_on_budget=True,
     abstain_on_infeasible=False,  # Allow partial solutions
     fallback_to_pareto=True,  # Fall back to Pareto when Safe-Cover fails
+    coverage_threshold=0.15,
+    token_cap=2000,
+    dual_tolerance=1e-6,
+    early_abstain=True,
+    use_certificates=True,
+    monitor_drift=False,
+    psi_threshold=0.5,
+)
+
+# Ablation: Safe 2000 with NLI threshold 0.8
+SAFE_COVER_2000_NLI08 = SafeCoverConfig(
+    per_facet_alpha=0.02,
+    max_evidence_tokens=2000,
+    max_units=10,
+    stop_on_budget=True,
+    abstain_on_infeasible=False,
+    fallback_to_pareto=True,
+    coverage_threshold=0.15,
+    token_cap=2000,
+    dual_tolerance=1e-6,
+    early_abstain=True,
+    use_certificates=True,
+    monitor_drift=False,
+    psi_threshold=0.5,
+)
+
+# Ablation: Safe 2000 without Mondrian calibration
+SAFE_COVER_2000_NO_MONDRIAN = SafeCoverConfig(
+    per_facet_alpha=0.02,
+    max_evidence_tokens=2000,
+    max_units=10,
+    stop_on_budget=True,
+    abstain_on_infeasible=False,
+    fallback_to_pareto=True,
     coverage_threshold=0.15,
     token_cap=2000,
     dual_tolerance=1e-6,
@@ -282,12 +330,17 @@ PARETO_CONFIGS = {
     "pareto_match_400": PARETO_MATCH_400,
     "pareto_match_1500_alpha06": PARETO_MATCH_1500_ALPHA06,
     "pareto_match_500_alpha06": PARETO_MATCH_500_ALPHA06,
+    # Ablation configs
+    "pareto_match_500_no_rerank": PARETO_MATCH_500_NO_RERANK,
 }
 
 SAFE_COVER_CONFIGS = {
     "safe_cover_loose_4000": SAFE_COVER_LOOSE_4000,
     "safe_cover_equal_2500": SAFE_COVER_EQUAL_2500,
     "safe_cover_equal_2000": SAFE_COVER_EQUAL_2000,
+    # Ablation configs
+    "safe_cover_2000_nli08": SAFE_COVER_2000_NLI08,
+    "safe_cover_2000_no_mondrian": SAFE_COVER_2000_NO_MONDRIAN,
 }
 
 SELFRAG_CONFIGS = {

@@ -439,6 +439,20 @@ class ExperimentRunner:
             }
         }
 
+        # Apply ablation-specific overrides
+        if config_family_name == "pareto_match_500_no_rerank":
+            # Disable reranker for ablation study
+            config_dict["retrieval"]["use_reranker"] = False
+            self.logger.info("Ablation: Reranker disabled")
+        elif config_family_name == "safe_cover_2000_nli08":
+            # Set NLI threshold to 0.8 for ablation study
+            config_dict["nli"] = {"score_threshold": 0.8}
+            self.logger.info("Ablation: NLI threshold set to 0.8")
+        elif config_family_name == "safe_cover_2000_no_mondrian":
+            # Disable Mondrian calibration for ablation study
+            config_dict["calibration"] = {"use_mondrian": False}
+            self.logger.info("Ablation: Mondrian calibration disabled")
+
         # Add mode-specific config
         if mode == "pareto":
             config_dict["pareto"] = {
