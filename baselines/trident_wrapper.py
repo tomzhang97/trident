@@ -64,17 +64,20 @@ class TridentSystemWrapper:
         )
 
         # Convert to baseline-compatible format
+        # CRITICAL FIX: Ensure certificates is always a list, never None
+        certificates = output.certificates if output.certificates is not None else []
+
         return {
             "answer": output.answer,
             "tokens_used": output.tokens_used,
             "latency_ms": output.latency_ms,
             "selected_passages": output.selected_passages,
-            "certificates": output.certificates,
+            "certificates": certificates,
             "abstained": output.abstained,
             "mode": f"trident_{self.mode}",
             "stats": {
                 **output.metrics,
-                "certificates": len(output.certificates) if output.certificates else 0,
+                "certificates": len(certificates),
                 "num_facets": len(output.facets),
             },
         }

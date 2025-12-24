@@ -378,12 +378,23 @@ class TridentPipeline:
                 # Access the fallback_to_pareto field directly from the dataclass instance
                 if self.config.safe_cover.fallback_to_pareto:
                     self.telemetry.log("fallback", {"reason": "safe_cover_abstain_or_infeasible"})
+                    # IMPORTANT: Preserve Safe-Cover attempt details before fallback
+                    safe_cover_attempt = {
+                        'certificates': result.get('certificates', []),
+                        'covered_facets': result.get('metrics', {}).get('coverage', 0),
+                        'dual_lower_bound': result.get('dual_lower_bound'),
+                        'abstention_reason': result.get('metrics', {}).get('abstention_reason'),
+                    }
                     # Run Pareto with the same data
                     pareto_result = self._run_pareto(query, facets, passages, scores)
-                    # Use the Pareto result instead, but mark that the primary mode failed
+                    # Use the Pareto result instead, but preserve Safe-Cover attempt info
                     result = pareto_result
-                    # Optionally, append mode info to metrics to distinguish
+                    # Append Safe-Cover attempt details to metrics
                     result['metrics']['fallback_from'] = 'safe_cover'
+                    result['metrics']['safe_cover_attempt'] = safe_cover_attempt
+                    # Preserve Safe-Cover certificates in the result
+                    if not result.get('certificates'):
+                        result['certificates'] = safe_cover_attempt['certificates']
                 # else: keep the original Safe-Cover result (e.g., abstained=True)
         elif mode == "pareto":
             result = self._run_pareto(query, facets, passages, scores)
