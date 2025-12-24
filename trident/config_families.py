@@ -258,6 +258,23 @@ SAFE_COVER_2000_NO_MONDRIAN = SafeCoverConfig(
     psi_threshold=0.5,
 )
 
+# Diagnostic: Relaxed Safe-Cover for testing (alpha=0.10)
+SAFE_COVER_2000_RELAXED = SafeCoverConfig(
+    per_facet_alpha=0.10,  # Much more relaxed (5x less strict)
+    max_evidence_tokens=2000,
+    max_units=10,
+    stop_on_budget=True,
+    abstain_on_infeasible=False,
+    fallback_to_pareto=False,  # Don't fall back - see real Safe-Cover behavior
+    coverage_threshold=0.15,
+    token_cap=2000,
+    dual_tolerance=1e-6,
+    early_abstain=True,
+    use_certificates=True,
+    monitor_drift=False,
+    psi_threshold=0.5,
+)
+
 
 # =============================================================================
 # Self-RAG configs for fair baseline comparison
@@ -341,6 +358,8 @@ SAFE_COVER_CONFIGS = {
     # Ablation configs
     "safe_cover_2000_nli08": SAFE_COVER_2000_NLI08,
     "safe_cover_2000_no_mondrian": SAFE_COVER_2000_NO_MONDRIAN,
+    # Diagnostic configs
+    "safe_cover_2000_relaxed": SAFE_COVER_2000_RELAXED,
 }
 
 SELFRAG_CONFIGS = {
