@@ -249,17 +249,36 @@ class TridentPipeline:
         config: TridentConfig,
         llm: LLMInterface,
         retriever: Any,
-        device: str = "cuda:0"
+        device: str = "cuda:0",
+        calibration_path: Optional[str] = None
     ):
         self.config = config
         self.llm = llm
         self.retriever = retriever
         self.device = device
-        
+
         # Initialize components
         self.facet_miner = FacetMiner(config)
         self.nli_scorer = NLIScorer(config.nli, device)
-        self.calibrator = ReliabilityCalibrator(use_mondrian=config.calibration.use_mondrian)
+
+        # Load calibrator from file if provided, otherwise create empty one
+        if calibration_path:
+            import json
+            from pathlib import Path
+            cal_path = Path(calibration_path)
+            if cal_path.exists():
+                print(f"📊 Loading calibration from: {calibration_path}")
+                self.calibrator = ReliabilityCalibrator.load(str(cal_path))
+                print(f"✅ Calibrator loaded successfully")
+            else:
+                print(f"⚠️  Warning: Calibration file not found: {calibration_path}")
+                print(f"    Creating empty calibrator (Safe-Cover will not work!)")
+                self.calibrator = ReliabilityCalibrator(use_mondrian=config.calibration.use_mondrian)
+        else:
+            # No calibration file provided - create empty calibrator
+            # Note: Safe-Cover requires calibration data to work!
+            self.calibrator = ReliabilityCalibrator(use_mondrian=config.calibration.use_mondrian)
+
         self.telemetry = TelemetryTracker(config.telemetry)
         
         # Initialize mode-specific components

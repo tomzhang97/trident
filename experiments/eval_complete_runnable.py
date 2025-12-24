@@ -604,12 +604,13 @@ class ExperimentRunner:
         mode = self.config.mode
 
         if mode in ["safe_cover", "pareto", "both"]:
-            # Initialize TRIDENT pipeline
+            # Initialize TRIDENT pipeline with optional calibration data
             pipeline = TridentPipeline(
                 config=self.config,
                 llm=self.llm,
                 retriever=self.retriever,
-                device=self.device
+                device=self.device,
+                calibration_path=getattr(self.args, 'calibration_path', None)
             )
             return TridentSystemWrapper(pipeline, mode=mode)
 
@@ -1147,7 +1148,13 @@ Examples:
         default=None,
         help="Optional JSON file with calibration provenance/audit metadata"
     )
-    
+    parser.add_argument(
+        "--calibration_path",
+        type=str,
+        default=None,
+        help="Path to calibration file (JSON) for Safe-Cover p-value computation"
+    )
+
     # Retrieval configuration
     parser.add_argument("--retrieval_method", choices=["dense", "hybrid", "sparse"], default="dense")
     parser.add_argument("--corpus_path", type=str, help="Path to corpus for retrieval")
