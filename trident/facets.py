@@ -192,7 +192,8 @@ class Facet:
             mention = _safe_phrase(self.template.get("mention", ""))
             if _looks_like_junk_entity(mention):
                 return "The passage mentions the relevant entity."
-            return _ensure_sentence(f'The passage contains the exact phrase "{mention}".')
+            # Σ(p,f) hypothesis: schema-bound sufficiency, not mere lexical containment
+            return _ensure_sentence(f'The passage identifies "{mention}" unambiguously (not merely a mention).')
 
         if ft == FacetType.RELATION:
             subj = _safe_phrase(self.template.get("subject", ""))
@@ -224,15 +225,16 @@ class Facet:
             value = _safe_phrase(self.template.get("value", ""))
             unit = _safe_phrase(self.template.get("unit", ""))
             attr = _safe_phrase(self.template.get("attribute", ""))
+            # Σ(p,f) hypothesis: value bound to property, not mere containment
             if entity and attr and value:
                 v = f"{value} {unit}".strip()
-                return _ensure_sentence(f"{entity} has {attr} of {v}")
+                return _ensure_sentence(f"The passage states that {entity}'s {attr} is {v}")
             if entity and value:
                 v = f"{value} {unit}".strip()
-                return _ensure_sentence(f"{entity} has value {v}")
+                return _ensure_sentence(f"The passage states that {entity} has the value {v}")
             if value:
                 v = f"{value} {unit}".strip()
-                return _ensure_sentence(f"The passage states the value {v}")
+                return _ensure_sentence(f"The passage binds the value {v} to a specific property")
             return "The passage states a relevant numeric fact."
 
         if ft == FacetType.BRIDGE_HOP1:
