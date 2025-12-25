@@ -24,28 +24,60 @@ except Exception:
     EXPERIMENTAL_UTILS_AVAILABLE = False
 
 
-def load_calibration_data(path: str) -> Tuple[List[float], List[int], List[Dict], List[str]]:
+def load_calibration_data(path: str, filter_lexical_false: bool = True, use_entail_prob: bool = True) -> Tuple[List[float], List[int], List[Dict], List[str]]:
     """
     Load calibration dataset.
-    
+
     Expected format: JSONL with fields:
-    - score: NLI/CE score
+    - score: NLI/CE score (or use probs.entail if use_entail_prob=True)
+    - probs: {entail, neutral, contra} probabilities
     - label: 1 if passage sufficient for facet, 0 otherwise
-    - metadata: facet_type, text_length, etc.
+    - metadata: facet_type, text_length, lexical_match, etc.
+
+    Args:
+        path: Path to JSONL file
+        filter_lexical_false: If True, skip samples where lexical_match=False
+                             (since they're gated at runtime anyway)
+        use_entail_prob: If True, use probs.entail instead of score
+                        (more stable for calibration)
     """
     scores = []
     labels = []
     metadata = []
     ids = []
-    
+
+    n_total = 0
+    n_filtered_lex = 0
+
     with open(path) as f:
         for line in f:
             item = json.loads(line.strip())
-            scores.append(item['score'])
-            labels.append(item['label'])
-            metadata.append(item.get('metadata', {}))
+            n_total += 1
+
+            meta = item.get('metadata', {})
+
+            # ✅ Filter out lexical_match=False cases (they're gated at runtime)
+            if filter_lexical_false and meta.get('lexical_match', None) is False:
+                n_filtered_lex += 1
+                continue
+
+            # Use entail prob or score
+            if use_entail_prob and 'probs' in item:
+                probs = item['probs']
+                # Use entailment probability directly (most stable)
+                score = float(probs.get('entail', item.get('score', 0.0)))
+            else:
+                score = float(item.get('score', 0.0))
+
+            scores.append(score)
+            labels.append(int(item['label']))
+            metadata.append(meta)
             ids.append(str(item.get('id', item.get('query_id', item.get('example_id', '')))))
-    
+
+    if n_filtered_lex > 0:
+        print(f"  Filtered {n_filtered_lex}/{n_total} samples with lexical_match=False")
+        print(f"  (Keeping {len(scores)} samples for calibration)")
+
     return scores, labels, metadata, ids
 
 
@@ -267,31 +299,33 @@ def evaluate_calibration(
     for facet_type, group_data in facet_groups.items():
         p_values = np.array(group_data['p_values'])
         labels = np.array(group_data['labels'])
-        
+
         # Calibration error at different alpha levels
         alphas = [0.01, 0.05, 0.1]
         for alpha in alphas:
-            # Predicted positives
-            predicted_positive = p_values <= alpha
-            actual_positive = labels == 1
-            
-            # False positive rate (should be ≤ alpha for good calibration)
-            if predicted_positive.sum() > 0:
-                fpr = ((predicted_positive & ~actual_positive).sum() / 
-                      predicted_positive.sum())
-            else:
-                fpr = 0.0
-            
-            metrics[f"{facet_type}_fpr_at_{alpha}"] = fpr
-            
-            # Coverage (fraction of positives detected)
-            if actual_positive.sum() > 0:
-                coverage = ((predicted_positive & actual_positive).sum() / 
-                          actual_positive.sum())
-            else:
-                coverage = 0.0
-            
-            metrics[f"{facet_type}_coverage_at_{alpha}"] = coverage
+            pred_pos = p_values <= alpha
+            pos = labels == 1
+            neg = ~pos
+
+            tp = int((pred_pos & pos).sum())
+            fp = int((pred_pos & neg).sum())
+            fn = int((~pred_pos & pos).sum())
+            tn = int((~pred_pos & neg).sum())
+
+            # ✅ TRUE FPR: FP / N_neg (not FP / predicted_positive!)
+            fpr = fp / max(1, int(neg.sum()))
+            tpr = tp / max(1, int(pos.sum()))  # recall / coverage
+
+            precision = tp / max(1, (tp + fp))
+            selection_rate = int(pred_pos.sum()) / max(1, len(labels))
+
+            metrics[f"{facet_type}_fpr_at_{alpha}"] = float(fpr)
+            metrics[f"{facet_type}_tpr_at_{alpha}"] = float(tpr)  # Same as coverage
+            metrics[f"{facet_type}_precision_at_{alpha}"] = float(precision)
+            metrics[f"{facet_type}_selection_rate_at_{alpha}"] = float(selection_rate)
+
+            # Keep old coverage name for backwards compatibility
+            metrics[f"{facet_type}_coverage_at_{alpha}"] = float(tpr)
         
         # Expected calibration error (ECE)
         n_bins = 10
@@ -349,6 +383,30 @@ def main():
         help="Fraction of data to use for testing"
     )
     parser.add_argument(
+        "--filter_lexical_false",
+        action="store_true",
+        default=True,
+        help="Filter out samples with lexical_match=False (default: True)"
+    )
+    parser.add_argument(
+        "--no_filter_lexical_false",
+        action="store_false",
+        dest="filter_lexical_false",
+        help="Don't filter lexical_match=False samples"
+    )
+    parser.add_argument(
+        "--use_entail_prob",
+        action="store_true",
+        default=True,
+        help="Use probs.entail instead of score (default: True)"
+    )
+    parser.add_argument(
+        "--no_use_entail_prob",
+        action="store_false",
+        dest="use_entail_prob",
+        help="Use score instead of probs.entail"
+    )
+    parser.add_argument(
         "--output_provenance",
         type=str,
         default=None,
@@ -381,7 +439,13 @@ def main():
         scores, labels, metadata, ids = generate_synthetic_calibration_data(2000)
     else:
         print(f"\nLoading calibration data from {args.data_path}...")
-        scores, labels, metadata, ids = load_calibration_data(args.data_path)
+        print(f"  Filter lexical_match=False: {args.filter_lexical_false}")
+        print(f"  Use probs.entail: {args.use_entail_prob}")
+        scores, labels, metadata, ids = load_calibration_data(
+            args.data_path,
+            filter_lexical_false=args.filter_lexical_false,
+            use_entail_prob=args.use_entail_prob
+        )
     
     print(f"Total samples: {len(scores)}")
     print(f"Positive rate: {sum(labels) / len(labels):.3f}")
@@ -446,13 +510,20 @@ def main():
     # Save calibrator
     print("\n" + "=" * 40)
     output_path = Path(args.output_path)
+
+    # ✅ Ensure .pkl extension to avoid confusion
+    if output_path.suffix != '.pkl':
+        print(f"⚠️  Warning: output_path should use .pkl extension (got {output_path.suffix})")
+        print(f"   Auto-correcting to .pkl")
+        output_path = output_path.with_suffix('.pkl')
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     # Save as pickle
     with open(output_path, 'wb') as f:
         pickle.dump(calibrator, f)
     print(f"Calibrator saved to {output_path}")
-    
+
     # Also save as JSON
     json_path = output_path.with_suffix('.json')
     calibrator.save(str(json_path))
