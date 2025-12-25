@@ -33,7 +33,23 @@ def analyze_lexical_mismatches(samples):
 
     lexical_types = {"ENTITY", "NUMERIC"}
 
-    mismatches = []
+    # Check if we're using entailment labels or supporting-fact labels
+    has_support_label = any("support_label" in s for s in samples[:10])
+    if has_support_label:
+        print("\n✅ Detected entailment-based labels (support_label field exists)")
+        print("   Using 'label' for analysis (should match lexical_match)")
+        label_semantics = "entailment"
+    else:
+        print("\n⚠️  Using Hotpot supporting-fact labels")
+        print("   'High mismatches' are EXPECTED - they mean:")
+        print("   - lex=True + label=0: phrase exists but not a supporting fact")
+        print("   - lex=False + label=1: BUG in facet_satisfied_in_text()")
+        print("\n   💡 Run convert_to_entail_labels.py to fix this for calibration!")
+        label_semantics = "support"
+
+    mismatches_false_pos = []  # lex=False but label=1 (ALWAYS a bug)
+    mismatches_true_neg = []   # lex=True but label=0 (expected for support labels)
+
     for s in samples:
         ft = s["metadata"].get("facet_type", "")
         if ft not in lexical_types:
@@ -42,36 +58,39 @@ def analyze_lexical_mismatches(samples):
         label = int(s["label"])
         lex = s["metadata"].get("lexical_match")
 
-        # For lexical facets, lexical_match should align with label
-        # If lex=False, label should be 0 (phrase doesn't exist)
-        # If lex=True, label should be 1 (phrase exists in supporting text)
-
         if lex is False and label == 1:
-            mismatches.append({
-                "type": "lex=False but label=1",
-                "sample": s,
-                "severity": "HIGH"
-            })
+            mismatches_false_pos.append(s)
         elif lex is True and label == 0:
-            mismatches.append({
-                "type": "lex=True but label=0",
-                "sample": s,
-                "severity": "MEDIUM"  # Could be valid if passage isn't supporting
-            })
+            mismatches_true_neg.append(s)
 
-    print(f"\nFound {len(mismatches)} potential mismatches in lexical facets")
+    print(f"\n📊 Found:")
+    print(f"   lex=False + label=1: {len(mismatches_false_pos)} (BUGS - phrase doesn't exist!)")
+    print(f"   lex=True + label=0:  {len(mismatches_true_neg)} ", end="")
+    if label_semantics == "support":
+        print("(EXPECTED - phrase exists but not supporting)")
+    else:
+        print("(UNEXPECTED - check labeling logic)")
 
-    # Show a few examples
-    for i, m in enumerate(mismatches[:5]):
-        s = m["sample"]
-        print(f"\n#{i+1} [{m['severity']}] {m['type']}")
-        print(f"  Type: {s['metadata'].get('facet_type')}")
-        print(f"  Hypothesis: {s.get('hypothesis')}")
-        print(f"  Label: {s['label']}, Lexical match: {s['metadata'].get('lexical_match')}")
-        print(f"  Supporting text: {s['metadata'].get('supporting_text', '')[:100]}")
-        print(f"  Passage: {s['metadata'].get('passage_preview', '')[:100]}")
+    # Show examples of BUGS (lex=False + label=1)
+    if mismatches_false_pos:
+        print(f"\n⚠️  CRITICAL BUGS (lex=False but label=1):")
+        for i, s in enumerate(mismatches_false_pos[:3]):
+            print(f"\n#{i+1} Type: {s['metadata'].get('facet_type')}")
+            print(f"  Hypothesis: {s.get('hypothesis')}")
+            print(f"  Label: {s['label']}, Lexical match: {s['metadata'].get('lexical_match')}")
+            print(f"  Supporting text: {s['metadata'].get('supporting_text', '')[:100]}...")
+            print(f"  → BUG: facet_satisfied_in_text() returned True but phrase doesn't exist!")
 
-    return mismatches
+    # Show examples of lex=True + label=0 (interpretation depends on label semantics)
+    if mismatches_true_neg and label_semantics == "entailment":
+        print(f"\n⚠️  Unexpected (lex=True but label=0) with entailment labels:")
+        for i, s in enumerate(mismatches_true_neg[:3]):
+            print(f"\n#{i+1} Type: {s['metadata'].get('facet_type')}")
+            print(f"  Hypothesis: {s.get('hypothesis')}")
+            print(f"  Label: {s['label']}, Lexical match: {s['metadata'].get('lexical_match')}")
+            print(f"  Passage: {s['metadata'].get('passage_preview', '')[:100]}...")
+
+    return mismatches_false_pos, mismatches_true_neg
 
 
 def analyze_high_confidence_negatives(samples, threshold=0.7):
@@ -79,6 +98,10 @@ def analyze_high_confidence_negatives(samples, threshold=0.7):
     print("\n" + "=" * 80)
     print(f"HIGH CONFIDENCE NEGATIVES (score > {threshold}, label=0)")
     print("=" * 80)
+
+    # Detect label semantics
+    has_support_label = any("support_label" in s for s in samples[:10])
+    label_semantics = "entailment" if has_support_label else "support"
 
     by_type = defaultdict(list)
 
@@ -100,9 +123,22 @@ def analyze_high_confidence_negatives(samples, threshold=0.7):
             print(f"    Passage: {s['metadata'].get('passage_preview', '')[:120]}")
 
             if ft in {"ENTITY", "NUMERIC"}:
-                print(f"    ⚠️  POTENTIAL BUG - lexical facet should have low score if label=0")
+                lex = s['metadata'].get('lexical_match')
+                if label_semantics == "entailment":
+                    if lex is False:
+                        print(f"    ✅ OK - lexical gate should force score=0 (check gate is working)")
+                    else:
+                        print(f"    ⚠️  BUG - lex=True but label=0 with entailment labels")
+                else:  # support labels
+                    if lex is False:
+                        print(f"    ✅ OK - lexical gate forces low score")
+                    else:
+                        print(f"    ℹ️  Expected - phrase exists but not supporting fact")
             else:
-                print(f"    ℹ️  Expected - {ft} labels are Hotpot supporting facts, not entailment")
+                if label_semantics == "entailment":
+                    print(f"    ⚠️  Consider excluding {ft} from calibration (non-lexical)")
+                else:
+                    print(f"    ℹ️  Expected - {ft} labels are Hotpot supporting facts, not entailment")
 
     return by_type
 
@@ -211,16 +247,62 @@ def main():
     analyze_per_type_quality(samples)
     inspect_one_bad_numeric(samples)
 
+    # Detect label semantics for summary
+    has_support_label = any("support_label" in samples for samples in [samples] if samples)
+    label_semantics = "entailment" if has_support_label else "support"
+
     print("\n" + "=" * 80)
     print("SUMMARY")
     print("=" * 80)
-    print("""
+
+    if label_semantics == "support":
+        print("""
+⚠️  CRITICAL: You're using Hotpot supporting-fact labels for calibration!
+
+Problem: Labels mean "is this a supporting fact?" but hypotheses ask "does passage entail facet?"
+Result: Many lex=True + label=0 cases (phrase exists but not supporting)
+
+✅ SOLUTION: Convert to entailment labels
+
+Run this command:
+  python convert_to_entail_labels.py calibration_hotpot_fixed.jsonl calibration_hotpot_entail.jsonl
+
+This will:
+  - Keep only ENTITY/NUMERIC facets (lexical, clean)
+  - Set label = int(lexical_match) for true entailment
+  - Preserve original as support_label
+  - Fix the label semantics mismatch
+
+Then re-run diagnostics on the new file.
+
 Next steps:
-1. If you see many "lex=False but label=1" → labeling bug, check facet_satisfied_in_text()
-2. If you see many "lex=True but label=0" → passage contains phrase but isn't supporting fact (expected)
-3. For ENTITY/NUMERIC with high avg negative scores → check lexical gate is working
-4. For RELATION/TEMPORAL → high-conf negatives are expected with Hotpot labels
-5. Use only facet types with 20+ positives and clean separation for calibration
+1. Fix "lex=False but label=1" bugs (if any) in facet_satisfied_in_text()
+2. Convert to entailment labels (command above)
+3. Re-run: python diagnose_calibration_detailed.py calibration_hotpot_entail.jsonl
+4. Train calibrator on entailment labels
+""")
+    else:
+        print("""
+✅ Using entailment-based labels (good for calibration!)
+
+Next steps:
+1. Fix any "lex=False but label=1" bugs (labeling errors)
+2. Check "lex=True but label=0" cases (should be rare/zero with entailment labels)
+3. Ensure facet types have 20+ positives for Mondrian calibration
+4. Train calibrator:
+
+   # ENTITY only (safest):
+   python train_calibration.py \\
+     --data_path <this_file> \\
+     --output_path calibrator_entity.json \\
+     --use_mondrian \\
+     --facet_types ENTITY
+
+   # ENTITY+NUMERIC (if NUMERIC has 20+ positives):
+   python train_calibration.py \\
+     --data_path <this_file> \\
+     --output_path calibrator.json \\
+     --use_mondrian
 """)
 
 
