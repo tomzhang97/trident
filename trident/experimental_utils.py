@@ -260,11 +260,20 @@ def aggregate_certificate_audit(
             margin = budget_cap - dual_lb
             metrics.lb_margins.append(margin)
 
-        # Coverage rate
-        covered = len(result.get("covered_facets", []))
-        total = result.get("total_facets", covered)
-        if total > 0:
-            metrics.facet_coverage_rates.append(covered / total)
+        # Coverage rate - CRITICAL FIX: Look in metrics dict, compute from utility/num_facets
+        result_metrics = result.get("metrics", {})
+        # Try to get utility (covered facets count) and num_facets
+        utility = result_metrics.get("utility", 0)
+        num_facets = result_metrics.get("num_facets", 0)
+        # Also check for explicit coverage field
+        coverage = result_metrics.get("coverage", None)
+
+        if coverage is not None:
+            # Use explicit coverage if available
+            metrics.facet_coverage_rates.append(coverage)
+        elif num_facets > 0:
+            # Compute coverage from utility/num_facets
+            metrics.facet_coverage_rates.append(utility / num_facets)
 
     return metrics
 

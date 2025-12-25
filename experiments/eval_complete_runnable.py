@@ -439,6 +439,20 @@ class ExperimentRunner:
             }
         }
 
+        # Apply ablation-specific overrides
+        if config_family_name == "pareto_match_500_no_rerank":
+            # Disable reranker for ablation study
+            config_dict["retrieval"]["use_reranker"] = False
+            self.logger.info("Ablation: Reranker disabled")
+        elif config_family_name == "safe_cover_2000_nli08":
+            # Set NLI threshold to 0.8 for ablation study
+            config_dict["nli"] = {"score_threshold": 0.8}
+            self.logger.info("Ablation: NLI threshold set to 0.8")
+        elif config_family_name == "safe_cover_2000_no_mondrian":
+            # Disable Mondrian calibration for ablation study
+            config_dict["calibration"] = {"use_mondrian": False}
+            self.logger.info("Ablation: Mondrian calibration disabled")
+
         # Add mode-specific config
         if mode == "pareto":
             config_dict["pareto"] = {
@@ -590,12 +604,13 @@ class ExperimentRunner:
         mode = self.config.mode
 
         if mode in ["safe_cover", "pareto", "both"]:
-            # Initialize TRIDENT pipeline
+            # Initialize TRIDENT pipeline with optional calibration data
             pipeline = TridentPipeline(
                 config=self.config,
                 llm=self.llm,
                 retriever=self.retriever,
-                device=self.device
+                device=self.device,
+                calibration_path=getattr(self.args, 'calibration_path', None)
             )
             return TridentSystemWrapper(pipeline, mode=mode)
 
@@ -1133,7 +1148,13 @@ Examples:
         default=None,
         help="Optional JSON file with calibration provenance/audit metadata"
     )
-    
+    parser.add_argument(
+        "--calibration_path",
+        type=str,
+        default=None,
+        help="Path to calibration file (JSON) for Safe-Cover p-value computation"
+    )
+
     # Retrieval configuration
     parser.add_argument("--retrieval_method", choices=["dense", "hybrid", "sparse"], default="dense")
     parser.add_argument("--corpus_path", type=str, help="Path to corpus for retrieval")
