@@ -756,6 +756,7 @@ def extract_calibration_samples(
                 sample = {
                     "id": f"{ex.qid}_{passage_id}_{facet.facet_id}",
                     "query_id": ex.qid,
+                    "hypothesis": hypothesis,  # Top-level for easy access
                     "score": float(score),
                     "probs": {
                         "entail": float(entail_prob),
@@ -770,8 +771,9 @@ def extract_calibration_samples(
                         "passage_id": passage_id,
                         "facet_id": facet.facet_id,
                         "question": ex.question,
-                        "facet_query": hypothesis,  # store what NLI saw
-                        "lexical_gate_applied": lexical_match is False,
+                        "facet_query": hypothesis,  # Duplicate for backwards compat
+                        "lexical_match": lexical_match,  # True/False/None for diagnostics
+                        "lexical_gate_applied": lexical_match is False,  # Boolean flag
                         # Debug helpers (remove if you want smaller files)
                         "title": title,
                         "supporting_title": bool(has_supporting),
@@ -833,6 +835,33 @@ def main():
     print(f"  Positive samples: {pos} ({pos/len(samples)*100:.1f}%)")
     print(f"  Negative samples: {neg} ({neg/len(samples)*100:.1f}%)")
     print(f"  Avg NLI score: {avg:.3f}")
+
+    # Per-facet-type breakdown
+    from collections import defaultdict
+    type_stats: DefaultDict[str, Dict[str, int]] = defaultdict(lambda: {"pos": 0, "neg": 0})
+    for s in samples:
+        ft = s["metadata"].get("facet_type", "UNKNOWN")
+        if s["label"] == 1:
+            type_stats[ft]["pos"] += 1
+        else:
+            type_stats[ft]["neg"] += 1
+
+    print(f"\n📊 Per-facet-type breakdown:")
+    for ft in sorted(type_stats.keys()):
+        p = type_stats[ft]["pos"]
+        n = type_stats[ft]["neg"]
+        total = p + n
+        print(f"  {ft:15s}: {p:4d} pos, {n:4d} neg ({p/total*100:5.1f}% positive)")
+
+    # Lexical gate stats
+    lexical_gate_count = sum(1 for s in samples if s["metadata"].get("lexical_gate_applied", False))
+    print(f"\n🚪 Lexical gate triggered: {lexical_gate_count} times ({lexical_gate_count/len(samples)*100:.1f}%)")
+
+    print("\n⚠️  IMPORTANT: Facet type selection for calibration")
+    print("  - ENTITY/NUMERIC: Safe to use (lexical, labels match hypothesis)")
+    print("  - RELATION/TEMPORAL: Use cautiously - labels are Hotpot supporting facts,")
+    print("    NOT true entailment. High entail + label=0 is often correct behavior.")
+    print("  - Recommendation: Start with ENTITY/NUMERIC only for cleanest calibration.")
 
     print("\n🔧 Next step: Train calibrator")
     print("  python train_calibration.py \\")
