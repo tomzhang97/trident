@@ -6,12 +6,14 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any
 from collections import OrderedDict
 import hashlib
+import re
+import unicodedata
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-from .facets import Facet
+from .facets import Facet, FacetType
 from .candidates import Passage
 from .config import NLIConfig
 
@@ -38,6 +40,83 @@ def _normalize_label(s: str) -> str:
     if "neutral" in s:
         return "neutral"
     return s
+
+
+# -------------------------
+# Lexical gate utilities
+# -------------------------
+
+_WS_RE = re.compile(r"\s+")
+
+
+def _norm(s: str) -> str:
+    """
+    Normalize text for robust exact-phrase matching.
+    - NFKC unicode normalization
+    - Normalize curly quotes and apostrophes
+    - Collapse whitespace
+    - Lowercase
+    """
+    s = unicodedata.normalize("NFKC", s or "")
+    # Normalize quotes
+    s = s.replace("'", "'").replace("'", "'")
+    s = s.replace(""", '"').replace(""", '"')
+    s = _WS_RE.sub(" ", s).strip().lower()
+    return s
+
+
+def _contains_exact_phrase(passage: str, phrase: str) -> bool:
+    """Check if passage contains the exact phrase (after normalization)."""
+    p = _norm(passage)
+    ph = _norm(phrase)
+    return ph != "" and ph in p
+
+
+def _contains_value(passage: str, value: str) -> bool:
+    """Check if passage contains the value string (after normalization)."""
+    p = _norm(passage)
+    v = _norm(str(value))
+    return v != "" and v in p
+
+
+def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
+    """
+    Perform lexical gate check for facets that make lexical claims.
+
+    Returns:
+        True if lexical condition is satisfied
+        False if lexical condition is NOT satisfied (NLI should be forced low)
+        None if facet doesn't make a lexical claim (use NLI normally)
+
+    For ENTITY facets ("contains exact phrase"), we check if phrase exists.
+    For NUMERIC facets ("states the value"), we check if value exists.
+
+    This prevents NLI from hallucinating entailment when the phrase/value isn't there.
+    """
+    ft = facet.facet_type
+    tpl = facet.template or {}
+
+    # ENTITY: "The passage contains the exact phrase X"
+    if ft == FacetType.ENTITY:
+        mention = str(tpl.get("mention", ""))
+        if mention:
+            return _contains_exact_phrase(passage_text, mention)
+        return None
+
+    # NUMERIC: "The passage states the value X"
+    if ft == FacetType.NUMERIC:
+        val = str(tpl.get("value", ""))
+        unit = str(tpl.get("unit", ""))
+        if val and unit:
+            full_value = f"{val} {unit}".strip()
+            if _contains_value(passage_text, full_value):
+                return True
+        if val:
+            return _contains_value(passage_text, val)
+        return None
+
+    # For other facet types, don't apply lexical gate
+    return None
 
 
 class NLIScorer:
@@ -112,6 +191,12 @@ class NLIScorer:
         premise = passage.text
         hypothesis = facet.to_hypothesis()
 
+        # LEXICAL GATE: For lexical hypotheses, check if phrase/value exists first
+        lexical_match = _check_lexical_gate(facet, premise)
+        if lexical_match is False:
+            # Phrase/value doesn't exist → return very low score
+            return 0.0
+
         if self.use_cache:
             key = self._cache_key(premise, hypothesis)
             if key in self.cache:
@@ -171,26 +256,50 @@ class NLIScorer:
                 to_run = batch
 
             if to_run:
-                premises = [p.text for p, _ in to_run]
-                hyps = [f.to_hypothesis() for _, f in to_run]
-
-                inputs = self.tokenizer(
-                    premises,
-                    hyps,
-                    truncation="only_first",
-                    max_length=self.config.max_length,
-                    padding=True,
-                    return_tensors="pt"
-                ).to(self.device)
-
-                with torch.no_grad():
-                    probs = F.softmax(self.model(**inputs).logits, dim=-1)
+                # Apply lexical gate and filter items that fail
+                to_run_nli: List[Tuple[int, Passage, Facet]] = []
+                lexical_gate_results: Dict[int, float] = {}
 
                 for j, (p, f) in enumerate(to_run):
-                    entail = float(probs[j, self.entail_idx].item())
-                    contra = float(probs[j, self.contra_idx].item()) if probs.size(-1) > 2 else 0.0
-                    s = entail - 0.5 * contra
+                    lexical_match = _check_lexical_gate(f, p.text)
+                    if lexical_match is False:
+                        # Phrase/value doesn't exist → store low score
+                        lexical_gate_results[j] = 0.0
+                    else:
+                        # Need to run NLI
+                        to_run_nli.append((j, p, f))
 
+                # Run NLI for items that passed lexical gate
+                if to_run_nli:
+                    premises = [p.text for _, p, _ in to_run_nli]
+                    hyps = [f.to_hypothesis() for _, _, f in to_run_nli]
+
+                    inputs = self.tokenizer(
+                        premises,
+                        hyps,
+                        truncation="only_first",
+                        max_length=self.config.max_length,
+                        padding=True,
+                        return_tensors="pt"
+                    ).to(self.device)
+
+                    with torch.no_grad():
+                        probs = F.softmax(self.model(**inputs).logits, dim=-1)
+
+                    for k, (j, p, f) in enumerate(to_run_nli):
+                        entail = float(probs[k, self.entail_idx].item())
+                        contra = float(probs[k, self.contra_idx].item()) if probs.size(-1) > 2 else 0.0
+                        s = entail - 0.5 * contra
+
+                        if self.use_cache:
+                            key = self._cache_key(p.text, f.to_hypothesis())
+                            if len(self.cache) >= self.cache_size:
+                                self.cache.popitem(last=False)
+                            self.cache[key] = float(s)
+
+                # Store lexical gate results in cache too
+                for j, s in lexical_gate_results.items():
+                    p, f = to_run[j]
                     if self.use_cache:
                         key = self._cache_key(p.text, f.to_hypothesis())
                         if len(self.cache) >= self.cache_size:
@@ -214,6 +323,17 @@ class NLIScorer:
     def score_with_details(self, passage: Passage, facet: Facet) -> NLIScore:
         premise = passage.text
         hypothesis = facet.to_hypothesis()
+
+        # LEXICAL GATE: For lexical hypotheses, check if phrase/value exists first
+        lexical_match = _check_lexical_gate(facet, premise)
+        if lexical_match is False:
+            # Phrase/value doesn't exist → return forced low scores
+            return NLIScore(
+                entailment_score=0.0,
+                contradiction_score=0.0,
+                neutral_score=1.0,
+                final_score=0.0,
+            )
 
         inputs = self.tokenizer(
             premise,

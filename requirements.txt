@@ -24,6 +24,7 @@ psutil>=5.9.0
 # Data processing
 pandas>=2.2.3  # Compatible with graphrag 2.7.0
 pyarrow>=17.0.0  # Compatible with graphrag 2.7.0
+tqdm>=4.65.0  # Progress bars for data extraction
 # faiss-cpu>=1.7.4  # For efficient similarity search
 faiss-gpu  # Uncomment for GPU support if needed
 

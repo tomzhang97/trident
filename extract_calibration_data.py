@@ -77,22 +77,55 @@ from trident.config import TridentConfig
 # Normalization utilities
 # -------------------------
 
+import unicodedata
+
 _WS_RE = re.compile(r"\s+")
-_APOS_S_RE = re.compile(r"\s+'s\b", re.IGNORECASE)
 
 
-def _norm(s: str) -> str:
-    s = (s or "").lower()
-    s = _APOS_S_RE.sub("'s", s)
-    s = _WS_RE.sub(" ", s).strip()
+def norm(s: str) -> str:
+    """
+    Normalize text for robust exact-phrase matching.
+    - NFKC unicode normalization
+    - Normalize curly quotes and apostrophes
+    - Collapse whitespace
+    - Lowercase
+    """
+    s = unicodedata.normalize("NFKC", s or "")
+    # Normalize quotes
+    s = s.replace("'", "'").replace("'", "'")
+    s = s.replace(""", '"').replace(""", '"')
+    s = _WS_RE.sub(" ", s).strip().lower()
     return s
 
 
-def _contains(haystack: str, needle: str) -> bool:
-    n = _norm(needle)
-    if not n:
-        return False
-    return n in _norm(haystack)
+def contains_exact_phrase(passage: str, phrase: str) -> bool:
+    """
+    Check if passage contains the exact phrase (after normalization).
+    Used for ENTITY facets.
+    """
+    p = norm(passage)
+    ph = norm(phrase)
+    return ph != "" and ph in p
+
+
+def contains_value(passage: str, value: str) -> bool:
+    """
+    Check if passage contains the value string (after normalization).
+    Used for NUMERIC facets (simple containment).
+    """
+    p = norm(passage)
+    v = norm(str(value))
+    return v != "" and v in p
+
+
+def contains_number_token(passage: str, num: str) -> bool:
+    """
+    Check if passage contains the number as a token (not part of larger number).
+    Example: 12 matches "12" but not "2012" or "120".
+    """
+    p = norm(passage)
+    num_norm = re.escape(norm(num))
+    return re.search(rf"(?<!\d){num_norm}(?!\d)", p) is not None
 
 
 def facet_to_query_text(facet: Any) -> str:
@@ -127,7 +160,11 @@ def facet_satisfied_in_text(facet: Facet, text: str) -> bool:
     Uses structured facet.template where possible.
 
     Important: this is NOT your runtime verifier, it's only for making labels less noisy.
-    The goal is: reduce false positives dramatically.
+    The goal is: reduce false positives dramatically and make labels match hypothesis semantics.
+
+    CRITICAL: Labels must match what the hypothesis actually asks!
+    - ENTITY hypothesis: "The passage contains the exact phrase X" → label based on exact phrase match
+    - NUMERIC hypothesis: "The passage states the value X" → label based on value containment
     """
     if not text:
         return False
@@ -135,9 +172,10 @@ def facet_satisfied_in_text(facet: Facet, text: str) -> bool:
     ft = facet.facet_type
     tpl = facet.template or {}
 
-    # ENTITY: require mention appears
+    # ENTITY: require exact phrase match (matches hypothesis: "contains the exact phrase")
     if ft == FacetType.ENTITY:
-        return _contains(text, str(tpl.get("mention", "")))
+        mention = str(tpl.get("mention", ""))
+        return contains_exact_phrase(text, mention)
 
     # RELATION: require both endpoints appear (predicate matching is too brittle)
     if ft == FacetType.RELATION:
@@ -145,7 +183,7 @@ def facet_satisfied_in_text(facet: Facet, text: str) -> bool:
         obj = str(tpl.get("object", ""))
         if not subj or not obj:
             return False
-        return _contains(text, subj) and _contains(text, obj)
+        return contains_exact_phrase(text, subj) and contains_exact_phrase(text, obj)
 
     # BRIDGE hops: require the endpoints appear
     if ft == FacetType.BRIDGE_HOP1:
@@ -153,32 +191,40 @@ def facet_satisfied_in_text(facet: Facet, text: str) -> bool:
         eb = str(tpl.get("bridge_entity", ""))
         if not e1 or not eb:
             return False
-        return _contains(text, e1) and _contains(text, eb)
+        return contains_exact_phrase(text, e1) and contains_exact_phrase(text, eb)
 
     if ft == FacetType.BRIDGE_HOP2:
         eb = str(tpl.get("bridge_entity", ""))
         e2 = str(tpl.get("entity2", ""))
         if not eb or not e2:
             return False
-        return _contains(text, eb) and _contains(text, e2)
+        return contains_exact_phrase(text, eb) and contains_exact_phrase(text, e2)
 
     if ft == FacetType.BRIDGE:
         e1 = str(tpl.get("entity1", ""))
         e2 = str(tpl.get("entity2", ""))
         if not e1 or not e2:
             return False
-        return _contains(text, e1) and _contains(text, e2)
+        return contains_exact_phrase(text, e1) and contains_exact_phrase(text, e2)
 
     # TEMPORAL: if time appears, good enough
     if ft == FacetType.TEMPORAL:
         time = str(tpl.get("time", ""))
         event = str(tpl.get("event", ""))
-        return (_contains(text, time) if time else False) or (_contains(text, event) if event else False)
+        return (contains_value(text, time) if time else False) or (contains_value(text, event) if event else False)
 
-    # NUMERIC: if value appears, good enough
+    # NUMERIC: require value containment (matches hypothesis: "states the value")
     if ft == FacetType.NUMERIC:
         val = str(tpl.get("value", ""))
-        return _contains(text, val) if val else False
+        unit = str(tpl.get("unit", ""))
+        # Try full "value unit" first, then just value
+        if val and unit:
+            full_value = f"{val} {unit}".strip()
+            if contains_value(text, full_value):
+                return True
+        if val:
+            return contains_value(text, val)
+        return False
 
     # COMPARISON/CAUSAL/PROCEDURAL: too brittle for labeling; default to false to avoid noise
     return False
@@ -556,6 +602,79 @@ def get_adapter(dataset: str) -> DatasetAdapter:
 # Gold support extraction
 # -------------------------
 
+def is_valid_hypothesis(hypothesis: str) -> bool:
+    """
+    Filter out garbage hypotheses that will cause NLI to behave randomly.
+
+    Invalid patterns:
+    - Contains "?" (question mark) - not a declarative statement
+    - Contains "occurred in after being" / "occurred in after who" - garbled templates
+    - Too short or nonsensical
+    """
+    if not hypothesis or len(hypothesis.strip()) < 10:
+        return False
+
+    # Question marks indicate malformed hypotheses
+    if "?" in hypothesis:
+        return False
+
+    # Known garbage patterns from template bugs
+    garbage_patterns = [
+        "occurred in after being",
+        "occurred in after who",
+        "occurred in after what",
+        "is related to … what",
+        "is related to ... what",
+    ]
+
+    hyp_lower = hypothesis.lower()
+    for pattern in garbage_patterns:
+        if pattern in hyp_lower:
+            return False
+
+    return True
+
+
+def get_lexical_match(facet: Facet, passage_text: str) -> Optional[bool]:
+    """
+    Perform lexical gate check for facets that make lexical claims.
+
+    Returns:
+        True if lexical condition is satisfied
+        False if lexical condition is NOT satisfied (NLI should be forced low)
+        None if facet doesn't make a lexical claim (use NLI normally)
+
+    For ENTITY facets ("contains exact phrase"), we check if phrase exists.
+    For NUMERIC facets ("states the value"), we check if value exists.
+
+    This prevents NLI from hallucinating entailment when the phrase/value isn't there.
+    """
+    ft = facet.facet_type
+    tpl = facet.template or {}
+
+    # ENTITY: "The passage contains the exact phrase X"
+    if ft == FacetType.ENTITY:
+        mention = str(tpl.get("mention", ""))
+        if mention:
+            return contains_exact_phrase(passage_text, mention)
+        return None
+
+    # NUMERIC: "The passage states the value X"
+    if ft == FacetType.NUMERIC:
+        val = str(tpl.get("value", ""))
+        unit = str(tpl.get("unit", ""))
+        if val and unit:
+            full_value = f"{val} {unit}".strip()
+            if contains_value(passage_text, full_value):
+                return True
+        if val:
+            return contains_value(passage_text, val)
+        return None
+
+    # For other facet types, don't apply lexical gate
+    return None
+
+
 def supporting_text_for_title(title: str, sentences: List[str], supporting: Dict[str, Set[int]]) -> str:
     idxs = sorted(i for i in supporting.get(title, set()) if 0 <= i < len(sentences))
     if not idxs:
@@ -606,9 +725,29 @@ def extract_calibration_samples(
             )
 
             for facet in facets:
+                # Generate hypothesis and validate it
+                hypothesis = facet_to_query_text(facet)
+
+                # FILTER: Skip garbage hypotheses
+                if not is_valid_hypothesis(hypothesis):
+                    continue
+
+                # Get NLI score
                 details = nli_scorer.score_with_details(passage, facet)
                 score = details.final_score
+                entail_prob = details.entailment_score
+                neutral_prob = details.neutral_score
+                contra_prob = details.contradiction_score
 
+                # LEXICAL GATE: For lexical hypotheses, force low score if lexical match fails
+                lexical_match = get_lexical_match(facet, passage_text)
+                if lexical_match is False:
+                    # Phrase/value doesn't exist → force NLI to very low confidence
+                    # Set probs to neutral=1, others=0, and very low score
+                    score = 0.0
+                    entail_prob = 0.0
+                    neutral_prob = 1.0
+                    contra_prob = 0.0
 
                 # Facet-conditioned label:
                 # positive only if (a) passage has gold support sentences AND (b) those sentences satisfy the facet
@@ -619,9 +758,9 @@ def extract_calibration_samples(
                     "query_id": ex.qid,
                     "score": float(score),
                     "probs": {
-                        "entail": float(details.entailment_score),
-                        "neutral": float(details.neutral_score),
-                        "contra": float(details.contradiction_score),
+                        "entail": float(entail_prob),
+                        "neutral": float(neutral_prob),
+                        "contra": float(contra_prob),
                    },
                     "label": int(label),
                     "metadata": {
@@ -631,7 +770,8 @@ def extract_calibration_samples(
                         "passage_id": passage_id,
                         "facet_id": facet.facet_id,
                         "question": ex.question,
-                        "facet_query": facet_to_query_text(facet),  # store what NLI saw
+                        "facet_query": hypothesis,  # store what NLI saw
+                        "lexical_gate_applied": lexical_match is False,
                         # Debug helpers (remove if you want smaller files)
                         "title": title,
                         "supporting_title": bool(has_supporting),
