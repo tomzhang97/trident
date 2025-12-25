@@ -378,6 +378,9 @@ def convert_to_sigma_labels(input_path: str, output_path: str, keep_types=None):
             r["support_label"] = orig_label
             r["label"] = sigma_label  # Overwrite with Σ label
 
+            # Tag label semantics so diagnostics know what to expect
+            r["metadata"]["label_semantics"] = "sigma"
+
             g.write(json.dumps(r, ensure_ascii=False) + "\n")
             n_out += 1
 

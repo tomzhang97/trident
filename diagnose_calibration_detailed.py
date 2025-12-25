@@ -33,19 +33,36 @@ def analyze_lexical_mismatches(samples):
 
     lexical_types = {"ENTITY", "NUMERIC"}
 
-    # Check if we're using entailment labels or supporting-fact labels
+    # Detect label semantics
     has_support_label = any("support_label" in s for s in samples[:10])
-    if has_support_label:
-        print("\n✅ Detected entailment-based labels (support_label field exists)")
-        print("   Using 'label' for analysis (should match lexical_match)")
-        label_semantics = "entailment"
+    label_semantics = "support"  # default
+
+    # Check for explicit label_semantics tag
+    for s in samples[:10]:
+        meta_semantics = s.get("metadata", {}).get("label_semantics")
+        if meta_semantics:
+            label_semantics = meta_semantics
+            break
+
+    # If not tagged but has support_label, infer
+    if label_semantics == "support" and has_support_label:
+        # Could be old entail labels
+        label_semantics = "entail"  # conservative guess
+
+    if label_semantics == "sigma":
+        print("\n✅ Detected Σ(p,f) schema-bound labels")
+        print("   For Σ labels, lex=True + label=0 is EXPECTED:")
+        print("   - Phrase exists but schema check failed (wrong binding, ambiguous, etc.)")
+        print("   - These are the CRITICAL NEGATIVES for calibration!")
+    elif label_semantics == "entail":
+        print("\n⚠️  Detected entailment-based labels (old convert_to_entail hack)")
+        print("   These are NOT proper Σ labels. Use convert_to_sigma_labels.py instead.")
     else:
         print("\n⚠️  Using Hotpot supporting-fact labels")
         print("   'High mismatches' are EXPECTED - they mean:")
         print("   - lex=True + label=0: phrase exists but not a supporting fact")
         print("   - lex=False + label=1: BUG in facet_satisfied_in_text()")
-        print("\n   💡 Run convert_to_entail_labels.py to fix this for calibration!")
-        label_semantics = "support"
+        print("\n   💡 Run convert_to_sigma_labels.py for proper Σ(p,f) labels!")
 
     mismatches_false_pos = []  # lex=False but label=1 (ALWAYS a bug)
     mismatches_true_neg = []   # lex=True but label=0 (expected for support labels)
@@ -66,10 +83,12 @@ def analyze_lexical_mismatches(samples):
     print(f"\n📊 Found:")
     print(f"   lex=False + label=1: {len(mismatches_false_pos)} (BUGS - phrase doesn't exist!)")
     print(f"   lex=True + label=0:  {len(mismatches_true_neg)} ", end="")
-    if label_semantics == "support":
+    if label_semantics == "sigma":
+        print("(EXPECTED - schema check failed, CRITICAL NEGATIVES! ✅)")
+    elif label_semantics == "support":
         print("(EXPECTED - phrase exists but not supporting)")
-    else:
-        print("(UNEXPECTED - check labeling logic)")
+    else:  # entail
+        print("(UNEXPECTED with entail labels - check labeling logic)")
 
     # Show examples of BUGS (lex=False + label=1)
     if mismatches_false_pos:
@@ -99,9 +118,18 @@ def analyze_high_confidence_negatives(samples, threshold=0.7):
     print(f"HIGH CONFIDENCE NEGATIVES (score > {threshold}, label=0)")
     print("=" * 80)
 
-    # Detect label semantics
+    # Detect label semantics (same logic as in analyze_lexical_mismatches)
     has_support_label = any("support_label" in s for s in samples[:10])
-    label_semantics = "entailment" if has_support_label else "support"
+    label_semantics = "support"
+
+    for s in samples[:10]:
+        meta_semantics = s.get("metadata", {}).get("label_semantics")
+        if meta_semantics:
+            label_semantics = meta_semantics
+            break
+
+    if label_semantics == "support" and has_support_label:
+        label_semantics = "entail"
 
     by_type = defaultdict(list)
 
@@ -124,18 +152,24 @@ def analyze_high_confidence_negatives(samples, threshold=0.7):
 
             if ft in {"ENTITY", "NUMERIC"}:
                 lex = s['metadata'].get('lexical_match')
-                if label_semantics == "entailment":
+                if label_semantics == "sigma":
                     if lex is False:
-                        print(f"    ✅ OK - lexical gate should force score=0 (check gate is working)")
+                        print(f"    ✅ OK - lexical gate should force score=0")
                     else:
-                        print(f"    ⚠️  BUG - lex=True but label=0 with entailment labels")
+                        print(f"    ℹ️  Expected for Σ - lex=True but schema check failed")
+                        print(f"       (This is score/hypothesis mismatch if many of these)")
+                elif label_semantics == "entail":
+                    if lex is False:
+                        print(f"    ✅ OK - lexical gate should force score=0")
+                    else:
+                        print(f"    ⚠️  BUG - lex=True but label=0 with entail labels")
                 else:  # support labels
                     if lex is False:
                         print(f"    ✅ OK - lexical gate forces low score")
                     else:
                         print(f"    ℹ️  Expected - phrase exists but not supporting fact")
             else:
-                if label_semantics == "entailment":
+                if label_semantics in {"sigma", "entail"}:
                     print(f"    ⚠️  Consider excluding {ft} from calibration (non-lexical)")
                 else:
                     print(f"    ℹ️  Expected - {ft} labels are Hotpot supporting facts, not entailment")
@@ -247,15 +281,49 @@ def main():
     analyze_per_type_quality(samples)
     inspect_one_bad_numeric(samples)
 
-    # Detect label semantics for summary
-    has_support_label = any("support_label" in samples for samples in [samples] if samples)
-    label_semantics = "entailment" if has_support_label else "support"
+    # Detect label semantics for summary (same logic)
+    has_support_label = any("support_label" in s for s in samples[:10])
+    label_semantics = "support"
+
+    for s in samples[:10]:
+        meta_semantics = s.get("metadata", {}).get("label_semantics")
+        if meta_semantics:
+            label_semantics = meta_semantics
+            break
+
+    if label_semantics == "support" and has_support_label:
+        label_semantics = "entail"
 
     print("\n" + "=" * 80)
     print("SUMMARY")
     print("=" * 80)
 
-    if label_semantics == "support":
+    if label_semantics == "sigma":
+        print("""
+✅ Using Σ(p,f) schema-bound labels (correct for Safe-Cover!)
+
+Next steps:
+1. Fix any "lex=False but label=1" bugs (if any)
+2. lex=True + label=0 cases are EXPECTED (critical negatives) ✅
+3. Check if calibrator selects anything (TPR > 0):
+   - If TPR=0 at all alphas → hypothesis/verifier mismatch!
+   - Hypotheses must ask Σ, not lexical containment
+4. Ensure enough positives per facet type (20+ for Mondrian)
+
+⚠️  CRITICAL: If TPR=0, your hypotheses are wrong!
+   Current hypotheses ask lexical questions:
+   - "The passage contains the exact phrase X"  ← TOO WEAK
+   - "The passage states the value X"  ← TOO WEAK
+
+   Σ hypotheses must ask schema-bound questions:
+   - ENTITY: "Passage identifies 'X' unambiguously (not merely mention)"
+   - NUMERIC: "Passage states that {subject}'s {property} is {value}"
+
+   To fix: Update facets.py hypothesis templates, regenerate data.
+
+5. If NUMERIC has 0 positives, need more data or relaxed schema_ok
+""")
+    elif label_semantics == "support":
         print("""
 ⚠️  CRITICAL: You're using Hotpot supporting-fact labels for calibration!
 
