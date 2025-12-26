@@ -1,378 +1,56 @@
 #!/usr/bin/env python3
 """
-Detailed diagnostic script for calibration data quality.
-
-Checks for:
-1. Label-hypothesis mismatches (lexical gate failures)
-2. High-confidence negatives (potential labeling issues)
-3. Per-facet-type quality metrics
+Detailed diagnostic script for Σ calibration data.
+Correctly handles 'sigma' semantics (lex=True, label=0 is EXPECTED).
 """
 
 import json
 import sys
 from collections import defaultdict
-from pathlib import Path
-
-
-def load_samples(path: str):
-    samples = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            samples.append(json.loads(line))
-    return samples
-
 
 def analyze_lexical_mismatches(samples):
-    """Check for cases where lexical_match disagrees with label."""
-    print("\n" + "=" * 80)
-    print("LEXICAL MATCH vs LABEL ANALYSIS")
-    print("=" * 80)
-
-    lexical_types = {"ENTITY", "NUMERIC"}
-
-    # Detect label semantics
-    has_support_label = any("support_label" in s for s in samples[:10])
-    label_semantics = "support"  # default
-
-    # Check for explicit label_semantics tag
-    for s in samples[:10]:
-        meta_semantics = s.get("metadata", {}).get("label_semantics")
-        if meta_semantics:
-            label_semantics = meta_semantics
-            break
-
-    # If not tagged but has support_label, infer
-    if label_semantics == "support" and has_support_label:
-        # Could be old entail labels
-        label_semantics = "entail"  # conservative guess
-
+    print("\n=== LEXICAL MATCH vs LABEL ANALYSIS ===")
+    
+    # Check semantics
+    label_semantics = samples[0].get("metadata", {}).get("label_semantics", "support")
+    print(f"Detected label semantics: {label_semantics}")
+    
     if label_semantics == "sigma":
-        print("\n✅ Detected Σ(p,f) schema-bound labels")
-        print("   For Σ labels, lex=True + label=0 is EXPECTED:")
-        print("   - Phrase exists but schema check failed (wrong binding, ambiguous, etc.)")
-        print("   - These are the CRITICAL NEGATIVES for calibration!")
-    elif label_semantics == "entail":
-        print("\n⚠️  Detected entailment-based labels (old convert_to_entail hack)")
-        print("   These are NOT proper Σ labels. Use convert_to_sigma_labels.py instead.")
-    else:
-        print("\n⚠️  Using Hotpot supporting-fact labels")
-        print("   'High mismatches' are EXPECTED - they mean:")
-        print("   - lex=True + label=0: phrase exists but not a supporting fact")
-        print("   - lex=False + label=1: BUG in facet_satisfied_in_text()")
-        print("\n   💡 Run convert_to_sigma_labels.py for proper Σ(p,f) labels!")
-
-    mismatches_false_pos = []  # lex=False but label=1 (ALWAYS a bug)
-    mismatches_true_neg = []   # lex=True but label=0 (expected for support labels)
-
+        print("✅ SIGMA MODE: lex=True + label=0 is EXPECTED (Critical Negatives)")
+    
+    bugs = []      # lex=False, label=1
+    crit_negs = [] # lex=True, label=0
+    
     for s in samples:
-        ft = s["metadata"].get("facet_type", "")
-        if ft not in lexical_types:
-            continue
-
-        label = int(s["label"])
+        ft = s["metadata"].get("facet_type")
+        if ft not in ["ENTITY", "NUMERIC"]: continue
+        
         lex = s["metadata"].get("lexical_match")
-
-        if lex is False and label == 1:
-            mismatches_false_pos.append(s)
-        elif lex is True and label == 0:
-            mismatches_true_neg.append(s)
-
-    print(f"\n📊 Found:")
-    print(f"   lex=False + label=1: {len(mismatches_false_pos)} (BUGS - phrase doesn't exist!)")
-    print(f"   lex=True + label=0:  {len(mismatches_true_neg)} ", end="")
-    if label_semantics == "sigma":
-        print("(EXPECTED - schema check failed, CRITICAL NEGATIVES! ✅)")
-    elif label_semantics == "support":
-        print("(EXPECTED - phrase exists but not supporting)")
-    else:  # entail
-        print("(UNEXPECTED with entail labels - check labeling logic)")
-
-    # Show examples of BUGS (lex=False + label=1)
-    if mismatches_false_pos:
-        print(f"\n⚠️  CRITICAL BUGS (lex=False but label=1):")
-        for i, s in enumerate(mismatches_false_pos[:3]):
-            print(f"\n#{i+1} Type: {s['metadata'].get('facet_type')}")
-            print(f"  Hypothesis: {s.get('hypothesis')}")
-            print(f"  Label: {s['label']}, Lexical match: {s['metadata'].get('lexical_match')}")
-            print(f"  Supporting text: {s['metadata'].get('supporting_text', '')[:100]}...")
-            print(f"  → BUG: facet_satisfied_in_text() returned True but phrase doesn't exist!")
-
-    # Show examples of lex=True + label=0 (interpretation depends on label semantics)
-    if mismatches_true_neg and label_semantics == "entailment":
-        print(f"\n⚠️  Unexpected (lex=True but label=0) with entailment labels:")
-        for i, s in enumerate(mismatches_true_neg[:3]):
-            print(f"\n#{i+1} Type: {s['metadata'].get('facet_type')}")
-            print(f"  Hypothesis: {s.get('hypothesis')}")
-            print(f"  Label: {s['label']}, Lexical match: {s['metadata'].get('lexical_match')}")
-            print(f"  Passage: {s['metadata'].get('passage_preview', '')[:100]}...")
-
-    return mismatches_false_pos, mismatches_true_neg
-
-
-def analyze_high_confidence_negatives(samples, threshold=0.7):
-    """Find high NLI score but label=0 cases."""
-    print("\n" + "=" * 80)
-    print(f"HIGH CONFIDENCE NEGATIVES (score > {threshold}, label=0)")
-    print("=" * 80)
-
-    # Detect label semantics (same logic as in analyze_lexical_mismatches)
-    has_support_label = any("support_label" in s for s in samples[:10])
-    label_semantics = "support"
-
-    for s in samples[:10]:
-        meta_semantics = s.get("metadata", {}).get("label_semantics")
-        if meta_semantics:
-            label_semantics = meta_semantics
-            break
-
-    if label_semantics == "support" and has_support_label:
-        label_semantics = "entail"
-
-    by_type = defaultdict(list)
-
-    for s in samples:
-        if s["label"] == 0 and s["score"] > threshold:
-            ft = s["metadata"].get("facet_type", "UNKNOWN")
-            by_type[ft].append(s)
-
-    for ft in sorted(by_type.keys()):
-        samples_ft = by_type[ft]
-        print(f"\n{ft}: {len(samples_ft)} high-conf negatives")
-
-        # Show top 3
-        samples_ft.sort(key=lambda x: x["score"], reverse=True)
-        for i, s in enumerate(samples_ft[:3]):
-            print(f"\n  #{i+1} score={s['score']:.4f}")
-            print(f"    Hypothesis: {s.get('hypothesis')}")
-            print(f"    Lexical match: {s['metadata'].get('lexical_match')}")
-            print(f"    Passage: {s['metadata'].get('passage_preview', '')[:120]}")
-
-            if ft in {"ENTITY", "NUMERIC"}:
-                lex = s['metadata'].get('lexical_match')
-                if label_semantics == "sigma":
-                    if lex is False:
-                        print(f"    ✅ OK - lexical gate should force score=0")
-                    else:
-                        print(f"    ℹ️  Expected for Σ - lex=True but schema check failed")
-                        print(f"       (This is score/hypothesis mismatch if many of these)")
-                elif label_semantics == "entail":
-                    if lex is False:
-                        print(f"    ✅ OK - lexical gate should force score=0")
-                    else:
-                        print(f"    ⚠️  BUG - lex=True but label=0 with entail labels")
-                else:  # support labels
-                    if lex is False:
-                        print(f"    ✅ OK - lexical gate forces low score")
-                    else:
-                        print(f"    ℹ️  Expected - phrase exists but not supporting fact")
-            else:
-                if label_semantics in {"sigma", "entail"}:
-                    print(f"    ⚠️  Consider excluding {ft} from calibration (non-lexical)")
-                else:
-                    print(f"    ℹ️  Expected - {ft} labels are Hotpot supporting facts, not entailment")
-
-    return by_type
-
-
-def analyze_per_type_quality(samples):
-    """Per-facet-type calibration quality metrics."""
-    print("\n" + "=" * 80)
-    print("PER-FACET-TYPE QUALITY METRICS")
-    print("=" * 80)
-
-    stats = defaultdict(lambda: {
-        "total": 0,
-        "pos": 0,
-        "neg": 0,
-        "avg_score_pos": [],
-        "avg_score_neg": [],
-        "lexical_gate_triggered": 0
-    })
-
-    for s in samples:
-        ft = s["metadata"].get("facet_type", "UNKNOWN")
-        stats[ft]["total"] += 1
-
-        if s["label"] == 1:
-            stats[ft]["pos"] += 1
-            stats[ft]["avg_score_pos"].append(s["score"])
-        else:
-            stats[ft]["neg"] += 1
-            stats[ft]["avg_score_neg"].append(s["score"])
-
-        if s["metadata"].get("lexical_gate_applied", False):
-            stats[ft]["lexical_gate_triggered"] += 1
-
-    print(f"\n{'Type':<15} {'Total':>6} {'Pos':>5} {'Neg':>5} {'Pos%':>6} {'Score+':>7} {'Score-':>7} {'Gate':>5}")
-    print("-" * 80)
-
-    for ft in sorted(stats.keys()):
-        st = stats[ft]
-        pos_pct = st["pos"] / st["total"] * 100 if st["total"] > 0 else 0
-        avg_pos = sum(st["avg_score_pos"]) / len(st["avg_score_pos"]) if st["avg_score_pos"] else 0
-        avg_neg = sum(st["avg_score_neg"]) / len(st["avg_score_neg"]) if st["avg_score_neg"] else 0
-
-        print(f"{ft:<15} {st['total']:>6} {st['pos']:>5} {st['neg']:>5} {pos_pct:>5.1f}% "
-              f"{avg_pos:>7.3f} {avg_neg:>7.3f} {st['lexical_gate_triggered']:>5}")
-
-    print("\nRecommendations:")
-    for ft in sorted(stats.keys()):
-        st = stats[ft]
-        if st["pos"] < 20:
-            print(f"  ⚠️  {ft}: Only {st['pos']} positives - may be too sparse for Mondrian calibration")
-
-        if ft in {"ENTITY", "NUMERIC"}:
-            avg_neg = sum(st["avg_score_neg"]) / len(st["avg_score_neg"]) if st["avg_score_neg"] else 0
-            if avg_neg > 0.5:
-                print(f"  ⚠️  {ft}: High avg negative score ({avg_neg:.3f}) - check labeling logic")
-            else:
-                print(f"  ✅ {ft}: Safe for calibration (lexical, avg neg score={avg_neg:.3f})")
-        else:
-            print(f"  ⚠️  {ft}: Use cautiously - labels are supporting facts, not entailment")
-
-    return stats
-
-
-def inspect_one_bad_numeric(samples):
-    """Deep dive into one problematic NUMERIC sample."""
-    print("\n" + "=" * 80)
-    print("DEEP DIVE: One problematic NUMERIC sample")
-    print("=" * 80)
-
-    for s in samples:
-        if (s["metadata"].get("facet_type") == "NUMERIC" and
-            s["label"] == 0 and
-            s["score"] > 0.8):
-
-            print("\nFull metadata:")
-            print(json.dumps(s["metadata"], indent=2))
-            print(f"\nHypothesis: {s.get('hypothesis')}")
-            print(f"Score: {s['score']:.4f}")
-            print(f"Label: {s['label']}")
-            print(f"Lexical match: {s['metadata'].get('lexical_match')}")
-            print(f"\nProbs: entail={s['probs']['entail']:.4f}, "
-                  f"neutral={s['probs']['neutral']:.4f}, "
-                  f"contra={s['probs']['contra']:.4f}")
-            return
-
-    print("\nNo problematic NUMERIC samples found (score > 0.8, label=0)")
-
+        lab = s["label"]
+        
+        if lex is False and lab == 1:
+            bugs.append(s)
+        elif lex is True and lab == 0:
+            crit_negs.append(s)
+            
+    print(f"\nResults:")
+    print(f"  BUGS (lex=False, label=1): {len(bugs)} (Should be 0)")
+    print(f"  CRITICAL NEGATIVES (lex=True, label=0): {len(crit_negs)} (Should be HIGH for robust training)")
+    
+    if label_semantics != "sigma" and len(crit_negs) > 100:
+        print("⚠️  Warning: High mismatches but not in Sigma mode? Check labels.")
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python diagnose_calibration_detailed.py <calibration_data.jsonl>")
-        sys.exit(1)
-
     path = sys.argv[1]
-    if not Path(path).exists():
-        print(f"Error: {path} not found")
-        sys.exit(1)
-
-    print(f"Loading samples from {path}...")
-    samples = load_samples(path)
-    print(f"Loaded {len(samples)} samples")
-
-    # Run analyses
+    samples = []
+    with open(path) as f:
+        for line in f: samples.append(json.loads(line))
+        
     analyze_lexical_mismatches(samples)
-    analyze_high_confidence_negatives(samples)
-    analyze_per_type_quality(samples)
-    inspect_one_bad_numeric(samples)
-
-    # Detect label semantics for summary (same logic)
-    has_support_label = any("support_label" in s for s in samples[:10])
-    label_semantics = "support"
-
-    for s in samples[:10]:
-        meta_semantics = s.get("metadata", {}).get("label_semantics")
-        if meta_semantics:
-            label_semantics = meta_semantics
-            break
-
-    if label_semantics == "support" and has_support_label:
-        label_semantics = "entail"
-
-    print("\n" + "=" * 80)
-    print("SUMMARY")
-    print("=" * 80)
-
-    if label_semantics == "sigma":
-        print("""
-✅ Using Σ(p,f) schema-bound labels (correct for Safe-Cover!)
-
-Next steps:
-1. Fix any "lex=False but label=1" bugs (if any)
-2. lex=True + label=0 cases are EXPECTED (critical negatives) ✅
-3. Check if calibrator selects anything (TPR > 0):
-   - If TPR=0 at all alphas → hypothesis/verifier mismatch!
-   - Hypotheses must ask Σ, not lexical containment
-4. Ensure enough positives per facet type (20+ for Mondrian)
-
-⚠️  CRITICAL: If TPR=0, your hypotheses are wrong!
-   Current hypotheses ask lexical questions:
-   - "The passage contains the exact phrase X"  ← TOO WEAK
-   - "The passage states the value X"  ← TOO WEAK
-
-   Σ hypotheses must ask schema-bound questions:
-   - ENTITY: "Passage identifies 'X' unambiguously (not merely mention)"
-   - NUMERIC: "Passage states that {subject}'s {property} is {value}"
-
-   To fix: Update facets.py hypothesis templates, regenerate data.
-
-5. If NUMERIC has 0 positives, need more data or relaxed schema_ok
-""")
-    elif label_semantics == "support":
-        print("""
-⚠️  CRITICAL: You're using Hotpot supporting-fact labels for calibration!
-
-Problem: Labels mean "is this a supporting fact?" but hypotheses ask "does passage entail facet?"
-Result: Many lex=True + label=0 cases (phrase exists but not supporting)
-
-✅ SOLUTION: Convert to entailment labels
-
-Run this command:
-  python convert_to_entail_labels.py calibration_hotpot_fixed.jsonl calibration_hotpot_entail.jsonl
-
-This will:
-  - Keep only ENTITY/NUMERIC facets (lexical, clean)
-  - Set label = int(lexical_match) for true entailment
-  - Preserve original as support_label
-  - Fix the label semantics mismatch
-
-Then re-run diagnostics on the new file.
-
-Next steps:
-1. Fix "lex=False but label=1" bugs (if any) in facet_satisfied_in_text()
-2. Convert to entailment labels (command above)
-3. Re-run: python diagnose_calibration_detailed.py calibration_hotpot_entail.jsonl
-4. Train calibrator on entailment labels
-""")
-    else:
-        print("""
-✅ Using entailment-based labels (good for calibration!)
-
-Next steps:
-1. Fix any "lex=False but label=1" bugs (labeling errors)
-2. Check "lex=True but label=0" cases (should be rare/zero with entailment labels)
-3. Ensure facet types have 20+ positives for Mondrian calibration
-4. Train calibrator:
-
-   # ENTITY only (safest):
-   python train_calibration.py \\
-     --data_path <this_file> \\
-     --output_path calibrator_entity.json \\
-     --use_mondrian \\
-     --facet_types ENTITY
-
-   # ENTITY+NUMERIC (if NUMERIC has 20+ positives):
-   python train_calibration.py \\
-     --data_path <this_file> \\
-     --output_path calibrator.json \\
-     --use_mondrian
-""")
-
+    
+    # Stats
+    pos = sum(s["label"] for s in samples)
+    print(f"\nTotal: {len(samples)}, Positive: {pos} ({pos/len(samples)*100:.1f}%)")
 
 if __name__ == "__main__":
     main()
