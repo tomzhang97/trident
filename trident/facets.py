@@ -110,6 +110,57 @@ def _dedupe_strings(xs: List[str]) -> List[str]:
         out.append(x)
     return out
 
+
+def _dedupe_entities_by_longest_span(mentions: List[str]) -> List[str]:
+    """
+    Deduplicate entity mentions by keeping only the longest span.
+
+    If 'Michael' and 'Michael Doeberl' both exist, drop 'Michael'.
+    This prevents partial matches from covering wrong passages.
+
+    Example:
+        Input: ['Michael', 'Michael Doeberl', 'Edward', 'Edward Dearle']
+        Output: ['Michael Doeberl', 'Edward Dearle']
+    """
+    if not mentions:
+        return []
+
+    # Normalize and dedupe exact matches first
+    normalized = []
+    seen_lower = set()
+    for m in mentions:
+        m = _safe_phrase(m)
+        if not m:
+            continue
+        m_lower = m.lower()
+        if m_lower not in seen_lower:
+            seen_lower.add(m_lower)
+            normalized.append(m)
+
+    if not normalized:
+        return []
+
+    # Sort by length descending so we check longer spans first
+    by_length = sorted(normalized, key=lambda x: len(x), reverse=True)
+
+    # Keep only mentions that are not substrings of a longer mention
+    result = []
+    for m in by_length:
+        m_lower = m.lower()
+        # Check if this mention is a substring of any already-kept mention
+        is_substring = False
+        for kept in result:
+            kept_lower = kept.lower()
+            # Check if m is a proper substring (not equal)
+            if m_lower != kept_lower and m_lower in kept_lower:
+                is_substring = True
+                break
+        if not is_substring:
+            result.append(m)
+
+    return result
+
+
 class FacetType(Enum):
     ENTITY = "ENTITY"
     RELATION = "RELATION"
@@ -338,7 +389,9 @@ class FacetMiner:
         mentions.extend(self._extract_or_entities(query))
         if not mentions:
             mentions.extend(re.findall(r"\b[A-Z][A-Za-z0-9']+(?:\s+[A-Z][A-Za-z0-9']+)*\b", query))
-        mentions = [m for m in _dedupe_strings(mentions) if not _looks_like_junk_entity(m)]
+        # CRITICAL: Use longest-span dedup to prevent "Michael" when "Michael Doeberl" exists
+        # This prevents partial matches from covering wrong passages
+        mentions = [m for m in _dedupe_entities_by_longest_span(mentions) if not _looks_like_junk_entity(m)]
         return [Facet(facet_id=f"entity_{i}", facet_type=FacetType.ENTITY, template={"mention": _safe_phrase(m)}) for i, m in enumerate(mentions)]
 
     # ---- relation (FIXED) ----

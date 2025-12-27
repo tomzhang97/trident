@@ -443,12 +443,25 @@ class TridentPipeline:
                 dataset=dataset_name
             )
             llm_output = self.llm.generate(prompt)
-            
+
             # CRITICAL FIX: Extract and clean the final answer from LLM output
             # This ensures we're not logging intermediate outputs like facet mining
             raw_answer = llm_output.text
             # Use the new, more robust extraction function
             answer = extract_final_answer(raw_answer, query)
+
+            # DEBUG: Log when answer becomes empty after extraction
+            if not answer or answer.strip() == "":
+                import os
+                if os.environ.get("TRIDENT_DEBUG_EMPTY_ANSWER", "0") == "1":
+                    print(f"\n[EMPTY ANSWER DEBUG]")
+                    print(f"  Query: {query[:100]}...")
+                    print(f"  Prompt (last 300 chars): ...{prompt[-300:]}")
+                    print(f"  Raw LLM output ({len(raw_answer)} chars): {raw_answer[:500]}...")
+                    print(f"  Extracted answer: '{answer}'")
+                    print(f"  Mode: {mode}")
+                    print(f"  Num passages: {len(result['selected_passages'])}")
+
             total_tokens = llm_output.tokens_used
             prompt_tokens = self.llm.compute_token_cost(prompt)
             completion_tokens = max(total_tokens - prompt_tokens, 0)
