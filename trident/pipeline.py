@@ -582,13 +582,24 @@ class TridentPipeline:
     ) -> TwoStageScores:
         """
         Perform two-stage scoring with shortlisting and CE/NLI.
-        
+
         CRITICAL FIX: Ensures facets are proper Facet objects, not strings.
         """
+        import os
+        debug = os.environ.get("TRIDENT_DEBUG_PVALUE", "0") == "1"
+
         stage1_scores = {}
         stage2_scores = {}
         p_values = {}
-        
+
+        if debug:
+            print(f"[DEBUG] _two_stage_scoring called: {len(passages)} passages, {len(facets)} facets")
+            print(f"[DEBUG] Calibrator loaded: {self.calibrator is not None}")
+            if self.calibrator:
+                print(f"[DEBUG] Conformal calibrator: {self.calibrator.conformal_calibrator is not None}")
+                if self.calibrator.conformal_calibrator:
+                    print(f"[DEBUG] Calibrator bins: {list(self.calibrator.conformal_calibrator.bins.keys())}")
+
         # Validate facets are proper objects
         for facet in facets:
             if not isinstance(facet, Facet):
@@ -597,7 +608,11 @@ class TridentPipeline:
         for facet in facets:
             # Stage 1: Shortlist candidates per facet
             shortlist = self._shortlist_for_facet(passages, facet)
-            
+
+            if debug:
+                ft_str = facet.facet_type.value if hasattr(facet.facet_type, 'value') else str(facet.facet_type)
+                print(f"[DEBUG] Facet {ft_str}: shortlist size={len(shortlist)}")
+
             # Stage 2: CE/NLI scoring for shortlisted pairs
             for passage in shortlist:
                 cache_key = (passage.pid, facet.facet_id, self.config.calibration.version)
@@ -609,17 +624,26 @@ class TridentPipeline:
                     self.score_cache[cache_key] = score
                 
                 stage2_scores[(passage.pid, facet.facet_id)] = score
-                
+
                 # Calibrate to p-value with text length for Mondrian
                 bucket = self._get_calibration_bucket(facet)
                 text_length = len(passage.text.split())
+
+                if debug and len(p_values) < 5:  # Only print first 5
+                    print(f"[DEBUG] Calling to_pvalue: bucket={bucket}, score={score:.4f}, len={text_length}")
+
                 p_value = self.calibrator.to_pvalue(score, bucket, text_length)
-                
+
+                if debug and len(p_values) < 5:
+                    print(f"[DEBUG] Got p_value={p_value:.4f}")
+
                 # CRITICAL FIX: Ensure p-values are reasonable
                 # If calibration gives extreme values, use score-based heuristic
                 if p_value > 0.99 or p_value < 0.0:
+                    if debug and len(p_values) < 5:
+                        print(f"[DEBUG] Overriding p_value {p_value:.4f} -> {max(0.0, min(1.0, 1.0 - score)):.4f}")
                     p_value = max(0.0, min(1.0, 1.0 - score))
-                
+
                 p_values[(passage.pid, facet.facet_id)] = p_value
         
         return TwoStageScores(
