@@ -40,15 +40,67 @@ def _normalize_label(s: str) -> str:
     return s
 
 _WS_RE = re.compile(r"\s+")
+_NON_ALNUM_RE = re.compile(r"[^0-9a-z]+")
 
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKC", s or "")
     # Robust normalization: standard quotes
-    s = (s.replace("’", "'").replace("‘", "'")
-          .replace("“", '"').replace("”", '"'))
-    s = s.replace(",", "") 
+    s = (s.replace("'", "'").replace("'", "'")
+          .replace(""", '"').replace(""", '"'))
+    s = s.replace(",", "")
     s = _WS_RE.sub(" ", s).strip().lower()
     return s
+
+def _normalize_for_matching(s: str) -> str:
+    """
+    Robust normalizer for entity/passage matching.
+    Handles hyphens, Unicode, diacritics consistently.
+
+    "Polish-Russian War" -> "polish russian war"
+    "Żuławski" -> "zulawski"
+    """
+    if not s:
+        return ""
+    s = s.lower()
+    s = unicodedata.normalize("NFKD", s)
+    # Strip diacritics (combining characters)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    # Convert all non-alphanumerics (hyphens, punctuation) to spaces
+    s = _NON_ALNUM_RE.sub(" ", s)
+    s = _WS_RE.sub(" ", s).strip()
+    return s
+
+def _token_set(s: str) -> set:
+    """Get set of normalized tokens from string."""
+    s = _normalize_for_matching(s)
+    return set(s.split()) if s else set()
+
+def _entity_in_passage(entity: str, passage: str, min_tokens: int = 2) -> bool:
+    """
+    Check if entity tokens are present in passage using robust matching.
+
+    For multi-token entities: require all tokens present (containment).
+    For single-token entities: require exact token match.
+
+    Handles hyphen normalization: "Polish-Russian War" matches "polish russian war".
+    """
+    e_tokens = _token_set(entity)
+    if not e_tokens:
+        return False
+    p_tokens = _token_set(passage)
+
+    # Filter out very short tokens (likely noise) for matching
+    e_tokens = {t for t in e_tokens if len(t) > 1}
+    if not e_tokens:
+        return False
+
+    # For multi-token entities: require containment
+    if len(e_tokens) >= min_tokens:
+        return e_tokens.issubset(p_tokens)
+
+    # For single-token entities, containment is too weak; require exact token hit
+    t = next(iter(e_tokens))
+    return t in p_tokens
 
 def _contains_exact_phrase(passage: str, phrase: str) -> bool:
     return _norm(phrase) in _norm(passage) and _norm(phrase) != ""
@@ -125,12 +177,12 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
     if "BRIDGE_HOP" in ft.value:
         e1 = str(tpl.get("entity1", "") or tpl.get("entity", "") or "")
         e2 = str(tpl.get("bridge_entity", "") or tpl.get("entity2", "") or "")
-        
+
         if not e1 or not e2:
-            return None 
-            
-        # Exact match on start node, token match (or safe exact) on end node
-        return _contains_exact_phrase(passage_text, e1) and _contains_tokens(passage_text, e2)
+            return None
+
+        # Use robust entity matching with hyphen/Unicode normalization
+        return _entity_in_passage(e1, passage_text) and _entity_in_passage(e2, passage_text)
 
     if ft == FacetType.RELATION:
         s_raw = str(tpl.get("subject", ""))
@@ -148,10 +200,19 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
                 print(f"[RELATION GATE] subj_raw='{s_raw}' obj_raw='{o_raw}' -> BOTH EMPTY after cleaning, gate=True (let NLI decide)")
             return True  # Don't gate, let NLI score it
 
-        s_match = _contains_tokens(passage_text, s) if s else False
-        o_match = _contains_tokens(passage_text, o) if o else False
+        # Use robust entity matching with hyphen/Unicode normalization
+        # "polish russian war" will match "Polish-Russian War" in passage
+        s_match = _entity_in_passage(s, passage_text) if s else False
+        o_match = _entity_in_passage(o, passage_text) if o else False
         # Require only ONE of subject OR object (multi-hop QA often splits entities across passages)
         endpoint_match = s_match or o_match
+
+        # Debug: show normalized tokens for diagnosis
+        if debug_rel:
+            s_tokens = _token_set(s) if s else set()
+            o_tokens = _token_set(o) if o else set()
+            p_tokens_sample = list(_token_set(passage_text))[:20]
+            print(f"[RELATION GATE] s_tokens={s_tokens} o_tokens={o_tokens} s_match={s_match} o_match={o_match}")
 
         passage_lower = passage_text.lower()
         facet_text_lower = f"{s_raw} {o_raw} {predicate}".lower()
