@@ -1,8 +1,7 @@
 """NLI/Cross-encoder scoring module.
-Updates:
-1. Numeric matching uses strict boundaries (Issue B).
-2. score_with_details matches runtime truncation settings (Issue C).
-3. BRIDGE_HOP1 lexical gate added.
+UPDATES:
+- Short token fallback: If phrase is "US" (no long tokens), falls back to exact match.
+- Robust normalization syntax.
 """
 
 from __future__ import annotations
@@ -22,14 +21,12 @@ from .facets import Facet, FacetType
 from .candidates import Passage
 from .config import NLIConfig
 
-
 @dataclass
 class NLIScore:
     entailment_score: float
     contradiction_score: float
     neutral_score: float
     final_score: float
-
 
 def _sha1(text: str) -> str:
     return hashlib.sha1((text or "").encode("utf-8")).hexdigest()
@@ -45,29 +42,41 @@ _WS_RE = re.compile(r"\s+")
 
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKC", s or "")
-    s = s.replace("'", "'").replace("'", "'").replace(""", '"').replace(""", '"')
+    # Robust normalization: standard quotes
+    s = (s.replace("’", "'").replace("‘", "'")
+          .replace("“", '"').replace("”", '"'))
+    s = s.replace(",", "") 
     s = _WS_RE.sub(" ", s).strip().lower()
     return s
 
 def _contains_exact_phrase(passage: str, phrase: str) -> bool:
     return _norm(phrase) in _norm(passage) and _norm(phrase) != ""
 
+def _token_in_text(tok: str, text: str) -> bool:
+    return bool(re.search(rf"(?<!\w){re.escape(tok)}(?!\w)", text))
+
+def _contains_tokens(passage: str, phrase: str) -> bool:
+    """
+    Looser check: Do significant tokens from phrase appear in passage?
+    Safe Fallback: If no significant tokens (e.g. "US"), require exact match.
+    """
+    p_norm = _norm(passage)
+    ph_norm = _norm(phrase)
+    tokens = [t for t in ph_norm.split() if len(t) > 2 and t not in {"the", "and", "of", "in"}]
+    
+    # FIX: Don't let short entities bypass the gate
+    if not tokens: 
+        return _contains_exact_phrase(passage, phrase)
+        
+    hits = sum(1 for t in tokens if _token_in_text(t, p_norm))
+    return hits >= (len(tokens) / 2)
+
 def _contains_value(passage: str, value: str) -> bool:
-    """
-    Strict numeric matching.
-    Prevents '10' matching '10th', '2010', or '10.5'.
-    Regex: (?<![\w.])value(?![\w.])
-    """
     val_str = _norm(str(value))
     if not val_str: return False
     pas_str = _norm(passage)
-    
-    # Escape value for regex
     esc_val = re.escape(val_str)
-    # Lookbehind: Not preceded by word char or dot
-    # Lookahead: Not followed by word char or dot
     pattern = rf"(?<![\w.]){esc_val}(?![\w.])"
-    
     return bool(re.search(pattern, pas_str))
 
 def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
@@ -75,23 +84,35 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
     tpl = facet.template or {}
     
     if ft == FacetType.ENTITY:
-        mention = str(tpl.get("mention", ""))
-        return _contains_exact_phrase(passage_text, mention) if mention else None
-        
+        return _contains_exact_phrase(passage_text, str(tpl.get("mention", "")))
     if ft == FacetType.NUMERIC:
-        val = str(tpl.get("value", ""))
-        return _contains_value(passage_text, val) if val else None
+        return _contains_value(passage_text, str(tpl.get("value", "")))
+    
+    # Generic BRIDGE_HOP
+    if "BRIDGE_HOP" in ft.value:
+        e1 = str(tpl.get("entity1", "") or tpl.get("entity", "") or "")
+        e2 = str(tpl.get("bridge_entity", "") or tpl.get("entity2", "") or "")
+        
+        if not e1 or not e2:
+            return None 
+            
+        # Exact match on start node, token match (or safe exact) on end node
+        return _contains_exact_phrase(passage_text, e1) and _contains_tokens(passage_text, e2)
 
-    # NEW: Bridge Gate (Require both entities)
-    if ft == FacetType.BRIDGE_HOP1:
+    if ft == FacetType.RELATION:
+        s = str(tpl.get("subject", ""))
+        o = str(tpl.get("object", ""))
+        return _contains_tokens(passage_text, s) and _contains_tokens(passage_text, o)
+
+    if ft == FacetType.COMPARISON:
         e1 = str(tpl.get("entity1", ""))
-        be = str(tpl.get("bridge_entity", ""))
-        if e1 and be:
-            return _contains_exact_phrase(passage_text, e1) and _contains_exact_phrase(passage_text, be)
-        return None
+        e2 = str(tpl.get("entity2", ""))
+        return _contains_tokens(passage_text, e1) or _contains_tokens(passage_text, e2)
+
+    if ft == FacetType.TEMPORAL:
+        return _contains_exact_phrase(passage_text, str(tpl.get("time", "")))
         
     return None
-
 
 class NLIScorer:
     def __init__(self, config: NLIConfig, device: str = "cuda:0"):
@@ -136,7 +157,6 @@ class NLIScorer:
                 self.cache.move_to_end(key)
                 return self.cache[key]
 
-        # Standard runtime settings
         inputs = self.tokenizer(premise, hypothesis, truncation="only_first", max_length=self.config.max_length, padding=True, return_tensors="pt").to(self.device)
         with torch.no_grad():
             probs = F.softmax(self.model(**inputs).logits[0], dim=-1)
@@ -203,11 +223,6 @@ class NLIScorer:
         return scores
 
     def score_with_details(self, passage: Passage, facet: Facet) -> NLIScore:
-        """
-        FIXED (Issue C): Now matches runtime truncation settings.
-        Old: truncation=True, padding="max_length"
-        New: truncation="only_first", padding=True
-        """
         premise = passage.text
         hypothesis = facet.to_hypothesis(passage.text)
 
@@ -215,14 +230,7 @@ class NLIScorer:
         if lexical_match is False:
             return NLIScore(0.0, 0.0, 1.0, 0.0)
 
-        inputs = self.tokenizer(
-            premise, hypothesis, 
-            truncation="only_first",  # Matched to runtime
-            max_length=self.config.max_length, 
-            padding=True,             # Matched to runtime
-            return_tensors="pt"
-        ).to(self.device)
-        
+        inputs = self.tokenizer(premise, hypothesis, truncation="only_first", max_length=self.config.max_length, padding=True, return_tensors="pt").to(self.device)
         with torch.no_grad():
             probs = F.softmax(self.model(**inputs).logits[0], dim=-1)
 
