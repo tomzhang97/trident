@@ -50,6 +50,27 @@ class TwoStageScores:
     p_values: Dict[Tuple[str, str], float]  # Calibrated p-values
 
 
+# Abstention sentinel - NEVER convert to empty string
+ABSTAIN_STR = "I cannot answer based on the given context."
+ABSTAIN_PATTERNS = [
+    "i cannot answer based on the given context",
+    "i cannot answer",
+    "cannot answer based on the given context",
+    "not enough information",
+    "insufficient information",
+    "no answer available",
+    "unable to answer",
+    "cannot determine",
+    "not possible to answer",
+]
+
+
+def _is_abstain_answer(text: str) -> bool:
+    """Check if text is an abstention pattern."""
+    text_lower = text.strip().lower()
+    return any(p in text_lower for p in ABSTAIN_PATTERNS)
+
+
 def _normalize_for_filter(text: str) -> str:
     """Helper function to normalize text for filtering."""
     t = text.lower().strip()
@@ -133,6 +154,10 @@ def extract_final_answer(raw_text: str, question: str) -> str:
     if not text:
         return ""
 
+    # Early check: if entire text is an abstention, return immediately
+    if _is_abstain_answer(text):
+        return ABSTAIN_STR
+
     # 0) Strip "Step N:" style reasoning lines (even at end of text)
     text = re.sub(r'(?mi)^step\s+\d+:[^\n]*$', '', text)
     text = re.sub(r'(?i)step\s+\d+:[^\.!\n]*', '', text)
@@ -150,6 +175,10 @@ def extract_final_answer(raw_text: str, question: str) -> str:
             cand = m.group(1).strip()
             # Clean up common trailing artifacts
             cand = re.sub(r'\s*(Human:|Assistant:|Question:).*$', '', cand, flags=re.IGNORECASE)
+            # CRITICAL: Check for abstention BEFORE _looks_like_meta
+            # Never convert "I cannot answer..." to empty string
+            if _is_abstain_answer(cand):
+                return ABSTAIN_STR
             if cand and len(cand) > 0 and not _looks_like_meta(cand):
                 return cand
 
@@ -196,6 +225,9 @@ def extract_final_answer(raw_text: str, question: str) -> str:
             # Clean up Human:/Assistant: artifacts
             cand = re.sub(r'\s*(Human:|Assistant:|Question:).*$', '', cand, flags=re.IGNORECASE)
             cand = re.sub(r'(Human:|Assistant:|Question:).*$', '', cand, flags=re.IGNORECASE)
+            # Check for abstention before rejecting
+            if _is_abstain_answer(cand):
+                return ABSTAIN_STR
             if cand and len(cand) > 1 and not _looks_like_meta(cand):
                 return cand
 
@@ -206,6 +238,9 @@ def extract_final_answer(raw_text: str, question: str) -> str:
         # Skip lines with colons (usually labels)
         if ":" in line:
             continue
+        # Check for abstention
+        if _is_abstain_answer(line):
+            return ABSTAIN_STR
         if _looks_like_meta(line):
             continue
         # Look for substantive content (not too short, not too long)
@@ -473,7 +508,11 @@ class TridentPipeline:
         
         # Calculate total latency
         latency_ms = (time.time() - start_time) * 1000
-        
+
+        # Check if model abstained (either selection abstained OR model said "I cannot answer")
+        model_abstained = (answer == ABSTAIN_STR)
+        final_abstained = result['abstained'] or model_abstained
+
         # Prepare output
         metrics = result.get('metrics', {})
         evidence_tokens = result.get('evidence_tokens', 0)
@@ -483,13 +522,14 @@ class TridentPipeline:
             'completion_tokens': completion_tokens,
             'total_tokens': total_tokens,
             'overhead_tokens': max(total_tokens - evidence_tokens, 0),
+            'model_abstained': model_abstained,  # Track when model says "I cannot answer"
         })
 
         return PipelineOutput(
             answer=answer,
             selected_passages=result['selected_passages'],
             certificates=result.get('certificates'),
-            abstained=result['abstained'],
+            abstained=final_abstained,
             tokens_used=total_tokens,
             latency_ms=latency_ms,
             metrics=metrics,

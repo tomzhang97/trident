@@ -135,6 +135,7 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
     if ft == FacetType.RELATION:
         s_raw = str(tpl.get("subject", ""))
         o_raw = str(tpl.get("object", ""))
+        predicate = str(tpl.get("predicate", ""))
         # Clean endpoints - remove WH-words and generic terms
         s = _clean_relation_endpoint(s_raw)
         o = _clean_relation_endpoint(o_raw)
@@ -149,9 +150,29 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         s_match = _contains_tokens(passage_text, s) if s else False
         o_match = _contains_tokens(passage_text, o) if o else False
         # Require only ONE of subject OR object (multi-hop QA often splits entities across passages)
-        result = s_match or o_match
+        endpoint_match = s_match or o_match
+
+        # AWARD/WIN ANCHOR GATE: If relation is about awards/wins, require anchor words in passage
+        # This prevents "director page" passages from falsely covering "award won" relations
+        award_keywords = {"won", "award", "prize", "win", "winner", "winning", "awarded"}
+        facet_text_lower = f"{s_raw} {o_raw} {predicate}".lower()
+        is_award_relation = any(kw in facet_text_lower for kw in award_keywords)
+
+        if is_award_relation:
+            # Require at least one award anchor in passage
+            award_anchors = {"award", "won", "prize", "received", "honor", "honoured", "honored",
+                           "oscar", "grammy", "emmy", "bafta", "golden globe", "winner", "winning",
+                           "accolade", "recognition", "nominated", "nomination", "laureate"}
+            passage_lower = passage_text.lower()
+            anchor_match = any(anchor in passage_lower for anchor in award_anchors)
+            if debug_rel:
+                print(f"[RELATION GATE] AWARD relation detected, anchor_match={anchor_match}")
+            result = endpoint_match and anchor_match
+        else:
+            result = endpoint_match
+
         if debug_rel:
-            print(f"[RELATION GATE] subj_raw='{s_raw}' subj_clean='{s}' obj_raw='{o_raw}' obj_clean='{o}' s_match={s_match} o_match={o_match} -> gate={result}")
+            print(f"[RELATION GATE] subj_raw='{s_raw}' subj_clean='{s}' obj_raw='{o_raw}' obj_clean='{o}' s_match={s_match} o_match={o_match} is_award={is_award_relation} -> gate={result}")
         return result
 
     if ft == FacetType.COMPARISON:
