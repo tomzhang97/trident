@@ -158,15 +158,24 @@ class SelectionConditionalCalibrator:
         self.temp_data = []
 
     def get_p_value(self, score: float, facet_type: str, text_length: int) -> float:
-        """Get p-value with robust fallback to 'all' bucket."""
+        """Get p-value with robust fallback to 'all' bucket.
+
+        NEVER raises - returns 1.0 (fail-closed) if no calibration data.
+        """
         import os
         debug = os.environ.get("TRIDENT_DEBUG_PVALUE", "0") == "1"
+
+        # Canonicalize facet_type (BRIDGE_HOP1/2/3 -> BRIDGE_HOP)
+        original_ft = facet_type
+        if facet_type.startswith("BRIDGE_HOP") or facet_type == "BRIDGE":
+            facet_type = "BRIDGE_HOP"
 
         ft_bins = self.bins.get(facet_type)
         if not ft_bins:
             if debug:
-                print(f"[PVALUE DEBUG] MISS facet_type={facet_type}, available={list(self.bins.keys())}")
-            raise KeyError(f"No calibration data for type: {facet_type}")
+                print(f"[PVALUE DEBUG] NO BINS for {original_ft}→{facet_type}, "
+                      f"available={list(self.bins.keys())} → p=1.0")
+            return 1.0  # Fail-closed, don't raise
 
         neg_scores = None
 
