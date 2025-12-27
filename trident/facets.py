@@ -224,7 +224,6 @@ class Facet:
             s_raw = tpl.get('subject', '')
             o_raw = tpl.get('object', '')
             p = _normalize_relation_predicate(tpl.get('predicate', ''))
-            p_lower = p.lower() if p else ''
             # Clean endpoints - remove WH-words and generic terms
             s = _clean_relation_endpoint_for_hypothesis(s_raw)
             o = _clean_relation_endpoint_for_hypothesis(o_raw)
@@ -232,54 +231,86 @@ class Facet:
             # PREDICATE-SPECIFIC HYPOTHESIS TEMPLATES
             # "The passage states something about X" is TOO PERMISSIVE
             # Use predicate-specific templates that require the actual relation
+            #
+            # CRITICAL: Check facet_text (subject + object + predicate combined)
+            # NOT just predicate - because predicate may be generic "is related to"
+            # while the actual relation type is in subject/object (e.g., "director of X")
+            facet_text_lower = f"{s_raw} {o_raw} {p}".lower()
+
+            # Detect relation kind from combined text (same logic as gate)
+            relation_kind = "DEFAULT"
+            hypothesis = None
 
             # Director/directed
-            if 'direct' in p_lower or 'director' in p_lower:
+            if 'direct' in facet_text_lower or 'director' in facet_text_lower:
+                relation_kind = "DIRECTOR"
                 if o:
-                    return _ensure_sentence(f"The passage states who directed {o}")
+                    hypothesis = f"The passage states who directed {o}"
                 elif s:
-                    return _ensure_sentence(f"The passage states that {s} directed a film")
+                    hypothesis = f"The passage states that {s} directed a film"
 
             # Born/birthplace
-            if 'born' in p_lower or 'birth' in p_lower:
-                if 'where' in s_raw.lower() or 'place' in p_lower:
+            elif 'born' in facet_text_lower or 'birth' in facet_text_lower:
+                relation_kind = "BORN"
+                if 'where' in s_raw.lower() or 'place' in facet_text_lower:
                     if o:
-                        return _ensure_sentence(f"The passage states where {o} was born")
+                        hypothesis = f"The passage states where {o} was born"
                     elif s:
-                        return _ensure_sentence(f"The passage states the birthplace of {s}")
+                        hypothesis = f"The passage states the birthplace of {s}"
                 else:
                     if o:
-                        return _ensure_sentence(f"The passage states when {o} was born")
+                        hypothesis = f"The passage states when {o} was born"
                     elif s:
-                        return _ensure_sentence(f"The passage states when {s} was born")
+                        hypothesis = f"The passage states when {s} was born"
 
             # Won/award/prize
-            if any(w in p_lower for w in ['won', 'win', 'award', 'prize', 'honor']):
+            elif any(w in facet_text_lower for w in ['won', 'win', 'award', 'prize', 'honor']):
+                relation_kind = "AWARD"
                 if o:
-                    return _ensure_sentence(f"The passage states what award {o} won")
+                    hypothesis = f"The passage states what award {o} won"
                 elif s:
-                    return _ensure_sentence(f"The passage states what {s} won")
+                    hypothesis = f"The passage states what {s} won"
 
             # Created/founded/written
-            if any(w in p_lower for w in ['creat', 'found', 'writ', 'author', 'compose']):
+            elif any(w in facet_text_lower for w in ['creat', 'found', 'writ', 'author', 'compose']):
+                relation_kind = "CREATED"
                 if o:
-                    return _ensure_sentence(f"The passage states who created {o}")
+                    hypothesis = f"The passage states who created {o}"
                 elif s:
-                    return _ensure_sentence(f"The passage states what {s} created")
+                    hypothesis = f"The passage states what {s} created"
 
             # Located/capital
-            if any(w in p_lower for w in ['locat', 'capital', 'situat', 'based']):
+            elif any(w in facet_text_lower for w in ['locat', 'capital', 'situat', 'based']):
+                relation_kind = "LOCATION"
                 if o:
-                    return _ensure_sentence(f"The passage states where {o} is located")
+                    hypothesis = f"The passage states where {o} is located"
                 elif s:
-                    return _ensure_sentence(f"The passage states the location of {s}")
+                    hypothesis = f"The passage states the location of {s}"
 
             # Married/spouse
-            if any(w in p_lower for w in ['marr', 'spouse', 'wife', 'husband']):
+            elif any(w in facet_text_lower for w in ['marr', 'spouse', 'wife', 'husband']):
+                relation_kind = "MARRIAGE"
                 if o:
-                    return _ensure_sentence(f"The passage states who {o} married")
+                    hypothesis = f"The passage states who {o} married"
                 elif s:
-                    return _ensure_sentence(f"The passage states the spouse of {s}")
+                    hypothesis = f"The passage states the spouse of {s}"
+
+            # Debug logging
+            import os
+            if os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1":
+                print(f"[RELATION HYP] relation_kind={relation_kind} raw_predicate='{p}' "
+                      f"facet_text='{facet_text_lower[:60]}...' hypothesis={hypothesis}")
+
+            # Return specific hypothesis if we matched a relation kind
+            if hypothesis:
+                # Sanity check in debug mode
+                if os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1":
+                    hyp_lower = hypothesis.lower()
+                    if relation_kind == "DIRECTOR" and "direct" not in hyp_lower:
+                        print(f"[RELATION HYP] WARNING: DIRECTOR kind but 'direct' not in hypothesis!")
+                    if relation_kind == "AWARD" and not any(w in hyp_lower for w in ["award", "won"]):
+                        print(f"[RELATION HYP] WARNING: AWARD kind but no award word in hypothesis!")
+                return _ensure_sentence(hypothesis)
 
             # Default: use predicate in hypothesis (still better than "something about")
             if s and o:
