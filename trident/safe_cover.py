@@ -214,12 +214,20 @@ class SafeCoverAlgorithm:
 
         Per query, freeze: T_f, α_query, α_f, ᾱ_f, calibrator version, coverage sets.
         No mid-episode adaptation.
+
+        CRITICAL FIX:
+        - per_facet_alpha IS the per-facet budget (don't divide by |F|)
+        - max_tests from config is the T_f (don't hardcode 10)
         """
-        alpha_query = alpha_query or self.config.per_facet_alpha
+        import os
+        debug = os.environ.get("TRIDENT_DEBUG_PVALUE", "0") == "1"
+
+        # per_facet_alpha is ALREADY the per-facet budget α_f
+        per_facet_alpha = alpha_query or self.config.per_facet_alpha
         n_facets = len(facets)
 
-        # Per-facet configs
-        t_f = 10  # Default max tests per facet
+        # Get max_tests from config (T_f for Bonferroni) - was hardcoded to 10!
+        t_f = getattr(self.config, 'max_tests', 3)
         alpha_f = {}
         alpha_bar_f = {}
 
@@ -231,11 +239,15 @@ class SafeCoverAlgorithm:
                 facet_alpha = facet_config.alpha
             else:
                 facet_t_f = t_f
-                # Bonferroni allocation: α_f = α_query / |F(q)|
-                facet_alpha = alpha_query / max(n_facets, 1)
+                # per_facet_alpha IS the per-facet budget (no division by |F|)
+                facet_alpha = per_facet_alpha
 
-            # ᾱ_f = α_f / T_f
+            # ᾱ_f = α_f / T_f (Bonferroni over tests within facet)
             facet_alpha_bar = facet_alpha / max(facet_t_f, 1)
+
+            if debug:
+                ft_str = facet.facet_type.value if hasattr(facet.facet_type, 'value') else str(facet.facet_type)
+                print(f"[CERT DEBUG] facet={ft_str} alpha_f={facet_alpha:.4f} T_f={facet_t_f} alpha_bar_f={facet_alpha_bar:.4f}")
 
             # Apply fallback if active
             if self.fallback_active:

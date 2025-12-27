@@ -584,6 +584,7 @@ class TridentPipeline:
         Perform two-stage scoring with shortlisting and CE/NLI.
 
         CRITICAL FIX: Ensures facets are proper Facet objects, not strings.
+        CRITICAL FIX: Enforces max_tests cap on shortlist BEFORE computing p-values.
         """
         import os
         debug = os.environ.get("TRIDENT_DEBUG_PVALUE", "0") == "1"
@@ -592,8 +593,12 @@ class TridentPipeline:
         stage2_scores = {}
         p_values = {}
 
+        # Get max_tests from config (T_f for Bonferroni)
+        max_tests = getattr(self.config.safe_cover, 'max_tests', 3) if hasattr(self.config, 'safe_cover') else 3
+
         if debug:
             print(f"[DEBUG] _two_stage_scoring called: {len(passages)} passages, {len(facets)} facets")
+            print(f"[DEBUG] max_tests (T_f) = {max_tests}")
             print(f"[DEBUG] Calibrator loaded: {self.calibrator is not None}")
             if self.calibrator:
                 print(f"[DEBUG] Conformal calibrator: {self.calibrator.conformal_calibrator is not None}")
@@ -604,14 +609,14 @@ class TridentPipeline:
         for facet in facets:
             if not isinstance(facet, Facet):
                 raise TypeError(f"Expected Facet object, got {type(facet)}: {facet}")
-        
+
         for facet in facets:
-            # Stage 1: Shortlist candidates per facet
-            shortlist = self._shortlist_for_facet(passages, facet)
+            # Stage 1: Shortlist candidates per facet - CAP TO max_tests
+            shortlist = self._shortlist_for_facet(passages, facet, max_candidates=max_tests)
 
             if debug:
                 ft_str = facet.facet_type.value if hasattr(facet.facet_type, 'value') else str(facet.facet_type)
-                print(f"[DEBUG] Facet {ft_str}: shortlist size={len(shortlist)}")
+                print(f"[DEBUG] Facet {ft_str}: shortlist size={len(shortlist)} (capped to max_tests={max_tests})")
 
             # Stage 2: CE/NLI scoring for shortlisted pairs
             for passage in shortlist:
