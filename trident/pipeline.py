@@ -690,6 +690,11 @@ class TridentPipeline:
                 p_values[(passage.pid, facet.facet_id)] = p_value
 
         # COVER SUMMARY: One line per facet showing why it passed/failed
+        # Track counters for summary
+        num_passed = 0
+        num_failed = 0
+        num_no_candidates = 0
+
         if debug:
             for facet in facets:
                 ft = facet.facet_type
@@ -706,11 +711,17 @@ class TridentPipeline:
                 cand = [(pid, p) for (pid, fid), p in p_values.items() if fid == facet.facet_id]
                 if not cand:
                     print(f"[COVER SUMMARY] facet={ft_str} id={facet.facet_id[:8]}... NO_CANDIDATES")
+                    num_no_candidates += 1
                     continue
 
                 best_pid, best_p = min(cand, key=lambda x: x[1])
                 best_score = stage2_scores.get((best_pid, facet.facet_id), None)
                 passes = best_p <= alpha_bar
+
+                if passes:
+                    num_passed += 1
+                else:
+                    num_failed += 1
 
                 # Get facet text for context
                 facet_text = ""
@@ -724,8 +735,14 @@ class TridentPipeline:
                       f"best_score={best_score:.4f} best_p={best_p:.4g} alpha_bar={alpha_bar:.4g} "
                       f"T_f={t_f} pass={passes}")
 
+            # Print summary line
+            print(f"[COVER TOTALS] passed={num_passed}/{len(facets)} failed={num_failed} no_candidates={num_no_candidates}")
+
         # ORACLE DEBUG: For failing facets, score ALL passages to diagnose stage-1 vs stage-2
         oracle_debug = os.environ.get("TRIDENT_DEBUG_ORACLE", "0") == "1"
+        stage1_miss_count = 0
+        stage2_fail_count = 0
+
         if debug and oracle_debug:
             print(f"\n[ORACLE DEBUG] Diagnosing failing facets...")
             for facet in facets:
@@ -773,8 +790,10 @@ class TridentPipeline:
                 # Diagnosis
                 if oracle_passes and not probed_passes:
                     diagnosis = "STAGE-1 MISS (ranking failed to surface best passage)"
+                    stage1_miss_count += 1
                 elif not oracle_passes:
                     diagnosis = "STAGE-2 FAIL (no passage scores high enough)"
+                    stage2_fail_count += 1
                 else:
                     diagnosis = "OK"
 
@@ -792,6 +811,9 @@ class TridentPipeline:
                 for rank, (pid, score, prob, pval) in enumerate(oracle_results[:3]):
                     in_sl = "✓" if pid in shortlist_pids else "✗"
                     print(f"  [{rank+1}] pid={pid[:12]}... score={score:.4f} p={pval:.4g} in_shortlist={in_sl}")
+
+            # Print oracle summary
+            print(f"[ORACLE TOTALS] stage1_miss={stage1_miss_count} stage2_fail={stage2_fail_count}")
 
         return TwoStageScores(
             stage1_scores=stage1_scores,

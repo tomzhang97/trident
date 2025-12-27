@@ -194,10 +194,67 @@ class NLIScorer:
     def _cache_key(self, passage_text: str, hypothesis: str) -> Tuple[str, str]:
         return (_sha1(passage_text), _sha1(hypothesis))
 
+    def _entity_lexical_score(self, passage_text: str, facet: Facet) -> float:
+        """
+        Score ENTITY facet using lexical containment (not NLI).
+
+        NLI with "The passage mentions X" is too permissive - any passage
+        containing the string gets high entailment even if irrelevant.
+
+        Returns:
+            0.0 if entity not found
+            0.5-1.0 based on presence and prominence (position, frequency)
+        """
+        mention = facet.template.get("mention", "") if facet.template else ""
+        if not mention:
+            return 0.0
+
+        # Normalize for matching
+        text_lower = passage_text.lower()
+        mention_lower = mention.lower()
+
+        # Check for exact phrase match
+        if mention_lower not in text_lower:
+            # Try with hyphen/space normalization
+            import re
+            mention_norm = re.sub(r"[-_]+", " ", mention_lower)
+            text_norm = re.sub(r"[-_]+", " ", text_lower)
+            if mention_norm not in text_norm:
+                return 0.0
+
+        # Entity is present - compute score based on prominence
+        # Base score: 0.7 for presence
+        score = 0.7
+
+        # Bonus for early mention (first 20% of passage) - up to +0.15
+        first_pos = text_lower.find(mention_lower)
+        if first_pos >= 0:
+            rel_pos = first_pos / max(len(text_lower), 1)
+            if rel_pos < 0.2:
+                score += 0.15 * (1 - rel_pos / 0.2)
+
+        # Bonus for multiple mentions - up to +0.15
+        count = text_lower.count(mention_lower)
+        if count > 1:
+            score += min(0.15, 0.05 * (count - 1))
+
+        return min(1.0, score)
+
     def score(self, passage: Passage, facet: Facet) -> float:
         premise = passage.text
-        hypothesis = facet.to_hypothesis(passage.text)
         debug_rel = os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1"
+        debug_entity = os.environ.get("TRIDENT_DEBUG_ENTITY", "0") == "1"
+
+        # ENTITY: Use lexical containment, not NLI
+        # NLI with "The passage mentions X" is too permissive
+        if facet.facet_type == FacetType.ENTITY:
+            score = self._entity_lexical_score(premise, facet)
+            if debug_entity:
+                mention = facet.template.get("mention", "") if facet.template else ""
+                print(f"[ENTITY LEXICAL] mention={mention!r} score={score:.4f}")
+            return score
+
+        hypothesis = facet.to_hypothesis(passage.text)
 
         if debug_rel and facet.facet_type == FacetType.RELATION:
             print(f"[RELATION HYP] {hypothesis}")
@@ -235,6 +292,7 @@ class NLIScorer:
         scores = []
         bs = int(getattr(self.config, "batch_size", 32))
         debug_rel = os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1"
+        debug_entity = os.environ.get("TRIDENT_DEBUG_ENTITY", "0") == "1"
 
         for i in range(0, len(pairs), bs):
             batch = pairs[i:i + bs]
@@ -246,10 +304,21 @@ class NLIScorer:
             results_map = {}
 
             for idx, (p, f) in enumerate(batch):
+                facet_types.append(f.facet_type)
+
+                # ENTITY: Use lexical containment, not NLI
+                if f.facet_type == FacetType.ENTITY:
+                    s = self._entity_lexical_score(p.text, f)
+                    if debug_entity:
+                        mention = f.template.get("mention", "") if f.template else ""
+                        print(f"[ENTITY BATCH] idx={idx} mention={mention!r} score={s:.4f}")
+                    results_map[idx] = s
+                    batch_data.append(None)  # Placeholder
+                    continue
+
                 hyp = f.to_hypothesis(p.text)
                 key = self._cache_key(p.text, hyp)
-                batch_data.append((key))
-                facet_types.append(f.facet_type)
+                batch_data.append(key)
 
                 lexical_match = _check_lexical_gate(f, p.text)
                 if lexical_match is False:
@@ -294,6 +363,13 @@ class NLIScorer:
 
     def score_with_details(self, passage: Passage, facet: Facet) -> NLIScore:
         premise = passage.text
+
+        # ENTITY: Use lexical containment, not NLI
+        if facet.facet_type == FacetType.ENTITY:
+            score = self._entity_lexical_score(premise, facet)
+            # Return synthetic NLIScore with lexical score as both entail and final
+            return NLIScore(score, 0.0, 1.0 - score, score)
+
         hypothesis = facet.to_hypothesis(passage.text)
 
         lexical_match = _check_lexical_gate(facet, premise)
