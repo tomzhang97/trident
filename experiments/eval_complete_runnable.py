@@ -940,6 +940,8 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
                 cmd.extend(["--config_family", args.config_family])
             if args.load_in_8bit:
                 cmd.append("--load_in_8bit")
+            if hasattr(args, 'calibration_path') and args.calibration_path:
+                cmd.extend(["--calibration_path", args.calibration_path])
 
             # Per-process environment: pin to exactly one GPU
             env = os.environ.copy()
