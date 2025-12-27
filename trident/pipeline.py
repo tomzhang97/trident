@@ -611,12 +611,19 @@ class TridentPipeline:
                 raise TypeError(f"Expected Facet object, got {type(facet)}: {facet}")
 
         for facet in facets:
-            # Stage 1: Shortlist candidates per facet - CAP TO max_tests
-            shortlist = self._shortlist_for_facet(passages, facet, max_candidates=max_tests)
+            ft = facet.facet_type
+
+            # Facet-type override: noisy facets need more tests to find good passages
+            facet_max_tests = max_tests
+            if ft == FacetType.RELATION or "BRIDGE" in ft.value:
+                facet_max_tests = max(max_tests, 10)
+
+            # Stage 1: Shortlist candidates per facet - CAP TO facet_max_tests
+            shortlist = self._shortlist_for_facet(passages, facet, max_candidates=facet_max_tests)
 
             if debug:
-                ft_str = facet.facet_type.value if hasattr(facet.facet_type, 'value') else str(facet.facet_type)
-                print(f"[DEBUG] Facet {ft_str}: shortlist size={len(shortlist)} (capped to max_tests={max_tests})")
+                ft_str = ft.value if hasattr(ft, 'value') else str(ft)
+                print(f"[DEBUG] Facet {ft_str}: shortlist size={len(shortlist)} (max_tests={facet_max_tests})")
 
             # Stage 2: CE/NLI scoring for shortlisted pairs
             for passage in shortlist:

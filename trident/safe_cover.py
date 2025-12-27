@@ -232,6 +232,8 @@ class SafeCoverAlgorithm:
         alpha_bar_f = {}
 
         for facet in facets:
+            ft = facet.facet_type
+
             # Get facet-specific config if available
             if facet.facet_id in self.config.per_facet_configs:
                 facet_config = self.config.per_facet_configs[facet.facet_id]
@@ -241,6 +243,11 @@ class SafeCoverAlgorithm:
                 facet_t_f = t_f
                 # per_facet_alpha IS the per-facet budget (no division by |F|)
                 facet_alpha = per_facet_alpha
+
+                # Facet-type override: noisy facets need more tests to find good passages
+                # RELATION and BRIDGE_HOP often have the "one good" passage ranked 5-10
+                if ft == FacetType.RELATION or "BRIDGE" in ft.value:
+                    facet_t_f = max(facet_t_f, 10)
 
             # ᾱ_f = α_f / T_f (Bonferroni over tests within facet)
             facet_alpha_bar = facet_alpha / max(facet_t_f, 1)
@@ -378,7 +385,11 @@ class SafeCoverAlgorithm:
         coverage_sets = {p.pid: set() for p in passages}
         coverage_info = {}  # (pid, fid) -> {p_value, alpha_bar, bin, ...}
 
+        import os
+        debug = os.environ.get("TRIDENT_DEBUG_PVALUE", "0") == "1"
+
         for facet in facets:
+            ft = facet.facet_type
             alpha_bar = knobs.get_alpha_bar(facet.facet_id)
 
             # Get per-facet test limit
@@ -386,11 +397,17 @@ class SafeCoverAlgorithm:
                 max_tests = self.config.per_facet_configs[facet.facet_id].max_tests
             else:
                 max_tests = knobs.t_f
+                # Facet-type override: noisy facets need more tests
+                if ft == FacetType.RELATION or "BRIDGE" in ft.value:
+                    max_tests = max(max_tests, 10)
 
             # Shortlist passages for this facet (Section 4.4)
             shortlist = self._shortlist_for_facet(
                 passages, facet, p_values, scores, max_tests
             )
+
+            # Track best p-value for this facet (for debugging)
+            facet_p_values = []
 
             # Test coverage for each shortlisted passage
             for entry in shortlist:
@@ -398,6 +415,7 @@ class SafeCoverAlgorithm:
 
                 if key in p_values:
                     pv = p_values[key]
+                    facet_p_values.append(pv)
 
                     if pv <= alpha_bar:
                         coverage_sets[entry.passage.pid].add(facet.facet_id)
@@ -409,8 +427,15 @@ class SafeCoverAlgorithm:
                         'alpha_facet': knobs.alpha_f.get(facet.facet_id, knobs.alpha_query),
                         'bin': bins.get(key, 'default') if bins else entry.bin_key,
                         'score': scores.get(key, 0.0) if scores else entry.score,
-                        'facet_type': facet.facet_type.value if isinstance(facet.facet_type, FacetType) else str(facet.facet_type),
+                        'facet_type': ft.value if isinstance(ft, FacetType) else str(ft),
                     }
+
+            # Log best p-value per facet for debugging
+            if debug:
+                best_p = min(facet_p_values) if facet_p_values else 1.0
+                ft_str = ft.value if hasattr(ft, 'value') else str(ft)
+                passes = best_p <= alpha_bar
+                print(f"[COVER DEBUG] facet={ft_str} best_p={best_p:.4g} alpha_bar={alpha_bar:.4g} pass={passes}")
 
         return coverage_sets, coverage_info
 
