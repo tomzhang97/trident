@@ -25,6 +25,22 @@ from .facets import Facet, FacetType
 from .config import SafeCoverConfig
 
 
+def tf_for(ft_enum: FacetType, ft_str: str) -> int:
+    """
+    Get T_f for a facet type. MUST be consistent with pipeline.py.
+
+    Used for:
+    - Shortlist size in pipeline
+    - Bonferroni threshold α_bar = α_f / T_f
+    - Coverage set building in safe_cover
+    """
+    if ft_enum == FacetType.ENTITY:
+        return 5
+    if ft_enum == FacetType.RELATION or "BRIDGE" in ft_str:
+        return 10
+    return 5
+
+
 class AbstentionReason(Enum):
     """Reasons for abstention per Section 4.6."""
     NONE = "none"
@@ -243,17 +259,9 @@ class SafeCoverAlgorithm:
                 # per_facet_alpha IS the per-facet budget (no division by |F|)
                 facet_alpha = per_facet_alpha
 
-                # Facet-type specific T_f values:
-                # - ENTITY: T_f=5 (stage-1 should rank well, don't over-penalize)
-                # - RELATION/BRIDGE: T_f=10 (noisier, need more candidates)
-                # - Others: T_f=5
+                # Use shared tf_for function (MUST match pipeline.py)
                 ft_str = ft.value if hasattr(ft, 'value') else str(ft)
-                if ft == FacetType.ENTITY:
-                    facet_t_f = 5
-                elif ft == FacetType.RELATION or "BRIDGE" in ft_str:
-                    facet_t_f = 10
-                else:
-                    facet_t_f = 5
+                facet_t_f = tf_for(ft, ft_str)
 
             # ᾱ_f = α_f / T_f (Bonferroni over tests within facet)
             facet_alpha_bar = facet_alpha / max(facet_t_f, 1)
@@ -402,14 +410,9 @@ class SafeCoverAlgorithm:
             if facet.facet_id in self.config.per_facet_configs:
                 max_tests = self.config.per_facet_configs[facet.facet_id].max_tests
             else:
-                # Facet-type specific T_f values (must match _freeze_episode_knobs)
+                # Use shared tf_for function (MUST match pipeline.py)
                 ft_str = ft.value if hasattr(ft, 'value') else str(ft)
-                if ft == FacetType.ENTITY:
-                    max_tests = 5
-                elif ft == FacetType.RELATION or "BRIDGE" in ft_str:
-                    max_tests = 10
-                else:
-                    max_tests = 5
+                max_tests = tf_for(ft, ft_str)
 
             # Shortlist passages for this facet (Section 4.4)
             shortlist = self._shortlist_for_facet(

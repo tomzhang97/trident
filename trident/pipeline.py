@@ -593,17 +593,29 @@ class TridentPipeline:
         stage2_scores = {}
         p_values = {}
 
-        # Get max_tests from config (T_f for Bonferroni)
-        max_tests = getattr(self.config.safe_cover, 'max_tests', 3) if hasattr(self.config, 'safe_cover') else 3
+        # Shared T_f function - MUST be consistent across pipeline, safe_cover, and certificates
+        def tf_for(ft_enum, ft_str: str) -> int:
+            """Get T_f for a facet type. Used for shortlist size AND Bonferroni threshold."""
+            if ft_enum == FacetType.ENTITY:
+                return 5
+            if ft_enum == FacetType.RELATION or "BRIDGE" in ft_str:
+                return 10
+            return 5
+
+        # Get per_facet_alpha from config
+        per_facet_alpha = getattr(self.config.safe_cover, 'per_facet_alpha', 0.2) if hasattr(self.config, 'safe_cover') else 0.2
 
         if debug:
-            print(f"[DEBUG] _two_stage_scoring called: {len(passages)} passages, {len(facets)} facets")
-            print(f"[DEBUG] max_tests (T_f) = {max_tests}")
+            print(f"[DEBUG] _two_stage_scoring: {len(passages)} passages, {len(facets)} facets")
+            print(f"[DEBUG] per_facet_alpha={per_facet_alpha}")
             print(f"[DEBUG] Calibrator loaded: {self.calibrator is not None}")
-            if self.calibrator:
-                print(f"[DEBUG] Conformal calibrator: {self.calibrator.conformal_calibrator is not None}")
-                if self.calibrator.conformal_calibrator:
-                    print(f"[DEBUG] Calibrator bins: {list(self.calibrator.conformal_calibrator.bins.keys())}")
+            # Print T_f for each facet
+            for facet in facets:
+                ft = facet.facet_type
+                ft_str = ft.value if hasattr(ft, 'value') else str(ft)
+                t_f = tf_for(ft, ft_str)
+                alpha_bar = per_facet_alpha / t_f
+                print(f"[DEBUG] facet={ft_str} T_f={t_f} alpha_bar={alpha_bar:.4f}")
 
         # Validate facets are proper objects
         for facet in facets:
@@ -614,22 +626,11 @@ class TridentPipeline:
             ft = facet.facet_type
             ft_str = ft.value if hasattr(ft, 'value') else str(ft)
 
-            # Facet-type specific T_f values:
-            # - ENTITY: T_f=5 (stage-1 should rank well, don't over-penalize with Bonferroni)
-            # - RELATION/BRIDGE: T_f=10 (noisier, need more candidates)
-            # - Others: T_f=5
-            if ft == FacetType.ENTITY:
-                facet_max_tests = 5
-            elif ft == FacetType.RELATION or "BRIDGE" in ft_str:
-                facet_max_tests = 10
-            else:
-                facet_max_tests = 5
+            # Get T_f for this facet type (uses shared tf_for function)
+            facet_max_tests = tf_for(ft, ft_str)
 
-            # Stage 1: Shortlist candidates per facet - CAP TO facet_max_tests
+            # Stage 1: Shortlist candidates per facet - CAP TO T_f
             shortlist = self._shortlist_for_facet(passages, facet, max_candidates=facet_max_tests)
-
-            if debug:
-                print(f"[DEBUG] Facet {ft_str}: shortlist size={len(shortlist)} (T_f={facet_max_tests})")
 
             # Stage 2: CE/NLI scoring for shortlisted pairs
             for passage in shortlist:
@@ -641,48 +642,45 @@ class TridentPipeline:
                     score = self.nli_scorer.score(passage, facet)
                     self.score_cache[cache_key] = score
 
-                # CRITICAL FIX: Clip scores to [0,1] before calibration
-                # Calibrator was trained on [0,1] scores; negatives map to p≈1
-                score_clipped = max(0.0, min(1.0, score))
+                import math
+
+                # Transform score to probability in [0,1]
+                # NLI scorer outputs entail - 0.5*contra, typically in [-0.5, 1]
+                prob = score
+                if prob < 0.0 or prob > 1.0:
+                    # Score outside [0,1] - likely logit/margin, apply sigmoid
+                    prob = 1.0 / (1.0 + math.exp(-score))
+
+                # Clip to [0,1] (safe)
+                prob = max(0.0, min(1.0, prob))
 
                 stage2_scores[(passage.pid, facet.facet_id)] = score
 
-                # Calibrate to p-value with text length for Mondrian
+                # Calibrate to conformal p-value with text length for Mondrian
                 bucket = self._get_calibration_bucket(facet)
                 text_length = len(passage.text.split())
 
-                if debug and len(p_values) < 5:  # Only print first 5
-                    print(f"[DEBUG] Calling to_pvalue: bucket={bucket}, score={score:.4f} (clipped={score_clipped:.4f}), len={text_length}")
+                if debug and len(p_values) < 5:
+                    print(f"[DEBUG] to_pvalue: bucket={bucket}, raw_score={score:.4f}, prob={prob:.4f}, len={text_length}")
 
-                p_value = self.calibrator.to_pvalue(score_clipped, bucket, text_length)
+                # CRITICAL: Use calibrator's conformal p-value, NOT 1-score
+                p_value = self.calibrator.to_pvalue(prob, bucket, text_length)
 
                 if debug and len(p_values) < 5:
-                    print(f"[DEBUG] Got p_value={p_value:.4f}")
+                    print(f"[DEBUG] conformal p_value={p_value:.4f}")
 
-                # CRITICAL FIX: Ensure p-values are reasonable
-                # If calibration gives extreme values, use score-based heuristic
-                if p_value > 0.99 or p_value < 0.0:
-                    if debug and len(p_values) < 5:
-                        print(f"[DEBUG] Overriding p_value {p_value:.4f} -> {max(0.0, min(1.0, 1.0 - score)):.4f}")
-                    p_value = max(0.0, min(1.0, 1.0 - score))
-
+                # p-value > 0.99 is legitimate (means "not significant")
+                # Do NOT override with 1-score - that breaks the certificate guarantees
                 p_values[(passage.pid, facet.facet_id)] = p_value
 
         # COVER SUMMARY: One line per facet showing why it passed/failed
         if debug:
-            # Get alpha_bar for each facet (approximate - use per_facet_alpha / T_f)
-            per_facet_alpha = getattr(self.config.safe_cover, 'per_facet_alpha', 0.2) if hasattr(self.config, 'safe_cover') else 0.2
             for facet in facets:
                 ft = facet.facet_type
                 ft_str = ft.value if hasattr(ft, 'value') else str(ft)
 
-                # Determine T_f for this facet type
-                if ft == FacetType.ENTITY:
-                    t_f = 5
-                elif ft == FacetType.RELATION or "BRIDGE" in ft_str:
-                    t_f = 10
-                else:
-                    t_f = 5
+                # Use shared tf_for function (same as shortlisting and safe_cover)
+                t_f = tf_for(ft, ft_str)
                 alpha_bar = per_facet_alpha / t_f
 
                 # Collect all p-values for this facet
