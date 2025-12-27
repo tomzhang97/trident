@@ -605,18 +605,6 @@ class TridentPipeline:
         # Get per_facet_alpha from config
         per_facet_alpha = getattr(self.config.safe_cover, 'per_facet_alpha', 0.2) if hasattr(self.config, 'safe_cover') else 0.2
 
-        if debug:
-            print(f"[DEBUG] _two_stage_scoring: {len(passages)} passages, {len(facets)} facets")
-            print(f"[DEBUG] per_facet_alpha={per_facet_alpha}")
-            print(f"[DEBUG] Calibrator loaded: {self.calibrator is not None}")
-            # Print T_f for each facet
-            for facet in facets:
-                ft = facet.facet_type
-                ft_str = ft.value if hasattr(ft, 'value') else str(ft)
-                t_f = tf_for(ft, ft_str)
-                alpha_bar = per_facet_alpha / t_f
-                print(f"[DEBUG] facet={ft_str} T_f={t_f} alpha_bar={alpha_bar:.4f}")
-
         # Validate facets are proper objects
         for facet in facets:
             if not isinstance(facet, Facet):
@@ -629,8 +617,19 @@ class TridentPipeline:
             and getattr(self.config.safe_cover, "exhaustive_pool", True)
             and pool_n <= getattr(self.config.safe_cover, "exhaustive_pool_max_n", 10)
         )
+
         if debug:
+            print(f"[DEBUG] _two_stage_scoring: {len(passages)} passages, {len(facets)} facets")
+            print(f"[DEBUG] per_facet_alpha={per_facet_alpha}")
+            print(f"[DEBUG] Calibrator loaded: {self.calibrator is not None}")
             print(f"[DEBUG] pool_n={pool_n} exhaustive={exhaustive}")
+            # Print T_f for each facet (using correct exhaustive-aware values)
+            for facet in facets:
+                ft = facet.facet_type
+                ft_str = ft.value if hasattr(ft, 'value') else str(ft)
+                t_f = pool_n if exhaustive else tf_for(ft, ft_str)
+                alpha_bar = per_facet_alpha / t_f
+                print(f"[DEBUG] facet={ft_str} T_f={t_f} alpha_bar={alpha_bar:.4f} exhaustive={exhaustive}")
 
         for facet in facets:
             ft = facet.facet_type
