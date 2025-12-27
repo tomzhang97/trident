@@ -80,27 +80,56 @@ class WorkerResult:
 
 
 def _normalize(text: str) -> str:
-    """Normalize text for EM/F1 calculation."""
+    """Normalize text for EM/F1 calculation.
+
+    Follows official 2WikiMultiHop evaluation order:
+    1. Remove articles (a, an, the)
+    2. Lowercase
+    3. Remove punctuation
+    4. Normalize whitespace
+    """
+    # Remove articles first (case-insensitive)
+    text = re.sub(r'\b(a|an|the)\b', ' ', text, flags=re.IGNORECASE)
+    # Lowercase
     text = text.lower().strip()
-    # remove punctuation
+    # Remove punctuation
     text = text.translate(str.maketrans("", "", string.punctuation))
-    # remove articles
-    text = re.sub(r'\b(a|an|the)\b', ' ', text)
-    # normalize whitespace
+    # Normalize whitespace
     text = ' '.join(text.split())
     return text
 
 def _f1(pred: str, gt: str) -> float:
-    """Calculate F1 score between prediction and ground truth."""
-    pred_tokens = _normalize(pred).split()
-    gt_tokens = _normalize(gt).split()
-    common = set(pred_tokens) & set(gt_tokens)
+    """Calculate F1 score between prediction and ground truth.
+
+    Follows official 2WikiMultiHop evaluation:
+    - Special case: if either is yes/no/noanswer, require exact match
+    - Otherwise compute token overlap F1 using Counter (not set!)
+    """
+    from collections import Counter
+
+    pred_norm = _normalize(pred)
+    gt_norm = _normalize(gt)
+
+    # Special case for yes/no/noanswer
+    special_answers = {'yes', 'no', 'noanswer'}
+    if pred_norm in special_answers or gt_norm in special_answers:
+        return float(pred_norm == gt_norm)
+
+    pred_tokens = pred_norm.split()
+    gt_tokens = gt_norm.split()
+
     if not pred_tokens or not gt_tokens:
         return 0.0
-    if not common:
+
+    # Use Counter for proper handling of duplicate tokens (NOT set!)
+    common = Counter(pred_tokens) & Counter(gt_tokens)
+    num_same = sum(common.values())
+
+    if num_same == 0:
         return 0.0
-    prec = len(common) / len(pred_tokens)
-    rec = len(common) / len(gt_tokens)
+
+    prec = num_same / len(pred_tokens)
+    rec = num_same / len(gt_tokens)
     return 2 * prec * rec / (prec + rec)
 
 

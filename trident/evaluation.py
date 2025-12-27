@@ -133,43 +133,61 @@ class BenchmarkEvaluator:
         )
     
     def _normalize_answer(self, text: str) -> str:
-        """Normalize answer for evaluation."""
+        """Normalize answer for evaluation.
+
+        Follows official 2WikiMultiHop evaluation order:
+        1. Remove articles (a, an, the)
+        2. Lowercase
+        3. Remove punctuation
+        4. Normalize whitespace
+        """
+        # Remove articles first (before lowercasing for consistency with official)
+        text = re.sub(r'\b(a|an|the)\b', ' ', text, flags=re.IGNORECASE)
+
         # Convert to lowercase
         text = text.lower()
-        
-        # Remove articles
-        text = re.sub(r'\b(a|an|the)\b', ' ', text)
-        
+
         # Remove punctuation
         text = re.sub(r'[^\w\s]', ' ', text)
-        
+
         # Remove extra whitespace
         text = ' '.join(text.split())
-        
+
         return text.strip()
-    
+
     def _exact_match(self, pred: str, ref: str) -> float:
         """Compute exact match score."""
         return float(pred == ref)
-    
+
     def _f1_score(self, pred: str, ref: str) -> float:
-        """Compute token-level F1 score."""
+        """Compute token-level F1 score.
+
+        Follows official 2WikiMultiHop evaluation:
+        - Special case: if either is yes/no/noanswer, require exact match
+        - Otherwise compute token overlap F1 using Counter
+        """
+        # Special case for yes/no/noanswer
+        special_answers = {'yes', 'no', 'noanswer'}
+        if pred in special_answers or ref in special_answers:
+            return float(pred == ref)
+
         pred_tokens = pred.split()
         ref_tokens = ref.split()
-        
+
         if not pred_tokens or not ref_tokens:
             return 0.0
-        
+
+        # Use Counter for proper handling of duplicate tokens
         common = Counter(pred_tokens) & Counter(ref_tokens)
         num_same = sum(common.values())
-        
+
         if num_same == 0:
             return 0.0
-        
+
         precision = num_same / len(pred_tokens)
         recall = num_same / len(ref_tokens)
         f1 = (2 * precision * recall) / (precision + recall)
-        
+
         return f1
     
     def _support_exact_match(
