@@ -656,8 +656,9 @@ class TridentPipeline:
     def _get_calibration_bucket(self, facet: Facet) -> str:
         """
         Get calibration bucket for facet.
-        
-        CRITICAL FIX: Properly handle facet type as enum.
+
+        Returns CANONICAL facet type for calibrator lookup.
+        E.g., BRIDGE_HOP1, BRIDGE_HOP2 -> BRIDGE_HOP
         """
         # Ensure facet_type is accessed correctly
         if isinstance(facet.facet_type, FacetType):
@@ -666,7 +667,11 @@ class TridentPipeline:
             facet_type_str = facet.facet_type
         else:
             facet_type_str = str(facet.facet_type)
-        
+
+        # Canonicalize: BRIDGE_HOP1, BRIDGE_HOP2, etc. -> BRIDGE_HOP
+        if "BRIDGE_HOP" in facet_type_str or facet_type_str == "BRIDGE":
+            return "BRIDGE_HOP"
+
         return facet_type_str
     
     def _run_safe_cover(

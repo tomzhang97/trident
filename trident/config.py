@@ -169,15 +169,15 @@ class CalibrationConfig:
     - Typical grid: 6 × 3 × 3 = 54 bins
     """
     method: str = "conformal"  # "conformal", "isotonic", "platt", "beta"
-    version: str = "v1.0"
+    version: str = "v2.2"
 
     # Mondrian Bin Configuration (Section 3.3)
     use_mondrian: bool = True
-    n_min: int = 50  # Minimum per-bin negatives before merging
+    n_min: int = 25  # Minimum per-bin negatives before merging
 
-    # Bin Specification (6 × 3 × 3 = 54 bins)
+    # Bin Specification - use canonical types only
     facet_types: List[str] = field(default_factory=lambda: [
-        "ENTITY", "RELATION", "TEMPORAL", "NUMERIC", "BRIDGE_HOP1", "BRIDGE_HOP2"
+        "ENTITY", "RELATION", "TEMPORAL", "NUMERIC", "BRIDGE_HOP"
     ])
     length_buckets: List[Tuple[int, int]] = field(default_factory=lambda: [
         (0, 50), (50, 150), (150, 10000)  # short, medium, long

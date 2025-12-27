@@ -10,7 +10,8 @@ from pathlib import Path
 np.random.seed(42)
 n_samples = 2000
 
-facet_types = ["ENTITY", "RELATION", "TEMPORAL", "NUMERIC", "BRIDGE_HOP1", "BRIDGE_HOP2"]
+# Use canonical facet types (BRIDGE_HOP not BRIDGE_HOP1/2)
+facet_types = ["ENTITY", "RELATION", "TEMPORAL", "NUMERIC", "BRIDGE_HOP"]
 data = []
 
 for i in range(n_samples):
