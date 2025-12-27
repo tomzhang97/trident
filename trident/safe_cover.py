@@ -258,7 +258,7 @@ class SafeCoverAlgorithm:
 
         return EpisodeKnobs(
             t_f=t_f,
-            alpha_query=alpha_query,
+            alpha_query=per_facet_alpha,  # Use resolved value, not the possibly-None parameter
             alpha_f=alpha_f,
             alpha_bar_f=alpha_bar_f,
             calibrator_version=getattr(self.calibrator, 'version', 'v1.0'),
