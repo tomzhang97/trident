@@ -136,6 +136,7 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         s_raw = str(tpl.get("subject", ""))
         o_raw = str(tpl.get("object", ""))
         predicate = str(tpl.get("predicate", ""))
+        predicate_lower = predicate.lower()
         # Clean endpoints - remove WH-words and generic terms
         s = _clean_relation_endpoint(s_raw)
         o = _clean_relation_endpoint(o_raw)
@@ -152,27 +153,65 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         # Require only ONE of subject OR object (multi-hop QA often splits entities across passages)
         endpoint_match = s_match or o_match
 
-        # AWARD/WIN ANCHOR GATE: If relation is about awards/wins, require anchor words in passage
-        # This prevents "director page" passages from falsely covering "award won" relations
-        award_keywords = {"won", "award", "prize", "win", "winner", "winning", "awarded"}
+        passage_lower = passage_text.lower()
         facet_text_lower = f"{s_raw} {o_raw} {predicate}".lower()
-        is_award_relation = any(kw in facet_text_lower for kw in award_keywords)
 
-        if is_award_relation:
-            # Require at least one award anchor in passage
+        # PREDICATE-SPECIFIC ANCHOR GATES
+        # For each relation type, require predicate-related tokens in passage
+        predicate_match = True  # Default: no specific predicate gate
+
+        # Director/directed
+        if 'direct' in predicate_lower or 'director' in facet_text_lower:
+            director_anchors = {"director", "directed", "filmmaker", "helmed", "helm", "direct"}
+            predicate_match = any(a in passage_lower for a in director_anchors)
+            if debug_rel:
+                print(f"[RELATION GATE] DIRECTOR relation, predicate_match={predicate_match}")
+
+        # Born/birthplace
+        elif 'born' in predicate_lower or 'birth' in predicate_lower:
+            birth_anchors = {"born", "birth", "birthplace", "native", "raised"}
+            predicate_match = any(a in passage_lower for a in birth_anchors)
+            if debug_rel:
+                print(f"[RELATION GATE] BORN relation, predicate_match={predicate_match}")
+
+        # Award/won/prize
+        elif any(kw in facet_text_lower for kw in {"won", "award", "prize", "win", "winner"}):
             award_anchors = {"award", "won", "prize", "received", "honor", "honoured", "honored",
                            "oscar", "grammy", "emmy", "bafta", "golden globe", "winner", "winning",
                            "accolade", "recognition", "nominated", "nomination", "laureate"}
-            passage_lower = passage_text.lower()
-            anchor_match = any(anchor in passage_lower for anchor in award_anchors)
+            predicate_match = any(a in passage_lower for a in award_anchors)
             if debug_rel:
-                print(f"[RELATION GATE] AWARD relation detected, anchor_match={anchor_match}")
-            result = endpoint_match and anchor_match
-        else:
-            result = endpoint_match
+                print(f"[RELATION GATE] AWARD relation, predicate_match={predicate_match}")
+
+        # Created/founded/written
+        elif any(kw in predicate_lower for kw in {"creat", "found", "writ", "author", "compose"}):
+            create_anchors = {"created", "founded", "wrote", "written", "author", "composed",
+                            "established", "started", "built", "invented", "designed"}
+            predicate_match = any(a in passage_lower for a in create_anchors)
+            if debug_rel:
+                print(f"[RELATION GATE] CREATED relation, predicate_match={predicate_match}")
+
+        # Located/capital
+        elif any(kw in predicate_lower for kw in {"locat", "capital", "situat", "based"}):
+            location_anchors = {"located", "capital", "situated", "based", "headquarters",
+                              "city", "country", "region", "province", "state"}
+            predicate_match = any(a in passage_lower for a in location_anchors)
+            if debug_rel:
+                print(f"[RELATION GATE] LOCATION relation, predicate_match={predicate_match}")
+
+        # Married/spouse
+        elif any(kw in predicate_lower for kw in {"marr", "spouse", "wife", "husband"}):
+            marriage_anchors = {"married", "spouse", "wife", "husband", "wed", "wedding", "partner"}
+            predicate_match = any(a in passage_lower for a in marriage_anchors)
+            if debug_rel:
+                print(f"[RELATION GATE] MARRIAGE relation, predicate_match={predicate_match}")
+
+        # Final gate: endpoint_match AND predicate_match
+        result = endpoint_match and predicate_match
 
         if debug_rel:
-            print(f"[RELATION GATE] subj_raw='{s_raw}' subj_clean='{s}' obj_raw='{o_raw}' obj_clean='{o}' s_match={s_match} o_match={o_match} is_award={is_award_relation} -> gate={result}")
+            print(f"[RELATION GATE] subj_raw='{s_raw}' subj_clean='{s}' obj_raw='{o_raw}' obj_clean='{o}' "
+                  f"s_match={s_match} o_match={o_match} predicate_match={predicate_match} -> gate={result}")
         return result
 
     if ft == FacetType.COMPARISON:
@@ -215,6 +254,24 @@ class NLIScorer:
     def _cache_key(self, passage_text: str, hypothesis: str) -> Tuple[str, str]:
         return (_sha1(passage_text), _sha1(hypothesis))
 
+    def _normalize_mention(self, m: str) -> str:
+        """
+        Normalize entity mention for lexical matching.
+
+        Fixes issues like ", Blind Shaft" where leading punctuation breaks matching.
+        """
+        import re
+        m = m.strip()
+        # Strip leading punctuation/quotes/commas
+        m = re.sub(r"^[\s\W_]+", "", m)
+        # Strip trailing punctuation
+        m = re.sub(r"[\s\W_]+$", "", m)
+        # Collapse whitespace
+        m = re.sub(r"\s+", " ", m)
+        # Optionally drop leading articles
+        m = re.sub(r"^(the|a|an)\s+", "", m, flags=re.IGNORECASE)
+        return m.lower()
+
     def _entity_lexical_score(self, passage_text: str, facet: Facet) -> float:
         """
         Score ENTITY facet using lexical containment (not NLI).
@@ -230,17 +287,20 @@ class NLIScorer:
         if not mention:
             return 0.0
 
-        # Normalize for matching
-        text_lower = passage_text.lower()
-        mention_lower = mention.lower()
+        # Normalize mention (fixes ", Blind Shaft" -> "blind shaft")
+        mention_norm = self._normalize_mention(mention)
+        if not mention_norm:
+            return 0.0
 
-        # Check for exact phrase match
-        if mention_lower not in text_lower:
+        # Normalize passage text
+        text_norm = re.sub(r"\s+", " ", passage_text.lower())
+
+        # Check for normalized phrase match
+        if mention_norm not in text_norm:
             # Try with hyphen/space normalization
-            import re
-            mention_norm = re.sub(r"[-_]+", " ", mention_lower)
-            text_norm = re.sub(r"[-_]+", " ", text_lower)
-            if mention_norm not in text_norm:
+            mention_hyphen = re.sub(r"[-_]+", " ", mention_norm)
+            text_hyphen = re.sub(r"[-_]+", " ", text_norm)
+            if mention_hyphen not in text_hyphen:
                 return 0.0
 
         # Entity is present - compute score based on prominence
@@ -248,14 +308,14 @@ class NLIScorer:
         score = 0.7
 
         # Bonus for early mention (first 20% of passage) - up to +0.15
-        first_pos = text_lower.find(mention_lower)
+        first_pos = text_norm.find(mention_norm)
         if first_pos >= 0:
-            rel_pos = first_pos / max(len(text_lower), 1)
+            rel_pos = first_pos / max(len(text_norm), 1)
             if rel_pos < 0.2:
                 score += 0.15 * (1 - rel_pos / 0.2)
 
         # Bonus for multiple mentions - up to +0.15
-        count = text_lower.count(mention_lower)
+        count = text_norm.count(mention_norm)
         if count > 1:
             score += min(0.15, 0.05 * (count - 1))
 

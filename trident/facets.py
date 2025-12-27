@@ -224,16 +224,71 @@ class Facet:
             s_raw = tpl.get('subject', '')
             o_raw = tpl.get('object', '')
             p = _normalize_relation_predicate(tpl.get('predicate', ''))
+            p_lower = p.lower() if p else ''
             # Clean endpoints - remove WH-words and generic terms
             s = _clean_relation_endpoint_for_hypothesis(s_raw)
             o = _clean_relation_endpoint_for_hypothesis(o_raw)
-            # Build hypothesis based on what we have
+
+            # PREDICATE-SPECIFIC HYPOTHESIS TEMPLATES
+            # "The passage states something about X" is TOO PERMISSIVE
+            # Use predicate-specific templates that require the actual relation
+
+            # Director/directed
+            if 'direct' in p_lower or 'director' in p_lower:
+                if o:
+                    return _ensure_sentence(f"The passage states who directed {o}")
+                elif s:
+                    return _ensure_sentence(f"The passage states that {s} directed a film")
+
+            # Born/birthplace
+            if 'born' in p_lower or 'birth' in p_lower:
+                if 'where' in s_raw.lower() or 'place' in p_lower:
+                    if o:
+                        return _ensure_sentence(f"The passage states where {o} was born")
+                    elif s:
+                        return _ensure_sentence(f"The passage states the birthplace of {s}")
+                else:
+                    if o:
+                        return _ensure_sentence(f"The passage states when {o} was born")
+                    elif s:
+                        return _ensure_sentence(f"The passage states when {s} was born")
+
+            # Won/award/prize
+            if any(w in p_lower for w in ['won', 'win', 'award', 'prize', 'honor']):
+                if o:
+                    return _ensure_sentence(f"The passage states what award {o} won")
+                elif s:
+                    return _ensure_sentence(f"The passage states what {s} won")
+
+            # Created/founded/written
+            if any(w in p_lower for w in ['creat', 'found', 'writ', 'author', 'compose']):
+                if o:
+                    return _ensure_sentence(f"The passage states who created {o}")
+                elif s:
+                    return _ensure_sentence(f"The passage states what {s} created")
+
+            # Located/capital
+            if any(w in p_lower for w in ['locat', 'capital', 'situat', 'based']):
+                if o:
+                    return _ensure_sentence(f"The passage states where {o} is located")
+                elif s:
+                    return _ensure_sentence(f"The passage states the location of {s}")
+
+            # Married/spouse
+            if any(w in p_lower for w in ['marr', 'spouse', 'wife', 'husband']):
+                if o:
+                    return _ensure_sentence(f"The passage states who {o} married")
+                elif s:
+                    return _ensure_sentence(f"The passage states the spouse of {s}")
+
+            # Default: use predicate in hypothesis (still better than "something about")
             if s and o:
                 return _ensure_sentence(f"The passage states that {s} {p} {o}")
-            elif s:
-                return _ensure_sentence(f"The passage states something about {s}")
             elif o:
-                return _ensure_sentence(f"The passage states something about {o}")
+                # Use predicate in template to be more specific
+                return _ensure_sentence(f"The passage states the {p} of {o}")
+            elif s:
+                return _ensure_sentence(f"The passage states what {s} {p}")
             else:
                 # Both endpoints are garbage - use a generic hypothesis that NLI will likely reject
                 return _ensure_sentence(f"The passage states a factual relationship")
