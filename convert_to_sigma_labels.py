@@ -3,7 +3,9 @@
 Convert to Σ(p,f) labels.
 UPDATES:
 - Canonical-aware filtering (matches BRIDGE_HOP1 if BRIDGE_HOP is requested).
-- Robust Sigma logic (0.5 overlap, title inclusion).
+- Robust Sigma logic (0.4 overlap threshold for better 2Wiki compatibility).
+- BRIDGE_HOP: title tokens checked for BOTH entities (symmetric handling).
+- RELATION: title included in exact match haystack (not only token overlap).
 """
 
 import json
@@ -93,58 +95,75 @@ def check_numeric_sigma(passage, sup_text, value, entity, lex):
     
     return False, "CONTEXT_MISSING"
 
-def check_relation_sigma(passage, sup_text, s, o, pred, lex, title=""):
+def check_relation_sigma(passage, sup_text, s, o, pred, lex, title="", overlap_thresh=0.4):
+    """Check relation sigma with title included in exact match haystack.
+
+    Uses 0.4 overlap threshold (lowered from 0.5) for better 2Wiki compatibility.
+    Title is now included in both exact match and token overlap checks.
+    """
     # No lex gate
     s = (s or "").strip()
     o = (o or "").strip()
     if not s or not o: return False, "EMPTY_SUBJ_OBJ"
 
     base_text = _norm(sup_text if sup_text else passage)
-    text_with_title = base_text + " " + _norm(title)
-    
+    title_norm = _norm(title)
+    # Include title in exact match haystack (not only token overlap)
+    text_with_title = base_text + " " + title_norm
+
     s_norm = _norm(s); o_norm = _norm(o)
-    
-    s_found = s_norm in base_text
-    o_found = o_norm in base_text
-    
+
+    # CHANGED: Exact match now checks text_with_title (includes title)
+    s_found = s_norm in text_with_title
+    o_found = o_norm in text_with_title
+
     if not (s_found and o_found):
         s_toks = _get_tokens(s)
         o_toks = _get_tokens(o)
         txt_toks = _get_tokens(text_with_title)
-        
-        # 0.5 Overlap Threshold
-        s_hit = len(s_toks.intersection(txt_toks)) / max(1, len(s_toks)) >= 0.5
-        o_hit = len(o_toks.intersection(txt_toks)) / max(1, len(o_toks)) >= 0.5
-        
+
+        # 0.4 Overlap Threshold (lowered from 0.5)
+        s_hit = len(s_toks.intersection(txt_toks)) / max(1, len(s_toks)) >= overlap_thresh
+        o_hit = len(o_toks.intersection(txt_toks)) / max(1, len(o_toks)) >= overlap_thresh
+
         if not (s_hit and o_hit): return False, "ENTITIES_MISSING"
-    
+
     return True, "OK_GOLD_PROXIMITY"
 
-def check_bridge_sigma_ok(passage, title, e1, e2):
+def check_bridge_sigma_ok(passage, title, e1, e2, overlap_thresh=0.4):
+    """Check bridge hop sigma with title tokens for BOTH entities.
+
+    Uses 0.4 overlap threshold (lowered from 0.5) for better 2Wiki compatibility.
+    Both e1 and e2 can match in title OR text for symmetric handling.
+    """
     if not passage: return False, "NO_TEXT"
-    
+
     e1 = (e1 or "").strip()
     e2 = (e2 or "").strip()
     if not e1 or not e2: return False, "EMPTY_BRIDGE_ENTS"
 
     t = _norm(passage)
     ttl = _norm(title or "")
-    
+
     txt_toks = _get_tokens(t)
     ttl_toks = _get_tokens(ttl)
+
     e1_toks = _get_tokens(e1)
     e2_toks = _get_tokens(e2)
-    
+
     if not e1_toks or not e2_toks: return False, "EMPTY_ENTITY_TOKS"
 
-    e1_hit = (len(e1_toks.intersection(ttl_toks)) / len(e1_toks) >= 0.5) or \
-             (len(e1_toks.intersection(txt_toks)) / len(e1_toks) >= 0.5)
-             
+    # e1: can match in title OR text (unchanged logic, but with new threshold)
+    e1_hit = (len(e1_toks.intersection(ttl_toks)) / len(e1_toks) >= overlap_thresh) or \
+             (len(e1_toks.intersection(txt_toks)) / len(e1_toks) >= overlap_thresh)
+
     if not e1_hit: return False, "E1_MISSING"
 
-    e2_hit = len(e2_toks.intersection(txt_toks)) / len(e2_toks) >= 0.5
+    # e2: NOW can also match in title OR text (symmetric with e1)
+    e2_hit = (len(e2_toks.intersection(ttl_toks)) / len(e2_toks) >= overlap_thresh) or \
+             (len(e2_toks.intersection(txt_toks)) / len(e2_toks) >= overlap_thresh)
     if not e2_hit: return False, "E2_MISSING"
-    
+
     return True, "OK_TOKEN_OVERLAP"
 
 def check_temporal_sigma(passage, sup_text, time_str, lex):
