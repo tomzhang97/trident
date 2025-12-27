@@ -612,17 +612,24 @@ class TridentPipeline:
 
         for facet in facets:
             ft = facet.facet_type
+            ft_str = ft.value if hasattr(ft, 'value') else str(ft)
 
-            # Facet-type override: all facets get at least 10 tests when pool is small
-            # This is critical when dataset only provides ~10 context passages
-            facet_max_tests = max(max_tests, 10)
+            # Facet-type specific T_f values:
+            # - ENTITY: T_f=5 (stage-1 should rank well, don't over-penalize with Bonferroni)
+            # - RELATION/BRIDGE: T_f=10 (noisier, need more candidates)
+            # - Others: T_f=5
+            if ft == FacetType.ENTITY:
+                facet_max_tests = 5
+            elif ft == FacetType.RELATION or "BRIDGE" in ft_str:
+                facet_max_tests = 10
+            else:
+                facet_max_tests = 5
 
             # Stage 1: Shortlist candidates per facet - CAP TO facet_max_tests
             shortlist = self._shortlist_for_facet(passages, facet, max_candidates=facet_max_tests)
 
             if debug:
-                ft_str = ft.value if hasattr(ft, 'value') else str(ft)
-                print(f"[DEBUG] Facet {ft_str}: shortlist size={len(shortlist)} (max_tests={facet_max_tests})")
+                print(f"[DEBUG] Facet {ft_str}: shortlist size={len(shortlist)} (T_f={facet_max_tests})")
 
             # Stage 2: CE/NLI scoring for shortlisted pairs
             for passage in shortlist:
@@ -660,7 +667,46 @@ class TridentPipeline:
                     p_value = max(0.0, min(1.0, 1.0 - score))
 
                 p_values[(passage.pid, facet.facet_id)] = p_value
-        
+
+        # COVER SUMMARY: One line per facet showing why it passed/failed
+        if debug:
+            # Get alpha_bar for each facet (approximate - use per_facet_alpha / T_f)
+            per_facet_alpha = getattr(self.config.safe_cover, 'per_facet_alpha', 0.2) if hasattr(self.config, 'safe_cover') else 0.2
+            for facet in facets:
+                ft = facet.facet_type
+                ft_str = ft.value if hasattr(ft, 'value') else str(ft)
+
+                # Determine T_f for this facet type
+                if ft == FacetType.ENTITY:
+                    t_f = 5
+                elif ft == FacetType.RELATION or "BRIDGE" in ft_str:
+                    t_f = 10
+                else:
+                    t_f = 5
+                alpha_bar = per_facet_alpha / t_f
+
+                # Collect all p-values for this facet
+                cand = [(pid, p) for (pid, fid), p in p_values.items() if fid == facet.facet_id]
+                if not cand:
+                    print(f"[COVER SUMMARY] facet={ft_str} id={facet.facet_id[:8]}... NO_CANDIDATES")
+                    continue
+
+                best_pid, best_p = min(cand, key=lambda x: x[1])
+                best_score = stage2_scores.get((best_pid, facet.facet_id), None)
+                passes = best_p <= alpha_bar
+
+                # Get facet text for context
+                facet_text = ""
+                if hasattr(facet, 'template') and facet.template:
+                    if 'mention' in facet.template:
+                        facet_text = facet.template.get('mention', '')
+                    elif 'subject' in facet.template:
+                        facet_text = f"{facet.template.get('subject', '')} -> {facet.template.get('object', '')}"
+
+                print(f"[COVER SUMMARY] facet={ft_str} text={facet_text!r} "
+                      f"best_score={best_score:.4f} best_p={best_p:.4g} alpha_bar={alpha_bar:.4g} "
+                      f"T_f={t_f} pass={passes}")
+
         return TwoStageScores(
             stage1_scores=stage1_scores,
             stage2_scores=stage2_scores,
@@ -673,23 +719,77 @@ class TridentPipeline:
         facet: Facet,
         max_candidates: int = 10
     ) -> List[Passage]:
-        """Shortlist passages for a facet using bi-encoder or lexical scoring."""
-        # Simple lexical scoring for now (can be replaced with bi-encoder)
+        """Shortlist passages for a facet using facet-aware lexical scoring."""
+        import re
+
+        ft = facet.facet_type
         scores = []
+
         for passage in passages:
-            score = self._lexical_score(passage.text, facet.get_keywords())
+            if ft == FacetType.ENTITY:
+                # ENTITY-specific scoring with hyphen/punct normalization
+                score = self._entity_stage1_score(passage.text, facet)
+            else:
+                # Generic lexical scoring for other facet types
+                score = self._lexical_score(passage.text, facet.get_keywords())
             scores.append((passage, score))
-        
+
         # Sort by score and take top candidates
         scores.sort(key=lambda x: x[1], reverse=True)
         return [p for p, _ in scores[:max_candidates]]
-    
+
+    def _normalize_for_matching(self, text: str) -> str:
+        """Normalize text for matching: lowercase, split hyphens, strip punctuation."""
+        import re
+        text = text.lower()
+        # Replace hyphens/underscores with spaces
+        text = re.sub(r"[-_]+", " ", text)
+        # Remove punctuation except spaces
+        text = re.sub(r"[^\w\s]", "", text)
+        # Normalize whitespace
+        text = " ".join(text.split())
+        return f" {text} "  # Pad for word boundary matching
+
+    def _entity_stage1_score(self, passage_text: str, facet: Facet) -> float:
+        """
+        Stage-1 scoring for ENTITY facets with hyphen/punct normalization.
+        Returns high score for exact phrase match, moderate for token overlap.
+        """
+        import re
+
+        # Get entity mention from facet template
+        template = facet.template or {}
+        entity = template.get("mention", "")
+        if not entity:
+            return 0.0
+
+        # Normalize both passage and entity
+        p_norm = self._normalize_for_matching(passage_text)
+        e_norm = self._normalize_for_matching(entity).strip()
+
+        # Exact phrase match (highest priority)
+        if f" {e_norm} " in p_norm:
+            return 10.0
+
+        # Token overlap scoring
+        e_tokens = [t for t in e_norm.split() if len(t) > 2]
+        if not e_tokens:
+            # Very short entity - check if it appears at all
+            return 5.0 if e_norm in p_norm else 0.0
+
+        hits = sum(1 for t in e_tokens if f" {t} " in p_norm)
+        return hits / len(e_tokens)
+
     def _lexical_score(self, text: str, keywords: List[str]) -> float:
-        """Simple lexical overlap score."""
+        """Simple lexical overlap score with normalization."""
         if not keywords:
             return 0.0
-        text_lower = text.lower()
-        matches = sum(1 for kw in keywords if kw.lower() in text_lower)
+        text_norm = self._normalize_for_matching(text)
+        matches = 0
+        for kw in keywords:
+            kw_norm = self._normalize_for_matching(kw).strip()
+            if kw_norm and f" {kw_norm} " in text_norm:
+                matches += 1
         return matches / len(keywords)
     
     def _get_calibration_bucket(self, facet: Facet) -> str:
