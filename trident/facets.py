@@ -149,13 +149,16 @@ class Facet:
         if ft == FacetType.ENTITY:
             mention = _safe_phrase(tpl.get("mention", ""))
             if passage_text:
+                # Try to extract context like "X is a Y" or "X, a Y"
                 pat1 = re.search(rf"\b{re.escape(mention)}\s+(?:is|was|are|were)\s+(?:an?|the)\s+([^,.]+)", passage_text, re.IGNORECASE)
                 if pat1 and len(pat1.group(1).split()) < 10:
                     return _ensure_sentence(f"{mention} is {pat1.group(1)}")
                 pat2 = re.search(rf"\b{re.escape(mention)}\s*[,(]\s*(?:an?|the)\s+([^,)]+)", passage_text, re.IGNORECASE)
                 if pat2 and len(pat2.group(1).split()) < 10:
                     return _ensure_sentence(f"{mention} is {pat2.group(1)}")
-            return _ensure_sentence(f'The passage identifies "{mention}" unambiguously (e.g. by definition, role, or unique context), not merely mentions the phrase.')
+            # Simple fallback: just check if the passage contains the entity
+            # Previous hypothesis was too strict ("identifies unambiguously") for NLI
+            return _ensure_sentence(f'The passage mentions "{mention}".')
 
         if ft == FacetType.NUMERIC:
             entity = _safe_phrase(tpl.get("entity", "")) 

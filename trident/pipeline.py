@@ -646,13 +646,16 @@ class TridentPipeline:
 
                 # Transform score to probability in [0,1]
                 # NLI scorer outputs entail - 0.5*contra, typically in [-0.5, 1]
-                prob = score
-                if prob < 0.0 or prob > 1.0:
-                    # Score outside [0,1] - likely logit/margin, apply sigmoid
-                    prob = 1.0 / (1.0 + math.exp(-score))
+                # CRITICAL: Only apply sigmoid for obvious logits (far outside [0,1])
+                # Tiny negatives like -0.01 are just noise and should be clipped to 0
+                def score_to_prob(s: float) -> float:
+                    # If it looks like a probability (nearly in [0,1]), just clip
+                    if -0.05 <= s <= 1.05:
+                        return max(0.0, min(1.0, s))
+                    # Otherwise treat as a logit/margin
+                    return 1.0 / (1.0 + math.exp(-s))
 
-                # Clip to [0,1] (safe)
-                prob = max(0.0, min(1.0, prob))
+                prob = score_to_prob(score)
 
                 stage2_scores[(passage.pid, facet.facet_id)] = score
 
@@ -704,6 +707,71 @@ class TridentPipeline:
                 print(f"[COVER SUMMARY] facet={ft_str} text={facet_text!r} "
                       f"best_score={best_score:.4f} best_p={best_p:.4g} alpha_bar={alpha_bar:.4g} "
                       f"T_f={t_f} pass={passes}")
+
+        # ORACLE DEBUG: For failing facets, score ALL passages to diagnose stage-1 vs stage-2
+        oracle_debug = os.environ.get("TRIDENT_DEBUG_ORACLE", "0") == "1"
+        if debug and oracle_debug:
+            print(f"\n[ORACLE DEBUG] Diagnosing failing facets...")
+            for facet in facets:
+                ft = facet.facet_type
+                ft_str = ft.value if hasattr(ft, 'value') else str(ft)
+                t_f = tf_for(ft, ft_str)
+                alpha_bar = per_facet_alpha / t_f
+
+                # Get probed_best_p (from shortlist)
+                cand = [(pid, p) for (pid, fid), p in p_values.items() if fid == facet.facet_id]
+                if not cand:
+                    continue
+                probed_best_pid, probed_best_p = min(cand, key=lambda x: x[1])
+                probed_passes = probed_best_p <= alpha_bar
+
+                if probed_passes:
+                    continue  # Skip facets that already pass
+
+                # Score ALL passages (not just shortlist) to find oracle_best_p
+                oracle_results = []
+                bucket = self._get_calibration_bucket(facet)
+                for passage in passages:
+                    # Check cache first
+                    cache_key = (passage.pid, facet.facet_id, self.config.calibration.version)
+                    if cache_key in self.score_cache:
+                        score = self.score_cache[cache_key]
+                    else:
+                        score = self.nli_scorer.score(passage, facet)
+                        # Don't cache oracle-only scores to avoid bloating cache
+
+                    prob = score_to_prob(score)
+                    text_length = len(passage.text.split())
+                    p_val = self.calibrator.to_pvalue(prob, bucket, text_length)
+                    oracle_results.append((passage.pid, score, prob, p_val))
+
+                oracle_results.sort(key=lambda x: x[3])  # Sort by p-value
+                oracle_best = oracle_results[0]
+                oracle_best_p = oracle_best[3]
+                oracle_passes = oracle_best_p <= alpha_bar
+
+                # Diagnosis
+                if oracle_passes and not probed_passes:
+                    diagnosis = "STAGE-1 MISS (ranking failed to surface best passage)"
+                elif not oracle_passes:
+                    diagnosis = "STAGE-2 FAIL (no passage scores high enough)"
+                else:
+                    diagnosis = "OK"
+
+                # Show where oracle_best ranks in stage-1
+                oracle_pid = oracle_best[0]
+                shortlist_pids = [pid for (pid, fid), _ in p_values.items() if fid == facet.facet_id]
+                oracle_in_shortlist = oracle_pid in shortlist_pids
+
+                print(f"[ORACLE] facet={ft_str} probed_best_p={probed_best_p:.4g} "
+                      f"oracle_best_p={oracle_best_p:.4g} oracle_score={oracle_best[1]:.4f} "
+                      f"oracle_in_shortlist={oracle_in_shortlist} alpha_bar={alpha_bar:.4g} "
+                      f"DIAGNOSIS={diagnosis}")
+
+                # Show top-3 oracle results for context
+                for rank, (pid, score, prob, pval) in enumerate(oracle_results[:3]):
+                    in_sl = "✓" if pid in shortlist_pids else "✗"
+                    print(f"  [{rank+1}] pid={pid[:12]}... score={score:.4f} p={pval:.4g} in_shortlist={in_sl}")
 
         return TwoStageScores(
             stage1_scores=stage1_scores,
