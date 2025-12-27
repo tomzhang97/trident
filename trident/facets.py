@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 trident/facets.py
-Update: BRIDGE_HOP1 fallback uses specific assertion to avoid loose entailment.
+UPDATES:
+- Added generic BRIDGE_HOP type.
+- Generates only adjacent hops (no aggregate).
+- Works for 2, 3, 4+ title chains.
 """
 
 from __future__ import annotations
@@ -41,7 +44,20 @@ def _safe_phrase(s: str) -> str:
     return _clean_text(s)
 
 def _normalize_relation_predicate(pred: str) -> str:
-    pred = _clean_text(pred).strip()
+    pred = _clean_text(pred).lower().strip()
+    mapping = {
+        "capital_of": "is the capital of",
+        "located_in": "is located in",
+        "created": "was created by",
+        "directed": "was directed by",
+        "written": "was written by",
+        "produced": "was produced by",
+        "founded": "was founded by",
+        "related_to": "is related to",
+        "features": "features"
+    }
+    for k, v in mapping.items():
+        if k in pred: return v
     return pred or "is related to"
 
 def _looks_like_junk_entity(mention: str) -> bool:
@@ -71,8 +87,9 @@ class FacetType(Enum):
     RELATION = "RELATION"
     TEMPORAL = "TEMPORAL"
     NUMERIC = "NUMERIC"
-    BRIDGE_HOP1 = "BRIDGE_HOP1"
-    BRIDGE_HOP2 = "BRIDGE_HOP2"
+    BRIDGE_HOP = "BRIDGE_HOP" # Generic for all hops
+    BRIDGE_HOP1 = "BRIDGE_HOP1" # Legacy/Specific
+    BRIDGE_HOP2 = "BRIDGE_HOP2" # Legacy/Specific
     BRIDGE = "BRIDGE"
     COMPARISON = "COMPARISON"
     CAUSAL = "CAUSAL"
@@ -80,7 +97,7 @@ class FacetType(Enum):
 
     @classmethod
     def core_types(cls) -> list:
-        return [cls.ENTITY, cls.RELATION, cls.TEMPORAL, cls.NUMERIC, cls.BRIDGE_HOP1, cls.BRIDGE_HOP2]
+        return [cls.ENTITY, cls.RELATION, cls.TEMPORAL, cls.NUMERIC, cls.BRIDGE_HOP]
 
 @dataclass(frozen=True)
 class Facet:
@@ -99,9 +116,10 @@ class Facet:
 
     def to_hypothesis(self, passage_text: Optional[str] = None) -> str:
         ft = self.facet_type
+        tpl = self.template
 
         if ft == FacetType.ENTITY:
-            mention = _safe_phrase(self.template.get("mention", ""))
+            mention = _safe_phrase(tpl.get("mention", ""))
             if passage_text:
                 pat1 = re.search(rf"\b{re.escape(mention)}\s+(?:is|was|are|were)\s+(?:an?|the)\s+([^,.]+)", passage_text, re.IGNORECASE)
                 if pat1 and len(pat1.group(1).split()) < 10:
@@ -112,28 +130,47 @@ class Facet:
             return _ensure_sentence(f'The passage identifies "{mention}" unambiguously (e.g. by definition, role, or unique context), not merely mentions the phrase.')
 
         if ft == FacetType.NUMERIC:
-            entity = _safe_phrase(self.template.get("entity", "")) 
-            value = _safe_phrase(self.template.get("value", ""))
-            unit = _safe_phrase(self.template.get("unit", ""))
-            attr = _safe_phrase(self.template.get("attribute", ""))
+            entity = _safe_phrase(tpl.get("entity", "")) 
+            value = _safe_phrase(tpl.get("value", ""))
+            unit = _safe_phrase(tpl.get("unit", ""))
+            attr = _safe_phrase(tpl.get("attribute", ""))
             val_str = f"{value} {unit}".strip()
             if entity and attr: return _ensure_sentence(f"The passage states that {entity}'s {attr} is {val_str}")
             return _ensure_sentence(f"The passage binds the value {val_str} to a specific property")
 
-        if ft == FacetType.BRIDGE_HOP1:
-            e1 = _safe_phrase(self.template.get("entity1", ""))
-            eb = _safe_phrase(self.template.get("bridge_entity", ""))
-            rel = self.template.get("relation", "is related to")
-            
-            # Stronger assertion hypothesis
-            if rel and rel != "is related to":
-                return _ensure_sentence(f"The passage explicitly states that {e1} {rel} {eb}")
-            # Even in fallback, use an assertion style
+        if ft == FacetType.RELATION:
+            s = tpl.get('subject', '')
+            o = tpl.get('object', '')
+            p = _normalize_relation_predicate(tpl.get('predicate', ''))
+            return _ensure_sentence(f"The passage states that {s} {p} {o}")
+
+        if ft == FacetType.TEMPORAL:
+            time = tpl.get('time', '')
+            event = tpl.get('event', '')
+            if event: return _ensure_sentence(f"The passage states that {event} happened in {time}")
+            return _ensure_sentence(f"The passage mentions {time} in relation to a specific event")
+
+        if ft == FacetType.COMPARISON:
+            e1 = tpl.get('entity1', '')
+            e2 = tpl.get('entity2', '')
+            attr = tpl.get('attribute', 'different')
+            return _ensure_sentence(f"The passage compares {e1} and {e2} regarding {attr}")
+
+        # BRIDGE HYPOTHESES (Unified)
+        if "BRIDGE_HOP" in ft.value:
+            e1 = tpl.get("entity1", "")
+            eb = tpl.get("bridge_entity", "")
+            rel = tpl.get("relation", "")
+            if "includes guest" in rel:
+                return _ensure_sentence(f"The passage explicitly states that {e1} includes guest appearances from {eb}")
             return _ensure_sentence(f"The passage explicitly mentions a direct factual connection between {e1} and {eb}")
 
-        if ft == FacetType.RELATION:
-             return _ensure_sentence(f"{self.template.get('subject')} {self.template.get('predicate')} {self.template.get('object')}")
-        
+        if ft == FacetType.CAUSAL:
+            return _ensure_sentence(f"The passage explains the cause or reason for the event")
+
+        if ft == FacetType.PROCEDURAL:
+            return _ensure_sentence(f"The passage describes a procedure, step, or method")
+
         return _ensure_sentence(str(self.template))
 
     def to_dict(self) -> Dict[str, Any]:
@@ -171,8 +208,15 @@ class FacetMiner:
         facets.extend(self._extract_temporal_facets(query))
         facets.extend(self._extract_numeric_facets(query))
         facets.extend(self._extract_comparison_facets(query))
+        facets.extend(self._extract_causal_facets(query))
+        
+        dataset = str(getattr(self.config, "dataset", "")).lower()
+        if "hotpot" not in dataset:
+            facets.extend(self._extract_procedural_facets(query))
+        
         if self._is_multi_hop(query):
             facets.extend(self._extract_bridge_facets(query, supporting_facts))
+            
         return self._deduplicate_facets(facets)
 
     # ---- entity ----
@@ -198,7 +242,7 @@ class FacetMiner:
         mentions = [m for m in _dedupe_strings(mentions) if not _looks_like_junk_entity(m)]
         return [Facet(facet_id=f"entity_{i}", facet_type=FacetType.ENTITY, template={"mention": _safe_phrase(m)}) for i, m in enumerate(mentions)]
 
-    # ---- relation ----
+    # ---- relation (FIXED) ----
     def _extract_relation_facets(self, query: str) -> List[Facet]:
         facets: List[Facet] = []
         patterns = [
@@ -210,8 +254,14 @@ class FacetMiner:
         q = _clean_text(query)
         for pat, rel_type in patterns:
             for m in re.finditer(pat, q, flags=re.IGNORECASE):
-                g = [g.strip() for g in m.groups() if g and g.strip()]
-                if len(g) < 2: continue
+                g = []
+                for grp in m.groups():
+                    clean = _safe_phrase(grp)
+                    clean = re.sub(r"^(which|what|who|where|when|why|how)\s+\w+\s*", "", clean, flags=re.IGNORECASE).strip()
+                    clean = re.sub(r"^(which|what|who|where|when|why|how)\s+(?:of\s+the\s+following\s+)?", "", clean, flags=re.IGNORECASE).strip()
+                    g.append(clean)
+                
+                if len(g) < 2 or not g[0] or not g[-1]: continue
                 facets.append(Facet(facet_id=f"relation_{len(facets)}", facet_type=FacetType.RELATION, template={"subject": g[0], "predicate": rel_type, "object": g[-1]}))
         return facets
 
@@ -279,7 +329,24 @@ class FacetMiner:
                 facets.append(Facet(facet_id=f"comparison_{len(facets)}", facet_type=FacetType.COMPARISON, template={"entity1": m.group(1), "entity2": m.group(2), "attribute": k}))
         return facets
 
-    # ---- bridge (UPGRADED) ----
+    # ---- causal / procedural ----
+    def _extract_causal_facets(self, query: str) -> List[Facet]:
+        facets: List[Facet] = []
+        q = query.lower()
+        causal_patterns = [r"\bwhy\b", r"\bwhat\s+(?:was|is|are)\s+the\s+caus(?:e|es)\b", r"\bwhat\s+led\s+to\b", r"\bwhat\s+resulted\s+in\b", r"\breason\s+for\b"]
+        if any(re.search(p, q) for p in causal_patterns):
+            facets.append(Facet(facet_id="causal_0", facet_type=FacetType.CAUSAL, template={"trigger": "causal"}))
+        return facets
+
+    def _extract_procedural_facets(self, query: str) -> List[Facet]:
+        facets: List[Facet] = []
+        q = query.lower()
+        procedural_patterns = [r"\bhow\s+to\b", r"\bwhat\s+are\s+the\s+steps\b", r"\bsteps?\s+to\b", r"\bprocedure\b", r"\bwalk\s+me\s+through\b", r"\bprocess\s+for\b", r"\bmethod\s+for\b"]
+        if any(re.search(p, q) for p in procedural_patterns):
+            facets.append(Facet(facet_id="procedural_0", facet_type=FacetType.PROCEDURAL, template={"trigger": "procedural"}))
+        return facets
+
+    # ---- bridge (GENERIC HOPS) ----
     def _extract_bridge_facets(self, query: str, supporting_facts: Optional[List[Tuple[str, int]]] = None) -> List[Facet]:
         facets: List[Facet] = []
         if not supporting_facts: return facets
@@ -287,37 +354,24 @@ class FacetMiner:
         titles = _dedupe_strings([t for t, _ in supporting_facts])
         if len(titles) < 2: return facets
 
-        # Infer predicate from query
         q_lower = query.lower()
         relation = "is related to"
-        if "guest appearance" in q_lower or "guest appearances" in q_lower:
-            relation = "includes guest appearances from"
-        elif "feature" in q_lower: # features, featuring
-            relation = "features"
-        elif "directed" in q_lower:
-            relation = "was directed by"
-        elif "written" in q_lower:
-            relation = "was written by"
-        elif "located" in q_lower or "where" in q_lower:
-            relation = "is located in"
+        if "guest appearance" in q_lower: relation = "includes guest appearances from"
+        elif "feature" in q_lower: relation = "features"
+        elif "directed" in q_lower: relation = "was directed by"
+        elif "written" in q_lower: relation = "was written by"
+        elif "located" in q_lower: relation = "is located in"
 
-        hop_counter = 0
+        # Generate adjacent hops for any length (2, 3, 4...)
+        # Uses generic BRIDGE_HOP type.
         for i in range(len(titles) - 1):
-            e1, eb = titles[i], titles[i+1]
-            e2 = titles[i+2] if (i + 2) < len(titles) else eb
-            
+            e1, e2 = titles[i], titles[i+1]
             facets.append(Facet(
-                facet_id=f"bridge_hop1_{hop_counter}",
-                facet_type=FacetType.BRIDGE_HOP1,
-                template={"entity1": e1, "relation": relation, "bridge_entity": eb},
+                facet_id=f"bridge_hop_{i+1}",
+                facet_type=FacetType.BRIDGE_HOP,
+                template={"entity1": e1, "relation": relation, "bridge_entity": e2, "hop": i+1}
             ))
-            if eb != e2:
-                facets.append(Facet(
-                    facet_id=f"bridge_hop2_{hop_counter}",
-                    facet_type=FacetType.BRIDGE_HOP2,
-                    template={"bridge_entity": eb, "relation": relation, "entity2": e2},
-                ))
-            hop_counter += 1
+            
         return facets
 
     def _is_multi_hop(self, query: str) -> bool:
