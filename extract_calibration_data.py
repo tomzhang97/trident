@@ -1,53 +1,10 @@
 #!/usr/bin/env python3
 """
 extract_calibration_data.py
-
-Unified calibration-data extractor for multi-hop QA datasets (HotpotQA / 2Wiki / MuSiQue).
-
-What this script does (robustly, across datasets):
-1) Load dataset examples
-2) Mine facets from question (FacetMiner)
-3) For each (facet, passage), compute NLI score
-4) Assign a *facet-conditioned* label:
-   - label=1 if the passage contains gold support evidence AND that gold evidence satisfies the facet
-   - label=0 otherwise
-5) Write JSONL calibration records
-
-Why this fixes your "facets still seem off" issue:
-- Old labeling used title-level supporting_facts -> many false positives.
-- New labeling uses *supporting sentences* (when available) and checks whether the facet is actually satisfied.
-
-Supports:
-- HotpotQA: uses `supporting_facts` (title, sent_idx) and `context` (title, [sentences])
-- 2WikiMultiHopQA: supports common formats (see DatasetAdapter2Wiki)
-- MuSiQue: supports common formats (see DatasetAdapterMuSiQue)
-
-If your local 2wiki / musique json differs, you only need to tweak the adapter methods.
-
-Usage examples:
-    # Hotpot
-    python extract_calibration_data.py \
-        --dataset hotpot \
-        --data_path hotpotqa/data/hotpot_train_v1.json \
-        --output_path calibration_hotpot.jsonl \
-        --num_samples 500 \
-        --device cuda:0
-
-    # 2Wiki
-    python extract_calibration_data.py \
-        --dataset 2wiki \
-        --data_path 2wiki/train.json \
-        --output_path calibration_2wiki.jsonl \
-        --num_samples 500 \
-        --device cuda:0
-
-    # MuSiQue
-    python extract_calibration_data.py \
-        --dataset musique \
-        --data_path musique/train.json \
-        --output_path calibration_musique.jsonl \
-        --num_samples 500 \
-        --device cuda:0
+UPDATES:
+- Added DatasetAdapter2Wiki (Standard 2WikiMultihop support).
+- Added DatasetAdapterMusique (JSONL support).
+- Switch logic in main() handles hotpot, musique, and 2wiki.
 """
 
 from __future__ import annotations
@@ -56,650 +13,220 @@ import argparse
 import json
 import re
 import sys
-from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, Set, Tuple
-
+from typing import Any, Dict, List, Set, Tuple
 from tqdm import tqdm
 
-# Add trident to path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from trident.facets import FacetMiner, FacetType, Facet
-from trident.nli_scorer import NLIScorer
+from trident.nli_scorer import NLIScorer, _check_lexical_gate
 from trident.candidates import Passage
 from trident.config import TridentConfig
-
-
-# -------------------------
-# Normalization utilities
-# -------------------------
+import unicodedata
 
 _WS_RE = re.compile(r"\s+")
-_APOS_S_RE = re.compile(r"\s+'s\b", re.IGNORECASE)
 
-
-def _norm(s: str) -> str:
-    s = (s or "").lower()
-    s = _APOS_S_RE.sub("'s", s)
-    s = _WS_RE.sub(" ", s).strip()
+def norm(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s or "")
+    s = s.replace("'", "'").replace("'", "'").replace(""", '"').replace(""", '"')
+    s = s.replace(",", "")
+    s = _WS_RE.sub(" ", s).strip().lower()
     return s
-
-
-def _contains(haystack: str, needle: str) -> bool:
-    n = _norm(needle)
-    if not n:
-        return False
-    return n in _norm(haystack)
-
-
-def facet_to_query_text(facet: Any) -> str:
-    """
-    Always store the *actual NLI hypothesis string*.
-    """
-    if hasattr(facet, "to_hypothesis") and callable(getattr(facet, "to_hypothesis")):
-        try:
-            hyp = facet.to_hypothesis()
-            if isinstance(hyp, str) and hyp.strip():
-                return hyp
-        except Exception:
-            pass
-    # fallback
-    return str(facet)
-
-
-def facet_type_str(facet: Any) -> str:
-    ft = getattr(facet, "facet_type", None)
-    if ft is None:
-        return "UNKNOWN"
-    return getattr(ft, "value", None) or str(ft)
-
-
-# -------------------------
-# Facet satisfaction (for labels)
-# -------------------------
-
-def facet_satisfied_in_text(facet: Facet, text: str) -> bool:
-    """
-    Conservative satisfiability check for calibration labels.
-    Uses structured facet.template where possible.
-
-    Important: this is NOT your runtime verifier, it's only for making labels less noisy.
-    The goal is: reduce false positives dramatically.
-    """
-    if not text:
-        return False
-
-    ft = facet.facet_type
-    tpl = facet.template or {}
-
-    # ENTITY: require mention appears
-    if ft == FacetType.ENTITY:
-        return _contains(text, str(tpl.get("mention", "")))
-
-    # RELATION: require both endpoints appear (predicate matching is too brittle)
-    if ft == FacetType.RELATION:
-        subj = str(tpl.get("subject", ""))
-        obj = str(tpl.get("object", ""))
-        if not subj or not obj:
-            return False
-        return _contains(text, subj) and _contains(text, obj)
-
-    # BRIDGE hops: require the endpoints appear
-    if ft == FacetType.BRIDGE_HOP1:
-        e1 = str(tpl.get("entity1", ""))
-        eb = str(tpl.get("bridge_entity", ""))
-        if not e1 or not eb:
-            return False
-        return _contains(text, e1) and _contains(text, eb)
-
-    if ft == FacetType.BRIDGE_HOP2:
-        eb = str(tpl.get("bridge_entity", ""))
-        e2 = str(tpl.get("entity2", ""))
-        if not eb or not e2:
-            return False
-        return _contains(text, eb) and _contains(text, e2)
-
-    if ft == FacetType.BRIDGE:
-        e1 = str(tpl.get("entity1", ""))
-        e2 = str(tpl.get("entity2", ""))
-        if not e1 or not e2:
-            return False
-        return _contains(text, e1) and _contains(text, e2)
-
-    # TEMPORAL: if time appears, good enough
-    if ft == FacetType.TEMPORAL:
-        time = str(tpl.get("time", ""))
-        event = str(tpl.get("event", ""))
-        return (_contains(text, time) if time else False) or (_contains(text, event) if event else False)
-
-    # NUMERIC: if value appears, good enough
-    if ft == FacetType.NUMERIC:
-        val = str(tpl.get("value", ""))
-        return _contains(text, val) if val else False
-
-    # COMPARISON/CAUSAL/PROCEDURAL: too brittle for labeling; default to false to avoid noise
-    return False
-
-
-# -------------------------
-# Example canonicalization (dataset adapters)
-# -------------------------
 
 @dataclass
 class QAExample:
     qid: str
     question: str
-    # Each context passage is (title, sentences[])
     context: List[Tuple[str, List[str]]]
-    # Gold supports: title -> set(sentence indices). If unknown, empty.
     supporting: Dict[str, Set[int]]
 
+# --- ADAPTERS ---
 
-class DatasetAdapter(ABC):
-    @abstractmethod
-    def load(self, path: str, limit: Optional[int]) -> List[Dict[str, Any]]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def to_example(self, raw: Dict[str, Any]) -> Optional[QAExample]:
-        raise NotImplementedError
-
-
-class DatasetAdapterHotpot(DatasetAdapter):
-    def load(self, path: str, limit: Optional[int]) -> List[Dict[str, Any]]:
-        with open(path) as f:
+class DatasetAdapterHotpot:
+    def load(self, path: str, limit: int = None):
+        with open(path) as f: 
             data = json.load(f)
         return data[:limit] if limit else data
 
-    def to_example(self, raw: Dict[str, Any]) -> Optional[QAExample]:
-        qid = raw.get("_id") or raw.get("id") or raw.get("qid")
-        question = raw.get("question", "")
-        context = raw.get("context", [])
-        supporting_facts = raw.get("supporting_facts", [])
+    def to_example(self, raw):
+        qid = raw.get("_id") or raw.get("id")
+        q = raw.get("question")
+        ctx = raw.get("context", [])
+        sup = raw.get("supporting_facts", [])
+        if not qid or not q or not ctx: return None
+        
+        parsed_ctx = []
+        for item in ctx:
+            if len(item) == 2: parsed_ctx.append((item[0], item[1]))
+            
+        sup_dict = defaultdict(set)
+        for t, i in sup: sup_dict[t].add(i)
+        
+        return QAExample(qid, q, parsed_ctx, dict(sup_dict))
 
-        if not qid or not question or not context or not supporting_facts:
-            return None
-
-        # Hotpot context is list of [title, [sentences]]
-        ctx: List[Tuple[str, List[str]]] = []
-        for item in context:
-            if not isinstance(item, (list, tuple)) or len(item) != 2:
-                continue
-            title, sents = item[0], item[1]
-            if isinstance(title, str) and isinstance(sents, list):
-                ctx.append((title, [str(x) for x in sents]))
-
-        if not ctx:
-            return None
-
-        sup: DefaultDict[str, Set[int]] = defaultdict(set)
-        for t, idx in supporting_facts:
-            if isinstance(t, str):
-                try:
-                    sup[t].add(int(idx))
-                except Exception:
-                    continue
-
-        return QAExample(qid=str(qid), question=str(question), context=ctx, supporting=dict(sup))
-
-
-class DatasetAdapter2Wiki(DatasetAdapter):
+class DatasetAdapter2Wiki:
     """
-    2WikiMultiHopQA has multiple variants in the wild.
-    We support common patterns:
-
-    - raw['id'] or raw['_id']
-    - question: raw['question']
-    - context can be:
-        a) raw['context'] as list of [title, [sentences]]  (same as Hotpot)
-        b) raw['context'] as list of dicts with 'title' and 'sentences'/'text'
-        c) raw['paragraphs'] or raw['docs'] etc.
-
-    - supporting facts can be:
-        a) raw['supporting_facts'] as (title, sent_idx) like Hotpot
-        b) raw['supporting_facts'] as list of titles only (no indices) -> we treat as title-level only
-        c) raw['evidence'] or raw['supporting'] etc (best-effort)
+    Adapter for 2WikiMultihop.
+    Format is nearly identical to HotpotQA (JSON list), but usually uses '_id'.
     """
-    def load(self, path: str, limit: Optional[int]) -> List[Dict[str, Any]]:
-        with open(path) as f:
+    def load(self, path: str, limit: int = None):
+        with open(path) as f: 
             data = json.load(f)
-        # sometimes JSONL
-        if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
-            data = data["data"]
         return data[:limit] if limit else data
 
-    def _parse_context(self, raw: Dict[str, Any]) -> List[Tuple[str, List[str]]]:
-        if "context" in raw:
-            c = raw["context"]
-            # list of [title, [sents]]
-            if isinstance(c, list) and c and isinstance(c[0], (list, tuple)):
-                out = []
-                for item in c:
-                    if isinstance(item, (list, tuple)) and len(item) == 2:
-                        title, sents = item[0], item[1]
-                        if isinstance(title, str) and isinstance(sents, list):
-                            out.append((title, [str(x) for x in sents]))
-                return out
+    def to_example(self, raw):
+        # 2Wiki uses '_id' typically
+        qid = raw.get("_id") or raw.get("id")
+        q = raw.get("question")
+        ctx = raw.get("context", [])
+        sup = raw.get("supporting_facts", [])
+        
+        if not qid or not q or not ctx: return None
+        
+        # Parse Context: [[Title, [Sentences]], ...]
+        parsed_ctx = []
+        for item in ctx:
+            # item is [title, sentences]
+            if len(item) >= 2: 
+                parsed_ctx.append((item[0], item[1]))
+            
+        # Parse Support: [[Title, sent_index], ...]
+        sup_dict = defaultdict(set)
+        for item in sup:
+            if len(item) >= 2:
+                t, i = item[0], item[1]
+                sup_dict[t].add(i)
+        
+        return QAExample(qid, q, parsed_ctx, dict(sup_dict))
 
-            # list of dicts
-            if isinstance(c, list) and c and isinstance(c[0], dict):
-                out = []
-                for d in c:
-                    title = d.get("title") or d.get("id") or d.get("doc_title")
-                    if not isinstance(title, str):
-                        continue
-                    if "sentences" in d and isinstance(d["sentences"], list):
-                        sents = [str(x) for x in d["sentences"]]
-                    elif "text" in d:
-                        # text may be string or list
-                        if isinstance(d["text"], list):
-                            sents = [str(x) for x in d["text"]]
-                        else:
-                            sents = [str(d["text"])]
-                    else:
-                        continue
-                    out.append((title, sents))
-                return out
-
-        # fallback: paragraphs/docs
-        for key in ("paragraphs", "docs", "documents", "passages"):
-            if key in raw and isinstance(raw[key], list):
-                out = []
-                for d in raw[key]:
-                    if isinstance(d, dict):
-                        title = d.get("title") or d.get("id") or d.get("doc_title")
-                        if not isinstance(title, str):
-                            continue
-                        if "sentences" in d and isinstance(d["sentences"], list):
-                            sents = [str(x) for x in d["sentences"]]
-                        elif "text" in d:
-                            if isinstance(d["text"], list):
-                                sents = [str(x) for x in d["text"]]
-                            else:
-                                sents = [str(d["text"])]
-                        else:
-                            continue
-                        out.append((title, sents))
-                return out
-
-        return []
-
-    def _parse_supporting(self, raw: Dict[str, Any]) -> Dict[str, Set[int]]:
-        sup: DefaultDict[str, Set[int]] = defaultdict(set)
-
-        # Hotpot-style
-        sf = raw.get("supporting_facts")
-        if isinstance(sf, list) and sf and isinstance(sf[0], (list, tuple)) and len(sf[0]) >= 1:
-            # could be (title, idx) or just titles
-            for item in sf:
-                if isinstance(item, (list, tuple)) and len(item) >= 1:
-                    title = item[0]
-                    if not isinstance(title, str):
-                        continue
-                    if len(item) >= 2:
-                        try:
-                            sup[title].add(int(item[1]))
-                        except Exception:
-                            # title-only evidence
-                            pass
-                    else:
-                        pass
-            return dict(sup)
-
-        # Alternative: evidence list of dicts
-        for key in ("evidence", "supporting", "gold_evidence"):
-            ev = raw.get(key)
-            if isinstance(ev, list):
-                for e in ev:
-                    if isinstance(e, dict):
-                        title = e.get("title")
-                        if isinstance(title, str):
-                            idxs = e.get("sent_idx") or e.get("sentences") or e.get("idxs")
-                            if isinstance(idxs, list):
-                                for i in idxs:
-                                    try:
-                                        sup[title].add(int(i))
-                                    except Exception:
-                                        continue
-                            elif isinstance(idxs, int):
-                                sup[title].add(int(idxs))
-                return dict(sup)
-
-        return dict(sup)
-
-    def to_example(self, raw: Dict[str, Any]) -> Optional[QAExample]:
-        qid = raw.get("_id") or raw.get("id") or raw.get("qid")
-        question = raw.get("question", "")
-        if not qid or not question:
-            return None
-
-        ctx = self._parse_context(raw)
-        if not ctx:
-            return None
-
-        sup = self._parse_supporting(raw)
-        # We allow empty supporting (some 2wiki formats might not carry it),
-        # but then labels will be all-0 (still useful for distribution check, not for calibration).
-        return QAExample(qid=str(qid), question=str(question), context=ctx, supporting=sup)
-
-
-class DatasetAdapterMuSiQue(DatasetAdapter):
-    """
-    MuSiQue also varies by release.
-    Common patterns:
-    - id: raw['id'] or raw['_id']
-    - question: raw['question']
-    - context: raw['context'] as list of paragraphs, each with 'title'/'sentences'/'text'
-      OR sometimes it's already [title, [sentences]] like Hotpot.
-    - gold supports: may appear as:
-        - raw['supporting_facts'] Hotpot-style
-        - raw['supporting_paragraphs'] titles or indices
-        - raw['evidence'] etc.
-
-    We implement best-effort parsing.
-    """
-    def load(self, path: str, limit: Optional[int]) -> List[Dict[str, Any]]:
-        # MuSiQue is often JSONL
-        p = Path(path)
-        if p.suffix.lower() in {".jsonl", ".jsonlines"}:
-            data = []
-            with open(path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
+class DatasetAdapterMusique:
+    """Adapter for MuSiQue (JSONL format)."""
+    def load(self, path: str, limit: int = None):
+        data = []
+        with open(path) as f:
+            for i, line in enumerate(f):
+                if limit and i >= limit: break
+                if line.strip():
                     data.append(json.loads(line))
-                    if limit and len(data) >= limit:
-                        break
-            return data
+        return data
 
-        with open(path) as f:
-            data = json.load(f)
+    def to_example(self, raw):
+        qid = raw.get("id")
+        q = raw.get("question")
+        if not qid or not q: return None
+        
+        parsed_ctx = []
+        sup_dict = defaultdict(set)
+        
+        # MuSiQue structure: [{"title": "...", "paragraph_text": "...", "is_supporting": bool}]
+        for p in raw.get("paragraphs", []):
+            title = p.get("title", "")
+            text = p.get("paragraph_text", "")
+            if not title or not text: continue
+            
+            # Treat entire paragraph as one block (index 0)
+            parsed_ctx.append((title, [text]))
+            
+            if p.get("is_supporting", False):
+                sup_dict[title].add(0) 
+                
+        return QAExample(qid, q, parsed_ctx, dict(sup_dict))
 
-        # sometimes wrapped
-        if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
-            data = data["data"]
+# --- EXTRACTION LOGIC ---
 
-        return data[:limit] if limit else data
-
-    def _parse_context(self, raw: Dict[str, Any]) -> List[Tuple[str, List[str]]]:
-        # Hotpot-like
-        c = raw.get("context")
-        if isinstance(c, list) and c:
-            if isinstance(c[0], (list, tuple)) and len(c[0]) == 2:
-                out = []
-                for item in c:
-                    if isinstance(item, (list, tuple)) and len(item) == 2:
-                        title, sents = item[0], item[1]
-                        if isinstance(title, str) and isinstance(sents, list):
-                            out.append((title, [str(x) for x in sents]))
-                return out
-
-            if isinstance(c[0], dict):
-                out = []
-                for d in c:
-                    title = d.get("title") or d.get("id") or d.get("doc_title") or "passage"
-                    if not isinstance(title, str):
-                        title = "passage"
-                    if "sentences" in d and isinstance(d["sentences"], list):
-                        sents = [str(x) for x in d["sentences"]]
-                    elif "text" in d:
-                        if isinstance(d["text"], list):
-                            sents = [str(x) for x in d["text"]]
-                        else:
-                            sents = [str(d["text"])]
-                    else:
-                        continue
-                    out.append((title, sents))
-                return out
-
-        # fallback keys
-        for key in ("paragraphs", "passages", "docs", "documents"):
-            if key in raw and isinstance(raw[key], list):
-                out = []
-                for d in raw[key]:
-                    if not isinstance(d, dict):
-                        continue
-                    title = d.get("title") or d.get("id") or d.get("doc_title") or "passage"
-                    if not isinstance(title, str):
-                        title = "passage"
-                    if "sentences" in d and isinstance(d["sentences"], list):
-                        sents = [str(x) for x in d["sentences"]]
-                    elif "text" in d:
-                        if isinstance(d["text"], list):
-                            sents = [str(x) for x in d["text"]]
-                        else:
-                            sents = [str(d["text"])]
-                    else:
-                        continue
-                    out.append((title, sents))
-                return out
-
-        return []
-
-    def _parse_supporting(self, raw: Dict[str, Any]) -> Dict[str, Set[int]]:
-        sup: DefaultDict[str, Set[int]] = defaultdict(set)
-
-        # Hotpot-style
-        sf = raw.get("supporting_facts")
-        if isinstance(sf, list):
-            for item in sf:
-                if isinstance(item, (list, tuple)) and len(item) >= 1:
-                    title = item[0]
-                    if not isinstance(title, str):
-                        continue
-                    if len(item) >= 2:
-                        try:
-                            sup[title].add(int(item[1]))
-                        except Exception:
-                            pass
-            return dict(sup)
-
-        # title-only supporting paragraphs
-        sp = raw.get("supporting_paragraphs") or raw.get("supporting_titles")
-        if isinstance(sp, list):
-            for t in sp:
-                if isinstance(t, str):
-                    # title-level only; no sent indices
-                    sup[t]  # create empty set
-            return dict(sup)
-
-        # evidence dicts
-        ev = raw.get("evidence")
-        if isinstance(ev, list):
-            for e in ev:
-                if isinstance(e, dict):
-                    title = e.get("title")
-                    if isinstance(title, str):
-                        idxs = e.get("sent_idx") or e.get("idxs")
-                        if isinstance(idxs, list):
-                            for i in idxs:
-                                try:
-                                    sup[title].add(int(i))
-                                except Exception:
-                                    continue
-                        elif isinstance(idxs, int):
-                            sup[title].add(int(idxs))
-            return dict(sup)
-
-        return dict(sup)
-
-    def to_example(self, raw: Dict[str, Any]) -> Optional[QAExample]:
-        qid = raw.get("_id") or raw.get("id") or raw.get("qid")
-        question = raw.get("question", "")
-        if not qid or not question:
-            return None
-
-        ctx = self._parse_context(raw)
-        if not ctx:
-            return None
-
-        sup = self._parse_supporting(raw)
-        return QAExample(qid=str(qid), question=str(question), context=ctx, supporting=sup)
-
-
-def get_adapter(dataset: str) -> DatasetAdapter:
-    d = dataset.lower().strip()
-    if d in {"hotpot", "hotpotqa"}:
-        return DatasetAdapterHotpot()
-    if d in {"2wiki", "2wikimultihopqa", "wiki"}:
-        return DatasetAdapter2Wiki()
-    if d in {"musique", "msq"}:
-        return DatasetAdapterMuSiQue()
-    raise ValueError(f"Unknown dataset '{dataset}'. Choose from: hotpot, 2wiki, musique.")
-
-
-# -------------------------
-# Gold support extraction
-# -------------------------
-
-def supporting_text_for_title(title: str, sentences: List[str], supporting: Dict[str, Set[int]]) -> str:
-    idxs = sorted(i for i in supporting.get(title, set()) if 0 <= i < len(sentences))
-    if not idxs:
-        return ""
-    return " ".join(sentences[i] for i in idxs)
-
-
-# -------------------------
-# Extraction
-# -------------------------
-
-def extract_calibration_samples(
-    raw_data: List[Dict[str, Any]],
-    adapter: DatasetAdapter,
-    facet_miner: FacetMiner,
-    nli_scorer: NLIScorer,
-) -> List[Dict[str, Any]]:
-    samples: List[Dict[str, Any]] = []
-
-    for raw in tqdm(raw_data, desc="Extracting calibration samples"):
+def extract_calibration_samples(raw_data, adapter, miner, scorer):
+    samples = []
+    
+    for raw in tqdm(raw_data, desc="Extracting"):
         ex = adapter.to_example(raw)
-        if ex is None:
-            continue
-
-        # Mine facets (supporting is passed only if your miner uses it)
-        supporting_facts_for_miner: Optional[List[Tuple[str, int]]] = None
-        if ex.supporting:
-            # flatten (title, idx) for miner bridge heuristics
-            supporting_facts_for_miner = [(t, i) for t, idxs in ex.supporting.items() for i in idxs] or None
-
-        facets = facet_miner.extract_facets(ex.question, supporting_facts_for_miner)
-        if not facets:
-            continue
-
-        # For each passage
+        if not ex: continue
+        
+        sup_list = [(t, i) for t, idxs in ex.supporting.items() for i in idxs]
+        facets = miner.extract_facets(ex.question, sup_list)
+        
         for i, (title, sentences) in enumerate(ex.context):
             passage_text = " ".join(sentences)
             passage_id = f"context_{i}"
+            
+            has_sup = bool(ex.supporting.get(title))
+            sup_idxs = sorted(i for i in ex.supporting.get(title, set()) if i < len(sentences))
+            sup_text = " ".join(sentences[j] for j in sup_idxs) if sup_idxs else ""
 
-            # Title has supporting evidence only if we have indices (non-empty set)
-            has_supporting = bool(ex.supporting.get(title, set()))
-            sup_text = supporting_text_for_title(title, sentences, ex.supporting) if has_supporting else ""
-
-            passage = Passage(
-                pid=passage_id,
-                text=passage_text,
-                cost=len(passage_text.split()),
-            )
+            passage = Passage(pid=passage_id, text=passage_text, cost=0)
 
             for facet in facets:
-                details = nli_scorer.score_with_details(passage, facet)
-                score = details.final_score
+                hyp = facet.to_hypothesis(passage_text)
+                if "?" in hyp or len(hyp) < 10: continue
 
+                lexical_match = _check_lexical_gate(facet, passage_text)
+                details = scorer.score_with_details(passage, facet)
+                
+                support_label = 1 if has_sup else 0
 
-                # Facet-conditioned label:
-                # positive only if (a) passage has gold support sentences AND (b) those sentences satisfy the facet
-                label = 1 if (has_supporting and facet_satisfied_in_text(facet, sup_text)) else 0
-
-                sample = {
+                samples.append({
                     "id": f"{ex.qid}_{passage_id}_{facet.facet_id}",
                     "query_id": ex.qid,
-                    "score": float(score),
+                    "hypothesis": hyp,
+                    "score": details.final_score,
                     "probs": {
-                        "entail": float(details.entailment_score),
-                        "neutral": float(details.neutral_score),
-                        "contra": float(details.contradiction_score),
-                   },
-                    "label": int(label),
-                    "metadata": {
-                        "facet_type": facet_type_str(facet),
-                        "text_length": len(passage_text),
-                        "retriever_score": 1.0,  # oracle context regime
-                        "passage_id": passage_id,
-                        "facet_id": facet.facet_id,
-                        "question": ex.question,
-                        "facet_query": facet_to_query_text(facet),  # store what NLI saw
-                        # Debug helpers (remove if you want smaller files)
-                        "title": title,
-                        "supporting_title": bool(has_supporting),
-                        "supporting_text": sup_text,
-                        "passage_preview": passage_text[:200],
+                        "entail": details.entailment_score,
+                        "neutral": details.neutral_score,
+                        "contra": details.contradiction_score,
                     },
-                }
-                samples.append(sample)
-
+                    "label": support_label,         
+                    "support_label": support_label, 
+                    "metadata": {
+                        "facet_type": facet.facet_type.value,
+                        "facet_template": facet.template,
+                        "passage_preview": passage_text[:200],
+                        "passage_full": passage_text,
+                        "lexical_match": lexical_match,
+                        "supporting_text": sup_text,
+                        "question": ex.question,
+                        "title": title
+                    }
+                })
     return samples
 
-
-# -------------------------
-# Main
-# -------------------------
-
 def main():
-    parser = argparse.ArgumentParser(description="Extract facet-conditioned NLI calibration data")
-    parser.add_argument("--dataset", type=str, required=True, help="hotpot | 2wiki | musique")
-    parser.add_argument("--data_path", type=str, required=True, help="Path to dataset file (json or jsonl)")
-    parser.add_argument("--output_path", type=str, default="calibration_data.jsonl", help="Output JSONL path")
-    parser.add_argument("--num_samples", type=int, default=500, help="Number of raw examples to process")
-    parser.add_argument("--device", type=str, default="cuda:0", help="Device for NLI scorer")
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", required=True, help="hotpot, musique, or 2wiki")
+    parser.add_argument("--data_path", required=True)
+    parser.add_argument("--output_path", default="calibration_data.jsonl")
+    parser.add_argument("--num_samples", type=int, default=500)
+    parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
 
-    print("Initializing NLI scorer and facet miner...")
     config = TridentConfig()
-    facet_miner = FacetMiner(config)
-    nli_scorer = NLIScorer(config.nli, device=args.device)
-
-    adapter = get_adapter(args.dataset)
-
-    print(f"Loading {args.dataset} data from {args.data_path}...")
-    raw_data = adapter.load(args.data_path, limit=args.num_samples)
-    print(f"Loaded {len(raw_data)} raw examples")
-
-    print("Extracting calibration samples...")
-    samples = extract_calibration_samples(raw_data, adapter, facet_miner, nli_scorer)
-
-    output_path = Path(args.output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w") as f:
+    config.dataset = args.dataset
+    
+    miner = FacetMiner(config)
+    scorer = NLIScorer(config.nli, device=args.device)
+    
+    # Adapter Selection
+    ds = args.dataset.lower()
+    if "hotpot" in ds:
+        adapter = DatasetAdapterHotpot()
+    elif "musique" in ds:
+        adapter = DatasetAdapterMusique()
+    elif "2wiki" in ds:
+        adapter = DatasetAdapter2Wiki()
+    else:
+        print(f"Warning: Unknown dataset '{args.dataset}', assuming Hotpot format.")
+        adapter = DatasetAdapterHotpot()
+    
+    print(f"Loading {ds} from {args.data_path}...")
+    raw = adapter.load(args.data_path, args.num_samples)
+    samples = extract_calibration_samples(raw, adapter, miner, scorer)
+    
+    with open(args.output_path, "w") as f:
         for s in samples:
             f.write(json.dumps(s) + "\n")
-
-    print(f"\n✅ Extracted {len(samples)} calibration samples")
-    print(f"📁 Saved to: {output_path}")
-
-    if len(samples) == 0:
-        print("\n⚠️ No samples produced. Most likely: adapter parsing mismatch or missing supporting evidence fields.")
-        return
-
-    pos = sum(1 for s in samples if s["label"] == 1)
-    neg = len(samples) - pos
-    avg = sum(float(s["score"]) for s in samples) / len(samples)
-
-    print(f"\n📊 Statistics:")
-    print(f"  Positive samples: {pos} ({pos/len(samples)*100:.1f}%)")
-    print(f"  Negative samples: {neg} ({neg/len(samples)*100:.1f}%)")
-    print(f"  Avg NLI score: {avg:.3f}")
-
-    print("\n🔧 Next step: Train calibrator")
-    print("  python train_calibration.py \\")
-    print(f"    --data_path {output_path} \\")
-    print("    --output_path calibrator.json \\")
-    print("    --use_mondrian")
-
+            
+    print(f"Extracted {len(samples)} samples to {args.output_path}")
 
 if __name__ == "__main__":
     main()
