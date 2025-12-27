@@ -173,6 +173,62 @@ class Facet:
 
         return _ensure_sentence(str(self.template))
 
+    def get_keywords(self) -> List[str]:
+        """Extract keywords from facet template for lexical matching."""
+        keywords = []
+        tpl = self.template
+        ft = self.facet_type
+
+        if ft == FacetType.ENTITY:
+            if tpl.get("mention"):
+                keywords.append(tpl["mention"])
+
+        elif ft == FacetType.NUMERIC:
+            if tpl.get("entity"):
+                keywords.append(tpl["entity"])
+            if tpl.get("value"):
+                keywords.append(str(tpl["value"]))
+
+        elif ft == FacetType.RELATION:
+            if tpl.get("subject"):
+                keywords.append(tpl["subject"])
+            if tpl.get("object"):
+                keywords.append(tpl["object"])
+
+        elif ft == FacetType.TEMPORAL:
+            if tpl.get("time"):
+                keywords.append(tpl["time"])
+            if tpl.get("event"):
+                keywords.append(tpl["event"])
+
+        elif ft == FacetType.COMPARISON:
+            if tpl.get("entity1"):
+                keywords.append(tpl["entity1"])
+            if tpl.get("entity2"):
+                keywords.append(tpl["entity2"])
+
+        elif "BRIDGE_HOP" in ft.value or ft == FacetType.BRIDGE:
+            if tpl.get("entity1"):
+                keywords.append(tpl["entity1"])
+            if tpl.get("bridge_entity"):
+                keywords.append(tpl["bridge_entity"])
+            elif tpl.get("entity2"):
+                keywords.append(tpl["entity2"])
+
+        elif ft == FacetType.CAUSAL:
+            # Extract any entities from template
+            for key in ["cause", "effect", "entity"]:
+                if tpl.get(key):
+                    keywords.append(tpl[key])
+
+        elif ft == FacetType.PROCEDURAL:
+            # Extract procedure-related terms
+            for key in ["action", "step", "method"]:
+                if tpl.get(key):
+                    keywords.append(tpl[key])
+
+        return [kw for kw in keywords if kw]
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "facet_id": self.facet_id,
