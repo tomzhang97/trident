@@ -158,6 +158,7 @@ class SelectionConditionalCalibrator:
         self.temp_data = []
 
     def get_p_value(self, score: float, facet_type: str, text_length: int) -> float:
+        """Get p-value with robust fallback to 'all' bucket."""
         import os
         debug = os.environ.get("TRIDENT_DEBUG_PVALUE", "0") == "1"
 
@@ -166,24 +167,37 @@ class SelectionConditionalCalibrator:
             if debug:
                 print(f"[PVALUE DEBUG] MISS facet_type={facet_type}, available={list(self.bins.keys())}")
             raise KeyError(f"No calibration data for type: {facet_type}")
-            
-        if "all" in ft_bins:
-            neg_scores = ft_bins["all"]
-        else:
-            thresh = self.thresholds.get(facet_type)
-            if thresh is None:
-                s = ft_bins.get("short", [])
-                l = ft_bins.get("long", [])
-                if not s and not l:
-                    return 1.0
-                neg_scores = sorted(s + l)
-            else:
-                key = "short" if text_length <= thresh else "long"
-                neg_scores = ft_bins.get(key, [])
 
+        neg_scores = None
+
+        # Try conditioned buckets first (if mondrian enabled)
+        if self.use_mondrian:
+            thresh = self.thresholds.get(facet_type)
+            if thresh is not None:
+                key = "short" if text_length <= thresh else "long"
+                neg_scores = ft_bins.get(key)
+                if debug and neg_scores:
+                    print(f"[PVALUE DEBUG] Using {key} bucket for {facet_type}, n={len(neg_scores)}")
+
+        # Fallback 1: try combining short+long if both exist
+        if not neg_scores:
+            s = ft_bins.get("short", [])
+            l = ft_bins.get("long", [])
+            if s or l:
+                neg_scores = sorted(s + l)
+                if debug and neg_scores:
+                    print(f"[PVALUE DEBUG] Using combined short+long for {facet_type}, n={len(neg_scores)}")
+
+        # Fallback 2: try "all" bucket (CRITICAL - this is what calibrator usually saves)
+        if not neg_scores:
+            neg_scores = ft_bins.get("all")
+            if debug and neg_scores:
+                print(f"[PVALUE DEBUG] Using 'all' bucket for {facet_type}, n={len(neg_scores)}")
+
+        # Final check
         if not neg_scores:
             if debug:
-                print(f"[PVALUE DEBUG] EMPTY BIN facet_type={facet_type}, len={text_length}")
+                print(f"[PVALUE DEBUG] NO DATA for {facet_type}, keys={list(ft_bins.keys())}")
             return 1.0
 
         import bisect

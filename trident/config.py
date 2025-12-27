@@ -183,12 +183,10 @@ class CalibrationConfig:
     facet_types: List[str] = field(default_factory=lambda: [
         "ENTITY", "RELATION", "TEMPORAL", "NUMERIC", "BRIDGE_HOP"
     ])
-    length_buckets: List[Tuple[int, int]] = field(default_factory=lambda: [
-        (0, 50), (50, 150), (150, 10000)  # short, medium, long
-    ])
-    # DISABLED by default - retriever scores often not in [0,1] range
-    # which causes all lookups to miss buckets. Enable only after
-    # normalizing retriever scores to [0,1] in both training and inference.
+    # BOTH DISABLED by default - bucket conditioning can cause lookup misses
+    # if calibrator was trained without bucketing or with "all" bucket.
+    # Re-enable after confirming certificates work with unconditioned lookup.
+    length_buckets: Optional[List[Tuple[int, int]]] = None
     retriever_score_buckets: Optional[List[Tuple[float, float]]] = None
 
     # Legacy fields

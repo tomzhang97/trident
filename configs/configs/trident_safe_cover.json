@@ -48,10 +48,11 @@
   "calibration": {
     "method": "conformal",
     "version": "v2.2",
-    "use_mondrian": true,
+    "use_mondrian": false,
     "n_min": 25,
     "facet_types": ["ENTITY", "RELATION", "TEMPORAL", "NUMERIC", "BRIDGE_HOP"],
     "pvalue_mode": "deterministic",
+    "length_buckets": null,
     "retriever_score_buckets": null
   },
   "evaluation": {
