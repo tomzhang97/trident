@@ -54,6 +54,9 @@ class ReliabilityCalibrator:
         """
         Convert score to p-value with robust fallback.
         """
+        import os
+        debug = os.environ.get("TRIDENT_DEBUG_PVALUE", "0") == "1"
+
         # Safety: Coerce inputs
         if hasattr(facet_type, "value"):
             facet_type = facet_type.value
@@ -62,19 +65,29 @@ class ReliabilityCalibrator:
 
         if self.conformal_calibrator:
             try:
-                return self.conformal_calibrator.get_p_value(score, facet_type, text_length)
+                p = self.conformal_calibrator.get_p_value(score, facet_type, text_length)
+                if debug:
+                    print(f"[PVALUE] type={facet_type}, score={score:.4f}, len={text_length}, p={p:.4f}")
+                return p
             except KeyError:
                 # 1. Canonical Fallback (e.g. BRIDGE_HOP3 -> BRIDGE_HOP)
                 canon = self._get_canonical_key(facet_type)
                 if canon != facet_type:
                     try:
-                        return self.conformal_calibrator.get_p_value(score, canon, text_length)
+                        p = self.conformal_calibrator.get_p_value(score, canon, text_length)
+                        if debug:
+                            print(f"[PVALUE] type={facet_type}→{canon}, score={score:.4f}, len={text_length}, p={p:.4f}")
+                        return p
                     except KeyError:
                         pass
-                
+
                 # 2. Global Fallback (Fail-Closed)
+                if debug:
+                    print(f"[PVALUE] FALLBACK type={facet_type}, score={score:.4f} → p=1.0 (no calibration data)")
                 return 1.0
 
+        if debug:
+            print(f"[PVALUE] NO CALIBRATOR → p=1.0")
         return 1.0
 
     def save(self, path: str):
