@@ -25,6 +25,12 @@ from .monitoring import DriftMonitor
 from .logging_utils import TelemetryTracker
 from .vqc import VerifierQueryCompiler
 from .bwk import BwKController
+from .chain_builder import (
+    build_chain_from_certified,
+    build_chain_prompt,
+    extract_grounded_answer,
+    ReasoningChain
+)
 
 
 @dataclass
@@ -465,29 +471,71 @@ class TridentPipeline:
         else:
             raise ValueError(f"Unknown mode: {mode}")
         
-        # Step 5: Generate answer (FIXED - now properly extracts final answer)
+        # Step 5: Generate answer using chain-based reasoning
+        # CRITICAL: Use only certified passages, build explicit multi-hop chain
         answer = ""
-        if not result['abstained'] and result['selected_passages']:
-            # Build prompt with selected passages
-            # Use dataset name from config for appropriate prompt context
-            dataset_name = getattr(self.config.evaluation, 'dataset', 'multi-hop QA')
-            prompt = self.llm.build_multi_hop_prompt(
-                question=query,
-                passages=result['selected_passages'],
-                facets=[f.to_dict() for f in facets],
-                dataset=dataset_name
-            )
-            llm_output = self.llm.generate(prompt)
+        chain = None
+        is_grounded = False
 
-            # CRITICAL FIX: Extract and clean the final answer from LLM output
-            # This ensures we're not logging intermediate outputs like facet mining
+        if not result['abstained'] and result['selected_passages']:
+            # Build reasoning chain from certified passages
+            chain = build_chain_from_certified(
+                certified_passages=result['selected_passages'],
+                question=query,
+                facets=[f.to_dict() for f in facets],
+                certificates=result.get('certificates')
+            )
+
+            debug_chain = os.environ.get("TRIDENT_DEBUG_CHAIN", "0") == "1"
+            if debug_chain and chain:
+                print(f"\n[CHAIN DEBUG] Built chain:")
+                print(f"  Bridge entity: {chain.bridge_entity}")
+                print(f"  Hop1: {chain.hop1.passage_text[:100]}...")
+                print(f"  Hop2: {chain.hop2.passage_text[:100]}...")
+                print(f"  Score: {chain.score}")
+
+            if chain:
+                # Use chain-based prompt for structured reasoning
+                prompt = build_chain_prompt(
+                    question=query,
+                    chain=chain,
+                    facets=[f.to_dict() for f in facets]
+                )
+            else:
+                # Fallback to regular prompt if chain building fails
+                dataset_name = getattr(self.config.evaluation, 'dataset', 'multi-hop QA')
+                prompt = self.llm.build_multi_hop_prompt(
+                    question=query,
+                    passages=result['selected_passages'],
+                    facets=[f.to_dict() for f in facets],
+                    dataset=dataset_name
+                )
+
+            llm_output = self.llm.generate(prompt)
             raw_answer = llm_output.text
-            # Use the new, more robust extraction function
+
+            # Extract and clean the final answer
             answer = extract_final_answer(raw_answer, query)
+
+            # GROUNDED EXTRACTION: Verify answer is in hop2 passage
+            if chain and answer:
+                grounded_answer, is_grounded = extract_grounded_answer(
+                    llm_answer=answer,
+                    hop2_text=chain.hop2.passage_text
+                )
+                if debug_chain:
+                    print(f"[CHAIN DEBUG] Grounding check:")
+                    print(f"  Raw answer: {answer[:100]}...")
+                    print(f"  Grounded: {is_grounded}")
+                    if is_grounded:
+                        print(f"  Grounded answer: {grounded_answer[:100]}...")
+
+                # Use grounded answer if found
+                if is_grounded:
+                    answer = grounded_answer
 
             # DEBUG: Log when answer becomes empty after extraction
             if not answer or answer.strip() == "":
-                import os
                 if os.environ.get("TRIDENT_DEBUG_EMPTY_ANSWER", "0") == "1":
                     print(f"\n[EMPTY ANSWER DEBUG]")
                     print(f"  Query: {query[:100]}...")
@@ -496,6 +544,7 @@ class TridentPipeline:
                     print(f"  Extracted answer: '{answer}'")
                     print(f"  Mode: {mode}")
                     print(f"  Num passages: {len(result['selected_passages'])}")
+                    print(f"  Chain built: {chain is not None}")
 
             total_tokens = llm_output.tokens_used
             prompt_tokens = self.llm.compute_token_cost(prompt)
@@ -523,6 +572,11 @@ class TridentPipeline:
             'total_tokens': total_tokens,
             'overhead_tokens': max(total_tokens - evidence_tokens, 0),
             'model_abstained': model_abstained,  # Track when model says "I cannot answer"
+            # Chain-based reasoning metrics
+            'chain_built': chain is not None,
+            'chain_score': chain.score if chain else 0.0,
+            'bridge_entity': chain.bridge_entity if chain else None,
+            'answer_grounded': is_grounded,
         })
 
         return PipelineOutput(
