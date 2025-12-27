@@ -223,6 +223,7 @@ class SafeCoverAlgorithm:
     def _freeze_episode_knobs(
         self,
         facets: List[Facet],
+        passages: Optional[List[Passage]] = None,
         alpha_query: Optional[float] = None
     ) -> EpisodeKnobs:
         """
@@ -234,6 +235,7 @@ class SafeCoverAlgorithm:
         CRITICAL FIX:
         - per_facet_alpha IS the per-facet budget (don't divide by |F|)
         - max_tests from config is the T_f (don't hardcode 10)
+        - EXHAUSTIVE PROBING: When pool ≤ 10, probe ALL passages to prevent STAGE-1 MISS
         """
         import os
         debug = os.environ.get("TRIDENT_DEBUG_PVALUE", "0") == "1"
@@ -242,10 +244,20 @@ class SafeCoverAlgorithm:
         per_facet_alpha = alpha_query or self.config.per_facet_alpha
         n_facets = len(facets)
 
+        # EXHAUSTIVE PROBING: When pool is small, use pool_n as T_f
+        pool_n = len(passages) if passages else 10
+        exhaustive = (
+            getattr(self.config, "exhaustive_pool", True)
+            and pool_n <= getattr(self.config, "exhaustive_pool_max_n", 10)
+        )
+
         # Get max_tests from config (T_f for Bonferroni) - was hardcoded to 10!
-        t_f = getattr(self.config, 'max_tests', 3)
+        t_f = pool_n if exhaustive else getattr(self.config, 'max_tests', 3)
         alpha_f = {}
         alpha_bar_f = {}
+
+        if debug:
+            print(f"[CERT DEBUG] pool_n={pool_n} exhaustive={exhaustive}")
 
         for facet in facets:
             ft = facet.facet_type
@@ -259,16 +271,19 @@ class SafeCoverAlgorithm:
                 # per_facet_alpha IS the per-facet budget (no division by |F|)
                 facet_alpha = per_facet_alpha
 
-                # Use shared tf_for function (MUST match pipeline.py)
-                ft_str = ft.value if hasattr(ft, 'value') else str(ft)
-                facet_t_f = tf_for(ft, ft_str)
+                # Use exhaustive T_f if applicable, otherwise facet-type T_f
+                if exhaustive:
+                    facet_t_f = pool_n
+                else:
+                    ft_str = ft.value if hasattr(ft, 'value') else str(ft)
+                    facet_t_f = tf_for(ft, ft_str)
 
             # ᾱ_f = α_f / T_f (Bonferroni over tests within facet)
             facet_alpha_bar = facet_alpha / max(facet_t_f, 1)
 
             if debug:
                 ft_str = facet.facet_type.value if hasattr(facet.facet_type, 'value') else str(facet.facet_type)
-                print(f"[CERT DEBUG] facet={ft_str} alpha_f={facet_alpha:.4f} T_f={facet_t_f} alpha_bar_f={facet_alpha_bar:.4f}")
+                print(f"[CERT DEBUG] facet={ft_str} alpha_f={facet_alpha:.4f} T_f={facet_t_f} alpha_bar_f={facet_alpha_bar:.4f} exhaustive={exhaustive}")
 
             # Apply fallback if active
             if self.fallback_active:
@@ -308,7 +323,7 @@ class SafeCoverAlgorithm:
         5. Generate certificates for covered facets
         """
         # Step 1: Freeze episode knobs (Section 4.1)
-        knobs = self._freeze_episode_knobs(facets)
+        knobs = self._freeze_episode_knobs(facets, passages)
 
         # Step 2: Build fixed coverage sets (Section 4.2)
         coverage_sets, coverage_info = self._build_coverage_sets(
@@ -402,6 +417,13 @@ class SafeCoverAlgorithm:
         import os
         debug = os.environ.get("TRIDENT_DEBUG_PVALUE", "0") == "1"
 
+        # EXHAUSTIVE PROBING: When pool is small, use all passages
+        pool_n = len(passages)
+        exhaustive = (
+            getattr(self.config, "exhaustive_pool", True)
+            and pool_n <= getattr(self.config, "exhaustive_pool_max_n", 10)
+        )
+
         for facet in facets:
             ft = facet.facet_type
             alpha_bar = knobs.get_alpha_bar(facet.facet_id)
@@ -409,6 +431,9 @@ class SafeCoverAlgorithm:
             # Get per-facet test limit
             if facet.facet_id in self.config.per_facet_configs:
                 max_tests = self.config.per_facet_configs[facet.facet_id].max_tests
+            elif exhaustive:
+                # Probe ALL passages to prevent STAGE-1 MISS
+                max_tests = pool_n
             else:
                 # Use shared tf_for function (MUST match pipeline.py)
                 ft_str = ft.value if hasattr(ft, 'value') else str(ft)

@@ -622,14 +622,28 @@ class TridentPipeline:
             if not isinstance(facet, Facet):
                 raise TypeError(f"Expected Facet object, got {type(facet)}: {facet}")
 
+        # EXHAUSTIVE PROBING: When pool is small, probe ALL passages to prevent STAGE-1 MISS
+        pool_n = len(passages)
+        exhaustive = (
+            hasattr(self.config, "safe_cover")
+            and getattr(self.config.safe_cover, "exhaustive_pool", True)
+            and pool_n <= getattr(self.config.safe_cover, "exhaustive_pool_max_n", 10)
+        )
+        if debug:
+            print(f"[DEBUG] pool_n={pool_n} exhaustive={exhaustive}")
+
         for facet in facets:
             ft = facet.facet_type
             ft_str = ft.value if hasattr(ft, 'value') else str(ft)
 
-            # Get T_f for this facet type (uses shared tf_for function)
-            facet_max_tests = tf_for(ft, ft_str)
+            # Get T_f: exhaustive probes all passages, otherwise use facet-type T_f
+            if exhaustive:
+                # Probe ALL passages to prevent STAGE-1 MISS
+                facet_max_tests = pool_n
+            else:
+                facet_max_tests = tf_for(ft, ft_str)
 
-            # Stage 1: Shortlist candidates per facet - CAP TO T_f
+            # Stage 1: Shortlist candidates per facet (sorted by stage-1 score, capped to facet_max_tests)
             shortlist = self._shortlist_for_facet(passages, facet, max_candidates=facet_max_tests)
 
             # Stage 2: CE/NLI scoring for shortlisted pairs
@@ -682,8 +696,11 @@ class TridentPipeline:
                 ft = facet.facet_type
                 ft_str = ft.value if hasattr(ft, 'value') else str(ft)
 
-                # Use shared tf_for function (same as shortlisting and safe_cover)
-                t_f = tf_for(ft, ft_str)
+                # Use exhaustive T_f if applicable, otherwise facet-type T_f
+                if exhaustive:
+                    t_f = pool_n
+                else:
+                    t_f = tf_for(ft, ft_str)
                 alpha_bar = per_facet_alpha / t_f
 
                 # Collect all p-values for this facet
@@ -715,7 +732,11 @@ class TridentPipeline:
             for facet in facets:
                 ft = facet.facet_type
                 ft_str = ft.value if hasattr(ft, 'value') else str(ft)
-                t_f = tf_for(ft, ft_str)
+                # Use exhaustive T_f if applicable
+                if exhaustive:
+                    t_f = pool_n
+                else:
+                    t_f = tf_for(ft, ft_str)
                 alpha_bar = per_facet_alpha / t_f
 
                 # Get probed_best_p (from shortlist)
