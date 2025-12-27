@@ -194,6 +194,10 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         o = _clean_relation_endpoint(o_raw)
         debug_rel = os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1"
 
+        # Detect if subject is a WH-word (meaningless for matching)
+        # For queries like "Who directed X?", subject="Who" is not a real entity
+        is_wh_subject = (not s) or (s_raw.strip().lower() in _WH_WORDS)
+
         # If both endpoints are empty after cleaning, can't gate reliably - let NLI decide
         if not s and not o:
             if debug_rel:
@@ -204,39 +208,49 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         # "polish russian war" will match "Polish-Russian War" in passage
         s_match = _entity_in_passage(s, passage_text) if s else False
         o_match = _entity_in_passage(o, passage_text) if o else False
-        # Require only ONE of subject OR object (multi-hop QA often splits entities across passages)
-        endpoint_match = s_match or o_match
+
+        passage_lower = passage_text.lower()
+        facet_text_lower = f"{s_raw} {o_raw} {predicate}".lower()
+
+        # Detect relation kind from combined text (same logic as hypothesis generation)
+        relation_kind = "DEFAULT"
+        if 'direct' in predicate_lower or 'director' in facet_text_lower:
+            relation_kind = "DIRECTOR"
+        elif 'born' in predicate_lower or 'birth' in predicate_lower:
+            relation_kind = "BORN"
+        elif any(kw in facet_text_lower for kw in {"won", "award", "prize", "win", "winner"}):
+            relation_kind = "AWARD"
+        elif any(kw in predicate_lower for kw in {"creat", "found", "writ", "author", "compose"}):
+            relation_kind = "CREATED"
+        elif any(kw in predicate_lower for kw in {"locat", "capital", "situat", "based"}):
+            relation_kind = "LOCATION"
+        elif any(kw in predicate_lower for kw in {"marr", "spouse", "wife", "husband"}):
+            relation_kind = "MARRIAGE"
 
         # Debug: show normalized tokens for diagnosis
         if debug_rel:
             s_tokens = _token_set(s) if s else set()
             o_tokens = _token_set(o) if o else set()
-            p_tokens_sample = list(_token_set(passage_text))[:20]
+            print(f"[RELATION GATE] relation_kind={relation_kind} is_wh_subject={is_wh_subject}")
             print(f"[RELATION GATE] s_tokens={s_tokens} o_tokens={o_tokens} s_match={s_match} o_match={o_match}")
-
-        passage_lower = passage_text.lower()
-        facet_text_lower = f"{s_raw} {o_raw} {predicate}".lower()
 
         # PREDICATE-SPECIFIC ANCHOR GATES
         # For each relation type, require predicate-related tokens in passage
         predicate_match = True  # Default: no specific predicate gate
 
-        # Director/directed
-        if 'direct' in predicate_lower or 'director' in facet_text_lower:
+        if relation_kind == "DIRECTOR":
             director_anchors = {"director", "directed", "filmmaker", "helmed", "helm", "direct"}
             predicate_match = any(a in passage_lower for a in director_anchors)
             if debug_rel:
                 print(f"[RELATION GATE] DIRECTOR relation, predicate_match={predicate_match}")
 
-        # Born/birthplace
-        elif 'born' in predicate_lower or 'birth' in predicate_lower:
+        elif relation_kind == "BORN":
             birth_anchors = {"born", "birth", "birthplace", "native", "raised"}
             predicate_match = any(a in passage_lower for a in birth_anchors)
             if debug_rel:
                 print(f"[RELATION GATE] BORN relation, predicate_match={predicate_match}")
 
-        # Award/won/prize
-        elif any(kw in facet_text_lower for kw in {"won", "award", "prize", "win", "winner"}):
+        elif relation_kind == "AWARD":
             award_anchors = {"award", "won", "prize", "received", "honor", "honoured", "honored",
                            "oscar", "grammy", "emmy", "bafta", "golden globe", "winner", "winning",
                            "accolade", "recognition", "nominated", "nomination", "laureate"}
@@ -244,31 +258,35 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
             if debug_rel:
                 print(f"[RELATION GATE] AWARD relation, predicate_match={predicate_match}")
 
-        # Created/founded/written
-        elif any(kw in predicate_lower for kw in {"creat", "found", "writ", "author", "compose"}):
+        elif relation_kind == "CREATED":
             create_anchors = {"created", "founded", "wrote", "written", "author", "composed",
                             "established", "started", "built", "invented", "designed"}
             predicate_match = any(a in passage_lower for a in create_anchors)
             if debug_rel:
                 print(f"[RELATION GATE] CREATED relation, predicate_match={predicate_match}")
 
-        # Located/capital
-        elif any(kw in predicate_lower for kw in {"locat", "capital", "situat", "based"}):
+        elif relation_kind == "LOCATION":
             location_anchors = {"located", "capital", "situated", "based", "headquarters",
                               "city", "country", "region", "province", "state"}
             predicate_match = any(a in passage_lower for a in location_anchors)
             if debug_rel:
                 print(f"[RELATION GATE] LOCATION relation, predicate_match={predicate_match}")
 
-        # Married/spouse
-        elif any(kw in predicate_lower for kw in {"marr", "spouse", "wife", "husband"}):
+        elif relation_kind == "MARRIAGE":
             marriage_anchors = {"married", "spouse", "wife", "husband", "wed", "wedding", "partner"}
             predicate_match = any(a in passage_lower for a in marriage_anchors)
             if debug_rel:
                 print(f"[RELATION GATE] MARRIAGE relation, predicate_match={predicate_match}")
 
-        # Final gate: endpoint_match AND predicate_match
-        result = endpoint_match and predicate_match
+        # FINAL GATE LOGIC
+        # For WH-subject relations (like "Who directed X?"), don't require subject match
+        # The subject is just a placeholder, not a real entity to find
+        if is_wh_subject and relation_kind in {"DIRECTOR", "BORN", "AWARD", "CREATED", "LOCATION", "MARRIAGE"}:
+            # WH-subject: only require object match + predicate match
+            result = o_match and predicate_match
+        else:
+            # Normal: require at least one endpoint match + predicate match
+            result = (s_match or o_match) and predicate_match
 
         if debug_rel:
             print(f"[RELATION GATE] subj_raw='{s_raw}' subj_clean='{s}' obj_raw='{o_raw}' obj_clean='{o}' "
