@@ -42,11 +42,6 @@ install_baseline() {
     echo "✓ $name installed successfully"
 }
 
-# Install GraphRAG
-install_baseline "GraphRAG" \
-    "$BASELINE_ROOT/graphrag" \
-    "pip install -e . --quiet"
-
 # Install Self-RAG dependencies
 # Flash-attn requires torch to be installed FIRST (needs it at build time)
 echo ""

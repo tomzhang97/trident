@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Train calibration model (Mondrian Conformal Prediction).
-FIXES:
-- Uses SelectionConditionalCalibrator for RANK-BASED p-values (Fixes saturation).
-- Filters lexical_match=False for BRIDGE as well (Gate failure = Untestable).
-- Skips degenerate buckets.
+Train calibration model.
+UPDATES:
+- Stop skipping lex_failures (calibration safety).
+- Added overall positive rate sanity check.
+- Canonical filtering.
 """
 
 import argparse
@@ -18,40 +18,66 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from trident.calibration import ReliabilityCalibrator, SelectionConditionalCalibrator
 
-def load_data(path: str, facet_types: list = None):
+def canonical_ft(ft: str) -> str:
+    return "BRIDGE_HOP" if "BRIDGE_HOP" in ft else ft
+
+def load_data(path: str, requested_types: list = None):
     data = []
-    skipped_lex = 0
+    lex_fail_count = 0
+    missing_score = 0
+    
+    # Pre-canonicalize requests
+    allowed_types = None
+    if requested_types:
+        allowed_types = set()
+        for t in requested_types:
+            allowed_types.add(t)
+            allowed_types.add(canonical_ft(t))
+    
     with open(path) as f:
         for line in f:
             r = json.loads(line)
             meta = r.get("metadata", {})
-            ft = meta.get("facet_type", "UNKNOWN")
-
-            if facet_types and ft not in facet_types:
-                continue
-
-            # --- SMART LEXICAL FILTER ---
-            # Filter lexical_match=False for ENTITY, NUMERIC, and BRIDGE.
-            # If the gate fails (lexical_match=False), the item is "untestable"
-            # and should not be part of the negative pool.
-            lex_match = meta.get("lexical_match")
-            if ft in ["ENTITY", "NUMERIC", "BRIDGE_HOP1"]:
-                if lex_match is False:
-                    skipped_lex += 1
-                    continue
+            raw_ft = meta.get("facet_type", "UNKNOWN")
             
-            if "probs" in r and "entail" in r["probs"]:
-                score = float(r["probs"]["entail"])
+            ft = canonical_ft(raw_ft)
+            
+            if ft == "UNKNOWN": continue
+            if allowed_types and ft not in allowed_types: continue
+
+            # METRIC ONLY: Do not skip lex failures
+            lex_match = meta.get("lexical_match")
+            if lex_match is False:
+                lex_fail_count += 1
+            
+            # SCORE SAFETY
+            score = r.get("score")
+            if score is None:
+                if "probs" in r and "entail" in r["probs"]:
+                    score = float(r["probs"]["entail"])
+                else:
+                    missing_score += 1
+                    continue
             else:
-                score = float(r.get("score", 0.0))
-                
+                score = float(score)
+
             data.append({
-                "score": float(score),
+                "score": score,
                 "label": int(r["label"]),
-                "facet_type": str(ft),
+                "facet_type": ft,
                 "text_length": int(meta.get("text_length", 0))
             })
-    print(f"Skipped {skipped_lex} items due to lexical gate failure.")
+            
+    print(f"Loaded {len(data)} samples.")
+    print(f"Info: Included {lex_fail_count} samples where lexical_match=False.")
+    
+    # SANITY CHECK
+    if data:
+        n_pos = sum(d["label"] for d in data)
+        print(f"Sanity Check: Overall positive rate: {n_pos/len(data)*100:.2f}% ({n_pos}/{len(data)})")
+    
+    if missing_score > 0:
+        print(f"Skipped {missing_score} items due to missing scores.")
     return data
 
 def main():
@@ -59,68 +85,37 @@ def main():
     parser.add_argument("--data_path", required=True)
     parser.add_argument("--output_path", default="calibrator.pkl")
     parser.add_argument("--use_mondrian", action="store_true")
-    parser.add_argument("--facet_types", type=str, help="Comma-sep list of types")
     args = parser.parse_args()
 
-    fts = args.facet_types.split(",") if args.facet_types else None
+    data = load_data(args.data_path)
     
-    print(f"Loading data from {args.data_path}...")
-    data = load_data(args.data_path, fts)
-    print(f"Loaded {len(data)} calibration samples.")
+    # n_min=25 is safer for sparse types
+    cal = SelectionConditionalCalibrator(n_min=25, use_mondrian=args.use_mondrian)
     
-    if len(data) == 0:
-        print("Error: No data loaded.")
-        sys.exit(1)
-
-    # Use Rank-Based Conformal Calibrator
-    # n_min=50 enforces merging small bins to ensure robust p-values
-    conformal_cal = SelectionConditionalCalibrator(n_min=50, use_mondrian=args.use_mondrian)
-    
-    # Accumulate samples
-    counts = defaultdict(lambda: [0, 0]) # [total, pos]
-    
+    counts = defaultdict(lambda: [0, 0])
     for d in data:
-        ft = d["facet_type"]
-        conformal_cal.add_calibration_sample(
-            score=d["score"],
-            is_sufficient=bool(d["label"]),
-            facet_type=ft,
-            text_length=d["text_length"]
-        )
-        counts[ft][0] += 1
-        counts[ft][1] += d["label"]
+        cal.add_calibration_sample(d["score"], bool(d["label"]), d["facet_type"], d["text_length"])
+        counts[d["facet_type"]][0] += 1
+        counts[d["facet_type"]][1] += d["label"]
 
     print("\nTraining Conformal Calibrator...")
-    for ft, (n, npos) in counts.items():
-        if npos == 0 or npos == n:
-            print(f"  {ft:<15}: {n} samples ({npos} pos) -> WARNING: degenerate")
-        else:
-            print(f"  {ft:<15}: {n} samples ({npos/n*100:.1f}% positive)")
+    for ft, (n, pos) in counts.items():
+        print(f"  {ft:<15}: {n} samples ({pos/n*100:.1f}% pos)")
 
-    # Finalize (sorts negative pools, merges small bins)
-    conformal_cal.finalize()
-
-    # Wrap in ReliabilityCalibrator for compatibility
-    cal = ReliabilityCalibrator(use_mondrian=args.use_mondrian)
-    cal.set_conformal_calibrator(conformal_cal)
+    cal.finalize()
     
-    # Save
+    wrapper = ReliabilityCalibrator(use_mondrian=args.use_mondrian)
+    wrapper.set_conformal_calibrator(cal)
+    
     out_path = Path(args.output_path)
     if out_path.suffix != '.pkl': out_path = out_path.with_suffix('.pkl')
     out_path.parent.mkdir(parents=True, exist_ok=True)
     
     with open(out_path, 'wb') as f:
-        pickle.dump(cal, f)
-    print(f"\nSaved Calibrator (Pickle) to: {out_path}")
-
-    # JSON check
-    json_path = out_path.with_suffix('.json')
-    try:
-        # Save the INNER conformal calibrator to JSON for inspection
-        conformal_cal.save(str(json_path))
-        print(f"Saved Calibrator (JSON)   to: {json_path}")
-    except Exception as e:
-        print(f"⚠️  JSON Save Warning: {e}")
+        pickle.dump(wrapper, f)
+    
+    wrapper.save(out_path.with_suffix(".json").as_posix())
+    print(f"Saved to {out_path}")
 
 if __name__ == "__main__":
     main()

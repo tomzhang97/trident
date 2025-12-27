@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 extract_calibration_data.py
-Updates:
-- BRIDGE_HOP1 label logic: Now defaults to 1 if 'has_sup' (Title match), 
-  allowing Sigma script to do the strict checking later.
-- Keeps 'passage_full' for Sigma checks.
+UPDATES:
+- Added DatasetAdapter2Wiki (Standard 2WikiMultihop support).
+- Added DatasetAdapterMusique (JSONL support).
+- Switch logic in main() handles hotpot, musique, and 2wiki.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent))
 
 from trident.facets import FacetMiner, FacetType, Facet
-from trident.nli_scorer import NLIScorer
+from trident.nli_scorer import NLIScorer, _check_lexical_gate
 from trident.candidates import Passage
 from trident.config import TridentConfig
 import unicodedata
@@ -32,34 +32,9 @@ _WS_RE = re.compile(r"\s+")
 def norm(s: str) -> str:
     s = unicodedata.normalize("NFKC", s or "")
     s = s.replace("'", "'").replace("'", "'").replace(""", '"').replace(""", '"')
+    s = s.replace(",", "")
     s = _WS_RE.sub(" ", s).strip().lower()
     return s
-
-def contains_exact_phrase(passage: str, phrase: str) -> bool:
-    return norm(phrase) in norm(passage) and norm(phrase) != ""
-
-def contains_value(passage: str, value: str) -> bool:
-    """Strict numeric matching: (?<![\w.])value(?![\w.])"""
-    val_str = norm(str(value))
-    if not val_str: return False
-    pas_str = norm(passage)
-    esc_val = re.escape(val_str)
-    pattern = rf"(?<![\w.]){esc_val}(?![\w.])"
-    return bool(re.search(pattern, pas_str))
-
-def facet_satisfied_in_text(facet: Facet, text: str) -> bool:
-    if not text: return False
-    ft = facet.facet_type
-    tpl = facet.template or {}
-    if ft == FacetType.ENTITY:
-        return contains_exact_phrase(text, str(tpl.get("mention", "")))
-    if ft == FacetType.NUMERIC:
-        val = str(tpl.get("value", ""))
-        return contains_value(text, val)
-    if ft == FacetType.RELATION:
-        return contains_exact_phrase(text, str(tpl.get("subject", ""))) and \
-               contains_exact_phrase(text, str(tpl.get("object", "")))
-    return False
 
 @dataclass
 class QAExample:
@@ -68,9 +43,12 @@ class QAExample:
     context: List[Tuple[str, List[str]]]
     supporting: Dict[str, Set[int]]
 
+# --- ADAPTERS ---
+
 class DatasetAdapterHotpot:
     def load(self, path: str, limit: int = None):
-        with open(path) as f: data = json.load(f)
+        with open(path) as f: 
+            data = json.load(f)
         return data[:limit] if limit else data
 
     def to_example(self, raw):
@@ -88,6 +66,76 @@ class DatasetAdapterHotpot:
         for t, i in sup: sup_dict[t].add(i)
         
         return QAExample(qid, q, parsed_ctx, dict(sup_dict))
+
+class DatasetAdapter2Wiki:
+    """
+    Adapter for 2WikiMultihop.
+    Format is nearly identical to HotpotQA (JSON list), but usually uses '_id'.
+    """
+    def load(self, path: str, limit: int = None):
+        with open(path) as f: 
+            data = json.load(f)
+        return data[:limit] if limit else data
+
+    def to_example(self, raw):
+        # 2Wiki uses '_id' typically
+        qid = raw.get("_id") or raw.get("id")
+        q = raw.get("question")
+        ctx = raw.get("context", [])
+        sup = raw.get("supporting_facts", [])
+        
+        if not qid or not q or not ctx: return None
+        
+        # Parse Context: [[Title, [Sentences]], ...]
+        parsed_ctx = []
+        for item in ctx:
+            # item is [title, sentences]
+            if len(item) >= 2: 
+                parsed_ctx.append((item[0], item[1]))
+            
+        # Parse Support: [[Title, sent_index], ...]
+        sup_dict = defaultdict(set)
+        for item in sup:
+            if len(item) >= 2:
+                t, i = item[0], item[1]
+                sup_dict[t].add(i)
+        
+        return QAExample(qid, q, parsed_ctx, dict(sup_dict))
+
+class DatasetAdapterMusique:
+    """Adapter for MuSiQue (JSONL format)."""
+    def load(self, path: str, limit: int = None):
+        data = []
+        with open(path) as f:
+            for i, line in enumerate(f):
+                if limit and i >= limit: break
+                if line.strip():
+                    data.append(json.loads(line))
+        return data
+
+    def to_example(self, raw):
+        qid = raw.get("id")
+        q = raw.get("question")
+        if not qid or not q: return None
+        
+        parsed_ctx = []
+        sup_dict = defaultdict(set)
+        
+        # MuSiQue structure: [{"title": "...", "paragraph_text": "...", "is_supporting": bool}]
+        for p in raw.get("paragraphs", []):
+            title = p.get("title", "")
+            text = p.get("paragraph_text", "")
+            if not title or not text: continue
+            
+            # Treat entire paragraph as one block (index 0)
+            parsed_ctx.append((title, [text]))
+            
+            if p.get("is_supporting", False):
+                sup_dict[title].add(0) 
+                
+        return QAExample(qid, q, parsed_ctx, dict(sup_dict))
+
+# --- EXTRACTION LOGIC ---
 
 def extract_calibration_samples(raw_data, adapter, miner, scorer):
     samples = []
@@ -113,27 +161,10 @@ def extract_calibration_samples(raw_data, adapter, miner, scorer):
                 hyp = facet.to_hypothesis(passage_text)
                 if "?" in hyp or len(hyp) < 10: continue
 
-                # Capture lexical_match status
-                lexical_match = None
-                if facet.facet_type == FacetType.ENTITY:
-                    lexical_match = contains_exact_phrase(passage_text, facet.template.get("mention", ""))
-                elif facet.facet_type == FacetType.NUMERIC:
-                    lexical_match = contains_value(passage_text, facet.template.get("value", ""))
-                elif facet.facet_type == FacetType.BRIDGE_HOP1:
-                    e1 = facet.template.get("entity1", "")
-                    be = facet.template.get("bridge_entity", "")
-                    lexical_match = contains_exact_phrase(passage_text, e1) and contains_exact_phrase(passage_text, be)
-
+                lexical_match = _check_lexical_gate(facet, passage_text)
                 details = scorer.score_with_details(passage, facet)
                 
-                # --- FIX: Support Label Logic ---
-                if facet.facet_type == FacetType.BRIDGE_HOP1:
-                    # Option A: Trust Title Support. 
-                    # We defer stricter checking to the Sigma conversion step.
-                    label = 1 if has_sup else 0
-                else:
-                    # Default: Title Support AND content verification in sup_text
-                    label = 1 if (has_sup and facet_satisfied_in_text(facet, sup_text)) else 0
+                support_label = 1 if has_sup else 0
 
                 samples.append({
                     "id": f"{ex.qid}_{passage_id}_{facet.facet_id}",
@@ -145,12 +176,13 @@ def extract_calibration_samples(raw_data, adapter, miner, scorer):
                         "neutral": details.neutral_score,
                         "contra": details.contradiction_score,
                     },
-                    "label": label,
+                    "label": support_label,         
+                    "support_label": support_label, 
                     "metadata": {
                         "facet_type": facet.facet_type.value,
                         "facet_template": facet.template,
                         "passage_preview": passage_text[:200],
-                        "passage_full": passage_text, # CRITICAL for Sigma
+                        "passage_full": passage_text,
                         "lexical_match": lexical_match,
                         "supporting_text": sup_text,
                         "question": ex.question,
@@ -161,7 +193,7 @@ def extract_calibration_samples(raw_data, adapter, miner, scorer):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--dataset", required=True, help="hotpot, musique, or 2wiki")
     parser.add_argument("--data_path", required=True)
     parser.add_argument("--output_path", default="calibration_data.jsonl")
     parser.add_argument("--num_samples", type=int, default=500)
@@ -169,10 +201,24 @@ def main():
     args = parser.parse_args()
 
     config = TridentConfig()
+    config.dataset = args.dataset
+    
     miner = FacetMiner(config)
     scorer = NLIScorer(config.nli, device=args.device)
-    adapter = DatasetAdapterHotpot()
     
+    # Adapter Selection
+    ds = args.dataset.lower()
+    if "hotpot" in ds:
+        adapter = DatasetAdapterHotpot()
+    elif "musique" in ds:
+        adapter = DatasetAdapterMusique()
+    elif "2wiki" in ds:
+        adapter = DatasetAdapter2Wiki()
+    else:
+        print(f"Warning: Unknown dataset '{args.dataset}', assuming Hotpot format.")
+        adapter = DatasetAdapterHotpot()
+    
+    print(f"Loading {ds} from {args.data_path}...")
     raw = adapter.load(args.data_path, args.num_samples)
     samples = extract_calibration_samples(raw, adapter, miner, scorer)
     
