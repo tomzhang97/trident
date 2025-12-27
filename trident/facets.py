@@ -70,6 +70,34 @@ def _looks_like_junk_entity(mention: str) -> bool:
     if re.fullmatch(r"\d+(\.\d+)?", ml): return True
     return False
 
+# WH-words and generic terms that should not be treated as real RELATION endpoints
+_RELATION_WH_WORDS = {"who", "what", "which", "when", "where", "why", "how", "whom", "whose"}
+_RELATION_GENERIC = {"the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are",
+                     "was", "were", "be", "been", "being", "have", "has", "had", "do", "does",
+                     "did", "will", "would", "could", "should", "may", "might", "must", "shall",
+                     "director", "film", "movie", "actor", "actress", "person", "thing", "place",
+                     "name", "title", "author", "writer", "book", "song", "album", "band", "group"}
+
+def _clean_relation_endpoint_for_hypothesis(x: str) -> str:
+    """
+    Clean a RELATION endpoint for hypothesis construction.
+    Removes WH-words and generic terms, returns what's left or empty string.
+    """
+    if not x:
+        return ""
+    x = _safe_phrase(x)
+    # Check if it's a pure WH-word
+    if x.lower() in _RELATION_WH_WORDS:
+        return ""
+    # Extract tokens and filter
+    toks = re.findall(r"[A-Za-z0-9]+", x)
+    cleaned = [t for t in toks if t.lower() not in _RELATION_WH_WORDS
+               and t.lower() not in _RELATION_GENERIC and len(t) > 1]
+    if not cleaned:
+        return ""
+    # Return original if it contains meaningful content, otherwise cleaned version
+    return x if len(cleaned) >= len(toks) // 2 else " ".join(cleaned)
+
 def _dedupe_strings(xs: List[str]) -> List[str]:
     seen: Set[str] = set()
     out: List[str] = []
@@ -139,10 +167,22 @@ class Facet:
             return _ensure_sentence(f"The passage binds the value {val_str} to a specific property")
 
         if ft == FacetType.RELATION:
-            s = tpl.get('subject', '')
-            o = tpl.get('object', '')
+            s_raw = tpl.get('subject', '')
+            o_raw = tpl.get('object', '')
             p = _normalize_relation_predicate(tpl.get('predicate', ''))
-            return _ensure_sentence(f"The passage states that {s} {p} {o}")
+            # Clean endpoints - remove WH-words and generic terms
+            s = _clean_relation_endpoint_for_hypothesis(s_raw)
+            o = _clean_relation_endpoint_for_hypothesis(o_raw)
+            # Build hypothesis based on what we have
+            if s and o:
+                return _ensure_sentence(f"The passage states that {s} {p} {o}")
+            elif s:
+                return _ensure_sentence(f"The passage states something about {s}")
+            elif o:
+                return _ensure_sentence(f"The passage states something about {o}")
+            else:
+                # Both endpoints are garbage - use a generic hypothesis that NLI will likely reject
+                return _ensure_sentence(f"The passage states a factual relationship")
 
         if ft == FacetType.TEMPORAL:
             time = tpl.get('time', '')

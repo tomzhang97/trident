@@ -80,6 +80,27 @@ def _contains_value(passage: str, value: str) -> bool:
     pattern = rf"(?<![\w.]){esc_val}(?![\w.])"
     return bool(re.search(pattern, pas_str))
 
+# WH-words and generic terms that should not be treated as real entity endpoints
+_WH_WORDS = {"who", "what", "which", "when", "where", "why", "how", "whom", "whose"}
+_GENERIC_TERMS = {"the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are",
+                  "was", "were", "be", "been", "being", "have", "has", "had", "do", "does",
+                  "did", "will", "would", "could", "should", "may", "might", "must", "shall",
+                  "director", "film", "movie", "actor", "actress", "person", "thing", "place",
+                  "name", "title", "author", "writer", "book", "song", "album", "band", "group"}
+
+def _clean_relation_endpoint(x: str) -> str:
+    """
+    Clean a RELATION endpoint by removing WH-words and generic terms.
+    Returns empty string if no meaningful content remains.
+    """
+    if not x:
+        return ""
+    # Extract alphanumeric tokens
+    toks = re.findall(r"[A-Za-z0-9]+", x.lower())
+    # Filter out WH-words and generic terms
+    cleaned = [t for t in toks if t not in _WH_WORDS and t not in _GENERIC_TERMS and len(t) > 1]
+    return " ".join(cleaned).strip()
+
 def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
     ft = facet.facet_type
     tpl = facet.template or {}
@@ -101,15 +122,25 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         return _contains_exact_phrase(passage_text, e1) and _contains_tokens(passage_text, e2)
 
     if ft == FacetType.RELATION:
-        s = str(tpl.get("subject", ""))
-        o = str(tpl.get("object", ""))
+        s_raw = str(tpl.get("subject", ""))
+        o_raw = str(tpl.get("object", ""))
+        # Clean endpoints - remove WH-words and generic terms
+        s = _clean_relation_endpoint(s_raw)
+        o = _clean_relation_endpoint(o_raw)
+        debug_rel = os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1"
+
+        # If both endpoints are empty after cleaning, can't gate reliably - let NLI decide
+        if not s and not o:
+            if debug_rel:
+                print(f"[RELATION GATE] subj_raw='{s_raw}' obj_raw='{o_raw}' -> BOTH EMPTY after cleaning, gate=True (let NLI decide)")
+            return True  # Don't gate, let NLI score it
+
         s_match = _contains_tokens(passage_text, s) if s else False
         o_match = _contains_tokens(passage_text, o) if o else False
-        # FIX: Require only ONE of subject OR object (like COMPARISON)
-        # Multi-hop QA often has subject in one passage, object in another
+        # Require only ONE of subject OR object (multi-hop QA often splits entities across passages)
         result = s_match or o_match
-        if os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1":
-            print(f"[RELATION GATE] subj='{s}' obj='{o}' s_match={s_match} o_match={o_match} -> gate={result}")
+        if debug_rel:
+            print(f"[RELATION GATE] subj_raw='{s_raw}' subj_clean='{s}' obj_raw='{o_raw}' obj_clean='{o}' s_match={s_match} o_match={o_match} -> gate={result}")
         return result
 
     if ft == FacetType.COMPARISON:
@@ -156,6 +187,9 @@ class NLIScorer:
         premise = passage.text
         hypothesis = facet.to_hypothesis(passage.text)
         debug_rel = os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1"
+
+        if debug_rel and facet.facet_type == FacetType.RELATION:
+            print(f"[RELATION HYP] {hypothesis}")
 
         lexical_match = _check_lexical_gate(facet, premise)
         if lexical_match is False:
