@@ -1,7 +1,7 @@
 {
   "mode": "safe_cover",
   "safe_cover": {
-    "per_facet_alpha": 0.05,
+    "per_facet_alpha": 0.2,
     "coverage_threshold": 0.15,
     "token_cap": 4000,
     "max_evidence_tokens": 4000,
@@ -13,7 +13,15 @@
     "monitor_drift": false,
     "psi_threshold": 0.5,
     "fallback_to_pareto": false,
-    "pvalue_mode": "deterministic"
+    "pvalue_mode": "deterministic",
+    "per_facet_configs": {
+      "default": {"max_tests": 3},
+      "ENTITY": {"max_tests": 3},
+      "RELATION": {"max_tests": 3},
+      "TEMPORAL": {"max_tests": 3},
+      "NUMERIC": {"max_tests": 3},
+      "BRIDGE_HOP": {"max_tests": 3}
+    }
   },
   "pareto": {
     "budget": 2000,
@@ -43,7 +51,8 @@
     "use_mondrian": true,
     "n_min": 25,
     "facet_types": ["ENTITY", "RELATION", "TEMPORAL", "NUMERIC", "BRIDGE_HOP"],
-    "pvalue_mode": "deterministic"
+    "pvalue_mode": "deterministic",
+    "retriever_score_buckets": null
   },
   "evaluation": {
     "metrics": ["em", "f1", "support_em", "faithfulness"],

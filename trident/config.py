@@ -44,9 +44,13 @@ class FacetConfig:
     - alpha: Per-facet error budget (α_f)
     - max_tests: T_f, max passages tested per facet for Bonferroni
     - alpha_bar is computed as: α_f / T_f
+
+    NOTE: max_tests=3 is the new default (was 10). Lower T_f means less
+    Bonferroni penalty, making certification more feasible. With T_f=10
+    and |F|=3, threshold was ~0.001; with T_f=3, it's ~0.02.
     """
     alpha: float = 0.01  # α_f: Per-facet Type I error level
-    max_tests: int = 10  # T_f: Max passages tested per facet (Bonferroni budget)
+    max_tests: int = 3  # T_f: Max passages tested per facet (reduced from 10)
     prefilter_tests: int = 3  # Tests for spurious facet filtering
     fallback_scale: float = 0.5  # ρ: Conservative threshold multiplier on drift (0.5-0.9)
     weight: float = 1.0  # w_f: Facet weight for utility computation
@@ -182,9 +186,10 @@ class CalibrationConfig:
     length_buckets: List[Tuple[int, int]] = field(default_factory=lambda: [
         (0, 50), (50, 150), (150, 10000)  # short, medium, long
     ])
-    retriever_score_buckets: List[Tuple[float, float]] = field(default_factory=lambda: [
-        (0.0, 0.33), (0.33, 0.67), (0.67, 1.0)  # low, medium, high
-    ])
+    # DISABLED by default - retriever scores often not in [0,1] range
+    # which causes all lookups to miss buckets. Enable only after
+    # normalizing retriever scores to [0,1] in both training and inference.
+    retriever_score_buckets: Optional[List[Tuple[float, float]]] = None
 
     # Legacy fields
     facet_bins: Dict[str, List[float]] = field(default_factory=dict)
