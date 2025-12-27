@@ -613,10 +613,9 @@ class TridentPipeline:
         for facet in facets:
             ft = facet.facet_type
 
-            # Facet-type override: noisy facets need more tests to find good passages
-            facet_max_tests = max_tests
-            if ft == FacetType.RELATION or "BRIDGE" in ft.value:
-                facet_max_tests = max(max_tests, 10)
+            # Facet-type override: all facets get at least 10 tests when pool is small
+            # This is critical when dataset only provides ~10 context passages
+            facet_max_tests = max(max_tests, 10)
 
             # Stage 1: Shortlist candidates per facet - CAP TO facet_max_tests
             shortlist = self._shortlist_for_facet(passages, facet, max_candidates=facet_max_tests)
@@ -628,13 +627,17 @@ class TridentPipeline:
             # Stage 2: CE/NLI scoring for shortlisted pairs
             for passage in shortlist:
                 cache_key = (passage.pid, facet.facet_id, self.config.calibration.version)
-                
+
                 if cache_key in self.score_cache:
                     score = self.score_cache[cache_key]
                 else:
                     score = self.nli_scorer.score(passage, facet)
                     self.score_cache[cache_key] = score
-                
+
+                # CRITICAL FIX: Clip scores to [0,1] before calibration
+                # Calibrator was trained on [0,1] scores; negatives map to p≈1
+                score_clipped = max(0.0, min(1.0, score))
+
                 stage2_scores[(passage.pid, facet.facet_id)] = score
 
                 # Calibrate to p-value with text length for Mondrian
@@ -642,9 +645,9 @@ class TridentPipeline:
                 text_length = len(passage.text.split())
 
                 if debug and len(p_values) < 5:  # Only print first 5
-                    print(f"[DEBUG] Calling to_pvalue: bucket={bucket}, score={score:.4f}, len={text_length}")
+                    print(f"[DEBUG] Calling to_pvalue: bucket={bucket}, score={score:.4f} (clipped={score_clipped:.4f}), len={text_length}")
 
-                p_value = self.calibrator.to_pvalue(score, bucket, text_length)
+                p_value = self.calibrator.to_pvalue(score_clipped, bucket, text_length)
 
                 if debug and len(p_values) < 5:
                     print(f"[DEBUG] Got p_value={p_value:.4f}")

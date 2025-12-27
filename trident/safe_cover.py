@@ -244,10 +244,9 @@ class SafeCoverAlgorithm:
                 # per_facet_alpha IS the per-facet budget (no division by |F|)
                 facet_alpha = per_facet_alpha
 
-                # Facet-type override: noisy facets need more tests to find good passages
-                # RELATION and BRIDGE_HOP often have the "one good" passage ranked 5-10
-                if ft == FacetType.RELATION or "BRIDGE" in ft.value:
-                    facet_t_f = max(facet_t_f, 10)
+                # All facets get at least 10 tests when pool is small (~10 passages)
+                # This ensures we don't miss the "one good" passage for any facet type
+                facet_t_f = max(facet_t_f, 10)
 
             # ᾱ_f = α_f / T_f (Bonferroni over tests within facet)
             facet_alpha_bar = facet_alpha / max(facet_t_f, 1)
@@ -397,9 +396,8 @@ class SafeCoverAlgorithm:
                 max_tests = self.config.per_facet_configs[facet.facet_id].max_tests
             else:
                 max_tests = knobs.t_f
-                # Facet-type override: noisy facets need more tests
-                if ft == FacetType.RELATION or "BRIDGE" in ft.value:
-                    max_tests = max(max_tests, 10)
+                # All facets get at least 10 tests when pool is small
+                max_tests = max(max_tests, 10)
 
             # Shortlist passages for this facet (Section 4.4)
             shortlist = self._shortlist_for_facet(
