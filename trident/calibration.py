@@ -145,8 +145,13 @@ class SelectionConditionalCalibrator:
         self.temp_data = []
 
     def get_p_value(self, score: float, facet_type: str, text_length: int) -> float:
+        import os
+        debug = os.environ.get("TRIDENT_DEBUG_PVALUE", "0") == "1"
+
         ft_bins = self.bins.get(facet_type)
         if not ft_bins:
+            if debug:
+                print(f"[PVALUE DEBUG] MISS facet_type={facet_type}, available={list(self.bins.keys())}")
             raise KeyError(f"No calibration data for type: {facet_type}")
             
         if "all" in ft_bins:
@@ -164,13 +169,20 @@ class SelectionConditionalCalibrator:
                 neg_scores = ft_bins.get(key, [])
 
         if not neg_scores:
+            if debug:
+                print(f"[PVALUE DEBUG] EMPTY BIN facet_type={facet_type}, len={text_length}")
             return 1.0
-            
+
         import bisect
         idx = bisect.bisect_left(neg_scores, score)
         count_ge = len(neg_scores) - idx
-        
-        return (1.0 + count_ge) / (len(neg_scores) + 1.0)
+        p_value = (1.0 + count_ge) / (len(neg_scores) + 1.0)
+
+        if debug:
+            print(f"[PVALUE DEBUG] HIT facet_type={facet_type}, score={score:.4f}, "
+                  f"n_bin={len(neg_scores)}, p_value={p_value:.4f}")
+
+        return p_value
 
     def to_dict(self) -> Dict:
         return {

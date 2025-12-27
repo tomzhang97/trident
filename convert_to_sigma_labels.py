@@ -179,7 +179,40 @@ def check_bridge_sigma_ok(passage, title, e1, e2, sup_text="", overlap_thresh=0.
     return True, "OK_TOKEN_OVERLAP"
 
 def check_temporal_sigma(passage, sup_text, time_str, lex):
-    return True, "OK"
+    """Check temporal sigma by requiring year/date tokens present.
+
+    Previously returned True always (100% retention), which distorted
+    coverage/feasibility logic. Now requires minimal temporal evidence.
+    """
+    text = _norm(sup_text if sup_text else passage)
+    time_norm = _norm(time_str) if time_str else ""
+
+    # Check for year patterns (1800-2099)
+    year_pattern = r"\b(1[89]\d{2}|20\d{2})\b"
+    has_year = bool(re.search(year_pattern, text))
+
+    # Check for date patterns (month names, ordinals)
+    date_patterns = [
+        r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\b",
+        r"\b\d{1,2}(st|nd|rd|th)\b",  # 1st, 2nd, 3rd, etc.
+        r"\b\d{1,2}/\d{1,2}/\d{2,4}\b",  # MM/DD/YYYY
+    ]
+    has_date = any(re.search(p, text) for p in date_patterns)
+
+    # If time_str provided, check if it's in the text
+    if time_norm:
+        # Check exact match or token overlap
+        if time_norm in text:
+            return True, "OK_TIME_EXACT"
+        time_toks = _get_tokens(time_norm)
+        text_toks = _get_tokens(text)
+        if time_toks and len(time_toks.intersection(text_toks)) / len(time_toks) >= 0.5:
+            return True, "OK_TIME_OVERLAP"
+
+    if has_year or has_date:
+        return True, "OK_TEMPORAL_CUE"
+
+    return False, "NO_TEMPORAL_EVIDENCE"
 
 def check_comparison_sigma(passage, sup_text, e1, e2, attr, lex):
     # No lex gate
