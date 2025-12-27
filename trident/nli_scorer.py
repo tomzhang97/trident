@@ -56,36 +56,32 @@ def _contains_exact_phrase(passage: str, phrase: str) -> bool:
 def _token_in_text(tok: str, text: str) -> bool:
     return bool(re.search(rf"(?<!\w){re.escape(tok)}(?!\w)", text))
 
+_STOP_WORDS = {"the", "and", "of", "in", "to", "a", "an", "for", "or", "is", "are", "was", "were"}
+
 def _contains_tokens(passage: str, phrase: str) -> bool:
     """
-    Looser check: Do significant tokens from phrase appear in passage?
-    Safe Fallback: If no significant tokens (e.g. "US"), require exact match.
-
-    FIX: Split on hyphens and other punctuation to handle "Polish-Russian" -> ["polish", "russian"]
+    Looser check: do significant tokens from phrase appear in passage?
+    Hyphen/punct robust: "Polish-Russian" -> ["polish", "russian"].
     """
+    import math
+
+    if not phrase:
+        return False
+
     p_norm = _norm(passage)
     ph_norm = _norm(phrase)
 
-    # Split on whitespace AND hyphens/underscores to handle compound words
-    raw_tokens = re.split(r"[\s\-_]+", ph_norm)
-    tokens = [t for t in raw_tokens if len(t) > 2 and t not in {"the", "and", "of", "in", "for", "to"}]
+    # Split phrase into tokens robustly (handles hyphen/underscore/punct)
+    raw = re.split(r"[\s\-_]+", ph_norm)
+    tokens = [t for t in raw if len(t) > 2 and t not in _STOP_WORDS]
 
-    # FIX: Don't let short entities bypass the gate
+    # If no significant tokens remain, fall back to exact-phrase match
     if not tokens:
         return _contains_exact_phrase(passage, phrase)
 
-    # Also split passage on hyphens for matching
-    p_tokens = set(re.split(r"[\s\-_]+", p_norm))
-
-    # Count hits - token can match directly in passage tokens OR via substring
-    hits = 0
-    for t in tokens:
-        if t in p_tokens or _token_in_text(t, p_norm):
-            hits += 1
-
-    # Require at least 1 token match for short phrases, half for longer
-    min_hits = 1 if len(tokens) <= 2 else len(tokens) // 2
-    return hits >= min_hits
+    hits = sum(1 for t in tokens if _token_in_text(t, p_norm))
+    need = max(1, math.ceil(len(tokens) / 2))
+    return hits >= need
 
 def _contains_value(passage: str, value: str) -> bool:
     val_str = _norm(str(value))
