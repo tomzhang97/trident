@@ -346,6 +346,12 @@ class NLIScorer:
                 print(f"[RELATION SCORE] GATED OUT -> score=0.0")
             return 0.0
 
+        # Log winning gated passage for debugging
+        if debug_rel and facet.facet_type == FacetType.RELATION:
+            # Show first 150 chars of passage that passed gate
+            psg_preview = premise[:150].replace('\n', ' ')
+            print(f"[RELATION PASSAGE] len={len(premise)} text={psg_preview!r}...")
+
         if self.use_cache:
             key = self._cache_key(premise, hypothesis)
             if key in self.cache:

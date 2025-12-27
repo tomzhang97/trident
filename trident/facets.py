@@ -241,43 +241,70 @@ class Facet:
             relation_kind = "DEFAULT"
             hypothesis = None
 
+            # Helper: strip relation suffix words from entity to avoid duplication
+            # e.g., "film X won" -> "film X" when template adds "won"
+            def _strip_relation_suffix(entity: str, suffixes: list) -> str:
+                """Strip trailing relation words from entity string."""
+                if not entity:
+                    return entity
+                import re
+                # Build pattern: match any suffix word at end (with optional punctuation)
+                pattern = r'\s+(?:' + '|'.join(re.escape(w) for w in suffixes) + r')[\s\.\?\!]*$'
+                return re.sub(pattern, '', entity, flags=re.IGNORECASE).strip()
+
             # Director/directed
             if 'direct' in facet_text_lower or 'director' in facet_text_lower:
                 relation_kind = "DIRECTOR"
-                if o:
-                    hypothesis = f"The passage states who directed {o}"
-                elif s:
-                    hypothesis = f"The passage states that {s} directed a film"
+                # Strip director-related words from object to avoid "directed directed"
+                o_clean = _strip_relation_suffix(o, ['director', 'directed', 'directs', 'directing',
+                                                      'director of', 'directed by'])
+                s_clean = _strip_relation_suffix(s, ['director', 'directed', 'directs', 'directing'])
+                if o_clean:
+                    hypothesis = f"The passage states who directed {o_clean}"
+                elif s_clean:
+                    hypothesis = f"The passage states that {s_clean} directed a film"
 
             # Born/birthplace
             elif 'born' in facet_text_lower or 'birth' in facet_text_lower:
                 relation_kind = "BORN"
+                # Strip birth-related words from object
+                o_clean = _strip_relation_suffix(o, ['born', 'birth', 'birthplace', 'born in',
+                                                      'was born', 'birthdate', 'birthday'])
+                s_clean = _strip_relation_suffix(s, ['born', 'birth', 'birthplace', 'was born'])
                 if 'where' in s_raw.lower() or 'place' in facet_text_lower:
-                    if o:
-                        hypothesis = f"The passage states where {o} was born"
-                    elif s:
-                        hypothesis = f"The passage states the birthplace of {s}"
+                    if o_clean:
+                        hypothesis = f"The passage states where {o_clean} was born"
+                    elif s_clean:
+                        hypothesis = f"The passage states the birthplace of {s_clean}"
                 else:
-                    if o:
-                        hypothesis = f"The passage states when {o} was born"
-                    elif s:
-                        hypothesis = f"The passage states when {s} was born"
+                    if o_clean:
+                        hypothesis = f"The passage states when {o_clean} was born"
+                    elif s_clean:
+                        hypothesis = f"The passage states when {s_clean} was born"
 
             # Won/award/prize
             elif any(w in facet_text_lower for w in ['won', 'win', 'award', 'prize', 'honor']):
                 relation_kind = "AWARD"
-                if o:
-                    hypothesis = f"The passage states what award {o} won"
-                elif s:
-                    hypothesis = f"The passage states what {s} won"
+                # Strip award-related words from object to avoid "X won won"
+                o_clean = _strip_relation_suffix(o, ['won', 'wins', 'winning', 'win', 'award',
+                                                      'awards', 'awarded', 'nominated', 'prize',
+                                                      'prizes', 'honor', 'honors', 'honoured'])
+                s_clean = _strip_relation_suffix(s, ['won', 'wins', 'winning', 'win', 'award'])
+                if o_clean:
+                    hypothesis = f"The passage states what award {o_clean} won"
+                elif s_clean:
+                    hypothesis = f"The passage states what {s_clean} won"
 
             # Created/founded/written
             elif any(w in facet_text_lower for w in ['creat', 'found', 'writ', 'author', 'compose']):
                 relation_kind = "CREATED"
-                if o:
-                    hypothesis = f"The passage states who created {o}"
-                elif s:
-                    hypothesis = f"The passage states what {s} created"
+                o_clean = _strip_relation_suffix(o, ['created', 'wrote', 'written', 'founded',
+                                                      'authored', 'composed', 'created by'])
+                s_clean = _strip_relation_suffix(s, ['created', 'wrote', 'written', 'founded'])
+                if o_clean:
+                    hypothesis = f"The passage states who created {o_clean}"
+                elif s_clean:
+                    hypothesis = f"The passage states what {s_clean} created"
 
             # Located/capital
             elif any(w in facet_text_lower for w in ['locat', 'capital', 'situat', 'based']):

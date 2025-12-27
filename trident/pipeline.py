@@ -684,9 +684,24 @@ class TridentPipeline:
                 alpha_bar = per_facet_alpha / t_f
                 print(f"[DEBUG] facet={ft_str} T_f={t_f} alpha_bar={alpha_bar:.4f} exhaustive={exhaustive}")
 
+        # Track skipped facets (empty template data)
+        skipped_facets = set()
+
         for facet in facets:
             ft = facet.facet_type
             ft_str = ft.value if hasattr(ft, 'value') else str(ft)
+
+            # Skip BRIDGE_HOP facets with empty entity fields
+            # These produce meaningless hypotheses and always score 0
+            if "BRIDGE_HOP" in ft_str:
+                tpl = facet.template or {}
+                e1 = str(tpl.get("entity1", "") or tpl.get("entity", "") or "").strip()
+                eb = str(tpl.get("bridge_entity", "") or tpl.get("entity2", "") or "").strip()
+                if not e1 or not eb:
+                    if debug:
+                        print(f"[DEBUG] SKIP facet={ft_str} (empty entities: e1={e1!r} eb={eb!r})")
+                    skipped_facets.add(facet.facet_id)
+                    continue
 
             # Get T_f: exhaustive probes all passages, otherwise use facet-type T_f
             if exhaustive:
@@ -747,11 +762,18 @@ class TridentPipeline:
         num_passed = 0
         num_failed = 0
         num_no_candidates = 0
+        num_skipped = 0
 
         if debug:
             for facet in facets:
                 ft = facet.facet_type
                 ft_str = ft.value if hasattr(ft, 'value') else str(ft)
+
+                # Check if this facet was skipped (empty template data)
+                if facet.facet_id in skipped_facets:
+                    print(f"[COVER SUMMARY] facet={ft_str} id={facet.facet_id[:8]}... SKIPPED (empty template)")
+                    num_skipped += 1
+                    continue
 
                 # Use exhaustive T_f if applicable, otherwise facet-type T_f
                 if exhaustive:
@@ -783,13 +805,18 @@ class TridentPipeline:
                         facet_text = facet.template.get('mention', '')
                     elif 'subject' in facet.template:
                         facet_text = f"{facet.template.get('subject', '')} -> {facet.template.get('object', '')}"
+                    elif 'entity1' in facet.template:
+                        # BRIDGE_HOP facets use entity1 and bridge_entity
+                        e1 = facet.template.get('entity1', '')
+                        eb = facet.template.get('bridge_entity', '')
+                        facet_text = f"{e1} <-> {eb}" if eb else e1
 
                 print(f"[COVER SUMMARY] facet={ft_str} text={facet_text!r} "
                       f"best_score={best_score:.4f} best_p={best_p:.4g} alpha_bar={alpha_bar:.4g} "
                       f"T_f={t_f} pass={passes}")
 
             # Print summary line
-            print(f"[COVER TOTALS] passed={num_passed}/{len(facets)} failed={num_failed} no_candidates={num_no_candidates}")
+            print(f"[COVER TOTALS] passed={num_passed}/{len(facets)} failed={num_failed} no_candidates={num_no_candidates} skipped={num_skipped}")
 
         # ORACLE DEBUG: For failing facets, score ALL passages to diagnose stage-1 vs stage-2
         oracle_debug = os.environ.get("TRIDENT_DEBUG_ORACLE", "0") == "1"
