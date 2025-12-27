@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any
 from collections import OrderedDict
 import hashlib
+import os
 import re
 import unicodedata
 
@@ -102,7 +103,14 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
     if ft == FacetType.RELATION:
         s = str(tpl.get("subject", ""))
         o = str(tpl.get("object", ""))
-        return _contains_tokens(passage_text, s) and _contains_tokens(passage_text, o)
+        s_match = _contains_tokens(passage_text, s) if s else False
+        o_match = _contains_tokens(passage_text, o) if o else False
+        # FIX: Require only ONE of subject OR object (like COMPARISON)
+        # Multi-hop QA often has subject in one passage, object in another
+        result = s_match or o_match
+        if os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1":
+            print(f"[RELATION GATE] subj='{s}' obj='{o}' s_match={s_match} o_match={o_match} -> gate={result}")
+        return result
 
     if ft == FacetType.COMPARISON:
         e1 = str(tpl.get("entity1", ""))
@@ -147,9 +155,13 @@ class NLIScorer:
     def score(self, passage: Passage, facet: Facet) -> float:
         premise = passage.text
         hypothesis = facet.to_hypothesis(passage.text)
+        debug_rel = os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1"
 
         lexical_match = _check_lexical_gate(facet, premise)
-        if lexical_match is False: return 0.0
+        if lexical_match is False:
+            if debug_rel and facet.facet_type == FacetType.RELATION:
+                print(f"[RELATION SCORE] GATED OUT -> score=0.0")
+            return 0.0
 
         if self.use_cache:
             key = self._cache_key(premise, hypothesis)
@@ -162,7 +174,12 @@ class NLIScorer:
             probs = F.softmax(self.model(**inputs).logits[0], dim=-1)
 
         s = float(probs[self.entail_idx].item()) - 0.5 * float(probs[self.contra_idx].item() if probs.numel() > 2 else 0.0)
-        
+
+        if debug_rel and facet.facet_type == FacetType.RELATION:
+            entail = float(probs[self.entail_idx].item())
+            contra = float(probs[self.contra_idx].item()) if probs.numel() > 2 else 0.0
+            print(f"[RELATION SCORE] NLI entail={entail:.4f} contra={contra:.4f} -> score={s:.4f}")
+
         if self.use_cache:
             if len(self.cache) >= self.cache_size: self.cache.popitem(last=False)
             self.cache[key] = s
@@ -172,22 +189,27 @@ class NLIScorer:
         if not pairs: return []
         scores = []
         bs = int(getattr(self.config, "batch_size", 32))
+        debug_rel = os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1"
 
         for i in range(0, len(pairs), bs):
             batch = pairs[i:i + bs]
             to_run_indices = []
-            to_run_inputs = [] 
-            batch_data = [] 
-            
-            results_map = {} 
+            to_run_inputs = []
+            batch_data = []
+            facet_types = []  # Track facet types for debug logging
+
+            results_map = {}
 
             for idx, (p, f) in enumerate(batch):
                 hyp = f.to_hypothesis(p.text)
                 key = self._cache_key(p.text, hyp)
                 batch_data.append((key))
+                facet_types.append(f.facet_type)
 
                 lexical_match = _check_lexical_gate(f, p.text)
                 if lexical_match is False:
+                    if debug_rel and f.facet_type == FacetType.RELATION:
+                        print(f"[RELATION BATCH] idx={idx} GATED OUT -> score=0.0")
                     results_map[idx] = 0.0
                     continue
 
@@ -211,7 +233,10 @@ class NLIScorer:
                     contra = float(probs[k, self.contra_idx].item()) if probs.size(-1) > 2 else 0.0
                     s = entail - 0.5 * contra
                     results_map[idx] = s
-                    
+
+                    if debug_rel and facet_types[idx] == FacetType.RELATION:
+                        print(f"[RELATION BATCH] idx={idx} NLI entail={entail:.4f} contra={contra:.4f} -> score={s:.4f}")
+
                     if self.use_cache:
                         key = batch_data[idx]
                         if len(self.cache) >= self.cache_size: self.cache.popitem(last=False)
