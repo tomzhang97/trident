@@ -65,26 +65,33 @@ class BenchmarkEvaluator:
         coverage_rates = []
         
         for pred, ref in zip(predictions, references):
-            # Handle abstentions
+            # Handle abstentions - count as 0 EM/F1 (don't skip!)
             if pred.get('abstained', False):
                 abstention_count += 1
+                em_scores.append(0.0)
+                f1_scores.append(0.0)
                 continue
-            
+
             # Exact Match and F1
             pred_answer = self._normalize_answer(pred.get('prediction', ''))
             ref_answers = ref.get('answer', [])
             if isinstance(ref_answers, str):
                 ref_answers = [ref_answers]
-            
-            # Compute EM
-            em = max(self._exact_match(pred_answer, self._normalize_answer(ans)) 
-                    for ans in ref_answers)
-            em_scores.append(em)
-            
-            # Compute F1
-            f1 = max(self._f1_score(pred_answer, self._normalize_answer(ans)) 
-                    for ans in ref_answers)
-            f1_scores.append(f1)
+
+            # Handle empty ref_answers
+            if not ref_answers:
+                em_scores.append(0.0)
+                f1_scores.append(0.0)
+            else:
+                # Compute EM
+                em = max(self._exact_match(pred_answer, self._normalize_answer(ans))
+                        for ans in ref_answers)
+                em_scores.append(em)
+
+                # Compute F1
+                f1 = max(self._f1_score(pred_answer, self._normalize_answer(ans))
+                        for ans in ref_answers)
+                f1_scores.append(f1)
             
             # Support EM/F1 for multi-hop
             if 'support_em' in self.metrics_to_compute:

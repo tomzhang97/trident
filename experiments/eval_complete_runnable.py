@@ -802,8 +802,14 @@ class ExperimentRunner:
         abstained_count = 0
 
         for result in valid_results:
+            # Abstained questions count as 0 EM/F1 (don't skip!)
             if result.get('abstained'):
                 abstained_count += 1
+                em_scores.append(0.0)
+                f1_scores.append(0.0)
+                # Still track tokens/latency for abstained
+                tokens_used.append(result.get('tokens_used', 0))
+                latencies.append(result.get('latency_ms', 0))
                 continue
 
             pred = result.get('prediction')
@@ -818,6 +824,10 @@ class ExperimentRunner:
                     best_f1 = max(best_f1, f1)
                 em_scores.append(best_em)
                 f1_scores.append(best_f1)
+            else:
+                # No prediction or no ground truth - count as 0
+                em_scores.append(0.0)
+                f1_scores.append(0.0)
 
             tokens_used.append(result.get('tokens_used', 0))
             latencies.append(result.get('latency_ms', 0))
@@ -1028,8 +1038,12 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
     latencies = []
 
     for result in all_results:
+        # Abstained/error questions count as 0 EM/F1 (don't skip!)
         if result.get('abstained') or 'error' in result:
             abstained += 1
+            em_scores.append(0.0)
+            f1_scores.append(0.0)
+            tokens_used.append(result.get('tokens_used', 0))
             continue
 
         pred = result.get('prediction', '')
@@ -1039,6 +1053,10 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
             best_f1 = max(_f1(pred, gt) for gt in gts)
             em_scores.append(best_em)
             f1_scores.append(best_f1)
+        else:
+            # No prediction or no ground truth - count as 0
+            em_scores.append(0.0)
+            f1_scores.append(0.0)
 
         tokens_used.append(result.get('tokens_used', 0))
         metrics = result.get('metrics', {})
