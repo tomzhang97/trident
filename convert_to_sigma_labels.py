@@ -4,8 +4,9 @@ Convert to Σ(p,f) labels.
 UPDATES:
 - Canonical-aware filtering (matches BRIDGE_HOP1 if BRIDGE_HOP is requested).
 - Robust Sigma logic (0.4 overlap threshold for better 2Wiki compatibility).
-- BRIDGE_HOP: title tokens checked for BOTH entities (symmetric handling).
-- RELATION: title included in exact match haystack (not only token overlap).
+- BRIDGE_HOP: checks supporting_text + passage + title (all sources combined).
+- RELATION: checks supporting_text + passage + title (not either/or).
+- Both types now handle 2Wiki alias/paraphrase patterns properly.
 """
 
 import json
@@ -96,72 +97,83 @@ def check_numeric_sigma(passage, sup_text, value, entity, lex):
     return False, "CONTEXT_MISSING"
 
 def check_relation_sigma(passage, sup_text, s, o, pred, lex, title="", overlap_thresh=0.4):
-    """Check relation sigma with title included in exact match haystack.
+    """Check relation sigma against combined text sources.
 
-    Uses 0.4 overlap threshold (lowered from 0.5) for better 2Wiki compatibility.
-    Title is now included in both exact match and token overlap checks.
+    Uses 0.4 overlap threshold for better 2Wiki compatibility.
+    Combines passage + supporting_text + title for maximum coverage.
+    This addresses 2Wiki's alias/paraphrase patterns where subjects/objects
+    may appear in different forms across sources.
     """
     # No lex gate
     s = (s or "").strip()
     o = (o or "").strip()
     if not s or not o: return False, "EMPTY_SUBJ_OBJ"
 
-    base_text = _norm(sup_text if sup_text else passage)
-    title_norm = _norm(title)
-    # Include title in exact match haystack (not only token overlap)
-    text_with_title = base_text + " " + title_norm
+    # Combine ALL text sources (not either/or)
+    passage_norm = _norm(passage or "")
+    sup_norm = _norm(sup_text or "")
+    title_norm = _norm(title or "")
+    # Combined text for exact match checks
+    combined_text = " ".join([passage_norm, sup_norm, title_norm])
 
     s_norm = _norm(s); o_norm = _norm(o)
 
-    # CHANGED: Exact match now checks text_with_title (includes title)
-    s_found = s_norm in text_with_title
-    o_found = o_norm in text_with_title
+    # Exact match checks against combined text
+    s_found = s_norm in combined_text
+    o_found = o_norm in combined_text
 
     if not (s_found and o_found):
         s_toks = _get_tokens(s)
         o_toks = _get_tokens(o)
-        txt_toks = _get_tokens(text_with_title)
+        # Token overlap against combined sources
+        all_toks = _get_tokens(combined_text)
 
-        # 0.4 Overlap Threshold (lowered from 0.5)
-        s_hit = len(s_toks.intersection(txt_toks)) / max(1, len(s_toks)) >= overlap_thresh
-        o_hit = len(o_toks.intersection(txt_toks)) / max(1, len(o_toks)) >= overlap_thresh
+        # 0.4 Overlap Threshold
+        s_hit = len(s_toks.intersection(all_toks)) / max(1, len(s_toks)) >= overlap_thresh
+        o_hit = len(o_toks.intersection(all_toks)) / max(1, len(o_toks)) >= overlap_thresh
 
         if not (s_hit and o_hit): return False, "ENTITIES_MISSING"
 
     return True, "OK_GOLD_PROXIMITY"
 
-def check_bridge_sigma_ok(passage, title, e1, e2, overlap_thresh=0.4):
-    """Check bridge hop sigma with title tokens for BOTH entities.
+def check_bridge_sigma_ok(passage, title, e1, e2, sup_text="", overlap_thresh=0.4):
+    """Check bridge hop sigma against supporting_text OR passage_full OR title.
 
-    Uses 0.4 overlap threshold (lowered from 0.5) for better 2Wiki compatibility.
-    Both e1 and e2 can match in title OR text for symmetric handling.
+    Uses 0.4 overlap threshold for better 2Wiki compatibility.
+    Entities can match in ANY of: supporting_text, passage, or title.
+    This addresses 2Wiki's alias/paraphrase patterns where gold evidence
+    may appear in supporting_text rather than passage body.
     """
-    if not passage: return False, "NO_TEXT"
-
     e1 = (e1 or "").strip()
     e2 = (e2 or "").strip()
     if not e1 or not e2: return False, "EMPTY_BRIDGE_ENTS"
 
-    t = _norm(passage)
-    ttl = _norm(title or "")
+    # Combine all text sources for maximum coverage
+    passage_norm = _norm(passage or "")
+    title_norm = _norm(title or "")
+    sup_norm = _norm(sup_text or "")
 
-    txt_toks = _get_tokens(t)
-    ttl_toks = _get_tokens(ttl)
+    # Build token sets from each source
+    passage_toks = _get_tokens(passage_norm)
+    title_toks = _get_tokens(title_norm)
+    sup_toks = _get_tokens(sup_norm)
+    # Combined tokens from all sources
+    all_toks = passage_toks | title_toks | sup_toks
+
+    if not passage_norm and not sup_norm: return False, "NO_TEXT"
 
     e1_toks = _get_tokens(e1)
     e2_toks = _get_tokens(e2)
 
     if not e1_toks or not e2_toks: return False, "EMPTY_ENTITY_TOKS"
 
-    # e1: can match in title OR text (unchanged logic, but with new threshold)
-    e1_hit = (len(e1_toks.intersection(ttl_toks)) / len(e1_toks) >= overlap_thresh) or \
-             (len(e1_toks.intersection(txt_toks)) / len(e1_toks) >= overlap_thresh)
+    # e1: can match in ANY source (title, passage, or supporting_text)
+    e1_hit = len(e1_toks.intersection(all_toks)) / len(e1_toks) >= overlap_thresh
 
     if not e1_hit: return False, "E1_MISSING"
 
-    # e2: NOW can also match in title OR text (symmetric with e1)
-    e2_hit = (len(e2_toks.intersection(ttl_toks)) / len(e2_toks) >= overlap_thresh) or \
-             (len(e2_toks.intersection(txt_toks)) / len(e2_toks) >= overlap_thresh)
+    # e2: can match in ANY source (symmetric with e1)
+    e2_hit = len(e2_toks.intersection(all_toks)) / len(e2_toks) >= overlap_thresh
     if not e2_hit: return False, "E2_MISSING"
 
     return True, "OK_TOKEN_OVERLAP"
@@ -223,7 +235,7 @@ def compute_sigma_label(item):
     if ft.startswith("BRIDGE_HOP") or ft == "BRIDGE":
         e1 = tpl.get("entity1", "")
         be = tpl.get("bridge_entity") or tpl.get("entity2") or ""
-        return check_bridge_sigma_ok(passage, title, e1, be)
+        return check_bridge_sigma_ok(passage, title, e1, be, sup_text)
         
     if ft == "CAUSAL":
         return check_causal_sigma(passage, sup_text)
