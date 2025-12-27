@@ -158,14 +158,15 @@ class SelectionConditionalCalibrator:
         self.temp_data = []
 
     def get_p_value(self, score: float, facet_type: str, text_length: int) -> float:
-        """Get p-value with robust fallback to 'all' bucket.
+        """
+        Get p-value with robust fallback.
 
-        NEVER raises - returns 1.0 (fail-closed) if no calibration data.
+        NEVER raises. Fail-closed returns 1.0 if no calibration data.
         """
         import os
         debug = os.environ.get("TRIDENT_DEBUG_PVALUE", "0") == "1"
 
-        # Canonicalize facet_type (BRIDGE_HOP1/2/3 -> BRIDGE_HOP)
+        # Canonicalize facet_type (BRIDGE_HOP1/2/.../BRIDGE -> BRIDGE_HOP)
         original_ft = facet_type
         if facet_type.startswith("BRIDGE_HOP") or facet_type == "BRIDGE":
             facet_type = "BRIDGE_HOP"
@@ -173,52 +174,41 @@ class SelectionConditionalCalibrator:
         ft_bins = self.bins.get(facet_type)
         if not ft_bins:
             if debug:
-                print(f"[PVALUE DEBUG] NO BINS for {original_ft}→{facet_type}, "
-                      f"available={list(self.bins.keys())} → p=1.0")
-            return 1.0  # Fail-closed, don't raise
-
-        neg_scores = None
-
-        # Try conditioned buckets first (if mondrian enabled)
-        if self.use_mondrian:
-            thresh = self.thresholds.get(facet_type)
-            if thresh is not None:
-                key = "short" if text_length <= thresh else "long"
-                neg_scores = ft_bins.get(key)
-                if debug and neg_scores:
-                    print(f"[PVALUE DEBUG] Using {key} bucket for {facet_type}, n={len(neg_scores)}")
-
-        # Fallback 1: try combining short+long if both exist
-        if not neg_scores:
-            s = ft_bins.get("short", [])
-            l = ft_bins.get("long", [])
-            if s or l:
-                neg_scores = sorted(s + l)
-                if debug and neg_scores:
-                    print(f"[PVALUE DEBUG] Using combined short+long for {facet_type}, n={len(neg_scores)}")
-
-        # Fallback 2: try "all" bucket (CRITICAL - this is what calibrator usually saves)
-        if not neg_scores:
-            neg_scores = ft_bins.get("all")
-            if debug and neg_scores:
-                print(f"[PVALUE DEBUG] Using 'all' bucket for {facet_type}, n={len(neg_scores)}")
-
-        # Final check
-        if not neg_scores:
-            if debug:
-                print(f"[PVALUE DEBUG] NO DATA for {facet_type}, keys={list(ft_bins.keys())}")
+                print(f"[PVALUE DEBUG] NO_FT_BINS original_ft={original_ft} canon_ft={facet_type} "
+                      f"available={list(self.bins.keys())} -> p=1.0")
             return 1.0
 
+        # Prefer "all" as stable fallback (this is what calibrator usually saves)
+        neg_scores = None
+        if "all" in ft_bins and ft_bins["all"]:
+            neg_scores = ft_bins["all"]
+
+        # Otherwise fall back to any known partitions that exist
+        if neg_scores is None:
+            short = ft_bins.get("short", [])
+            long = ft_bins.get("long", [])
+            if short or long:
+                neg_scores = sorted(list(short) + list(long))
+
+        if not neg_scores:
+            if debug:
+                print(f"[PVALUE DEBUG] EMPTY_BINS ft={facet_type} keys={list(ft_bins.keys())} -> p=1.0")
+            return 1.0
+
+        # p-value computation (empirical right-tail)
         import bisect
-        idx = bisect.bisect_left(neg_scores, score)
-        count_ge = len(neg_scores) - idx
-        p_value = (1.0 + count_ge) / (len(neg_scores) + 1.0)
+        neg_scores_sorted = neg_scores if isinstance(neg_scores, list) else list(neg_scores)
+        neg_scores_sorted.sort()
+
+        n = len(neg_scores_sorted)
+        idx = bisect.bisect_left(neg_scores_sorted, score)
+        ge = n - idx
+        p = (ge + 1.0) / (n + 1.0)
 
         if debug:
-            print(f"[PVALUE DEBUG] HIT facet_type={facet_type}, score={score:.4f}, "
-                  f"n_bin={len(neg_scores)}, p_value={p_value:.4f}")
-
-        return p_value
+            print(f"[PVALUE DEBUG] HIT ft={facet_type} (orig={original_ft}) n={n} score={score:.4f} p={p:.6f} "
+                  f"keys={list(ft_bins.keys())}")
+        return float(p)
 
     def to_dict(self) -> Dict:
         return {

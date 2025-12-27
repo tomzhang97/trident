@@ -51,7 +51,9 @@
     "use_mondrian": true,
     "n_min": 25,
     "facet_types": ["ENTITY", "RELATION", "TEMPORAL", "NUMERIC", "BRIDGE_HOP"],
-    "pvalue_mode": "deterministic"
+    "pvalue_mode": "deterministic",
+    "length_buckets": null,
+    "retriever_score_buckets": null
   },
   "evaluation": {
     "metrics": ["em", "f1", "support_em", "faithfulness"],
