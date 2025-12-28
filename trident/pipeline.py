@@ -29,8 +29,10 @@ from .bwk import BwKController
 from .chain_builder import (
     build_chain_from_certified,
     build_chain_prompt,
+    build_certificate_aware_prompt,
     extract_grounded_answer,
     regex_extract_answer_from_hop2,
+    typed_extract_from_winning_passage,
     ReasoningChain
 )
 
@@ -501,46 +503,74 @@ class TridentPipeline:
         else:
             raise ValueError(f"Unknown mode: {mode}")
         
-        # Step 5: Generate answer using chain-based reasoning
-        # CRITICAL: Use only certified passages, build explicit multi-hop chain
+        # Step 5: Generate answer using CERTIFICATE-AWARE reasoning
+        # CRITICAL: Use the passages that actually certified each facet!
+        # The "winning" passage per facet is identified from certificates.
         answer = ""
         chain = None
         is_grounded = False
         used_regex_fallback = False
+        relation_info = None  # Track the RELATION-winning passage for typed fallback
 
         if not result['abstained'] and result['selected_passages']:
-            # Build reasoning chain from certified passages
-            chain = build_chain_from_certified(
-                certified_passages=result['selected_passages'],
-                question=query,
-                facets=[f.to_dict() for f in facets],
-                certificates=result.get('certificates')
-            )
-
             debug_chain = os.environ.get("TRIDENT_DEBUG_CHAIN", "0") == "1"
-            if debug_chain and chain:
-                print(f"\n[CHAIN DEBUG] Built chain:")
-                print(f"  Bridge entity: {chain.bridge_entity}")
-                print(f"  Hop1: {chain.hop1.passage_text[:100]}...")
-                print(f"  Hop2: {chain.hop2.passage_text[:100]}...")
-                print(f"  Score: {chain.score}")
+            facet_dicts = [f.to_dict() for f in facets]
+            certificates = result.get('certificates', [])
+            prompt = ""  # Initialize prompt
+            prompt_type = "none"  # Track which prompt type was used
 
-            if chain:
-                # Use chain-based prompt for structured reasoning
-                prompt = build_chain_prompt(
+            # PRIORITY 1: Use certificate-aware prompt (uses the actual winning passages)
+            if certificates:
+                prompt, relation_info = build_certificate_aware_prompt(
                     question=query,
-                    chain=chain,
-                    facets=[f.to_dict() for f in facets]
+                    certificates=certificates,
+                    passages=result['selected_passages'],
+                    facets=facet_dicts
                 )
-            else:
-                # Fallback to regular prompt if chain building fails
+                if prompt:
+                    prompt_type = "certificate_aware"
+                if debug_chain and relation_info:
+                    print(f"\n[CERT-AWARE DEBUG] Using certificate-aware prompt:")
+                    print(f"  RELATION-winning passage: {relation_info['passage_id'][:12]}...")
+                    print(f"  RELATION-winning p-value: {relation_info['p_value']:.4g}")
+                    print(f"  RELATION passage text: {relation_info['passage'].get('text', '')[:100]}...")
+
+            # FALLBACK: If no certificate-aware prompt, try chain-based approach
+            if not prompt:
+                # Build reasoning chain from certified passages
+                chain = build_chain_from_certified(
+                    certified_passages=result['selected_passages'],
+                    question=query,
+                    facets=facet_dicts,
+                    certificates=certificates
+                )
+
+                if debug_chain and chain:
+                    print(f"\n[CHAIN DEBUG] Built chain (fallback):")
+                    print(f"  Bridge entity: {chain.bridge_entity}")
+                    print(f"  Hop1: {chain.hop1.passage_text[:100]}...")
+                    print(f"  Hop2: {chain.hop2.passage_text[:100]}...")
+                    print(f"  Score: {chain.score}")
+
+                if chain:
+                    # Use chain-based prompt for structured reasoning
+                    prompt = build_chain_prompt(
+                        question=query,
+                        chain=chain,
+                        facets=facet_dicts
+                    )
+                    prompt_type = "chain_based"
+
+            # FINAL FALLBACK: Regular prompt if nothing else works
+            if not prompt:
                 dataset_name = getattr(self.config.evaluation, 'dataset', 'multi-hop QA')
                 prompt = self.llm.build_multi_hop_prompt(
                     question=query,
                     passages=result['selected_passages'],
-                    facets=[f.to_dict() for f in facets],
+                    facets=facet_dicts,
                     dataset=dataset_name
                 )
+                prompt_type = "regular"
 
             llm_output = self.llm.generate(prompt)
             raw_answer = llm_output.text
@@ -548,14 +578,20 @@ class TridentPipeline:
             # Extract and clean the final answer
             answer = extract_final_answer(raw_answer, query)
 
-            # GROUNDED EXTRACTION: Verify answer is in hop2 passage
-            if chain and answer:
+            # GROUNDED EXTRACTION: Verify answer is in the RELATION-winning passage (or hop2)
+            grounding_text = None
+            if relation_info:
+                grounding_text = relation_info['passage'].get('text', '')
+            elif chain:
+                grounding_text = chain.hop2.passage_text
+
+            if grounding_text and answer:
                 grounded_answer, is_grounded = extract_grounded_answer(
                     llm_answer=answer,
-                    hop2_text=chain.hop2.passage_text
+                    hop2_text=grounding_text
                 )
                 if debug_chain:
-                    print(f"[CHAIN DEBUG] Grounding check:")
+                    print(f"[GROUNDING DEBUG] Grounding check:")
                     print(f"  Raw answer: {answer[:100]}...")
                     print(f"  Grounded: {is_grounded}")
                     if is_grounded:
@@ -565,19 +601,33 @@ class TridentPipeline:
                 if is_grounded:
                     answer = grounded_answer
 
-            # REGEX FALLBACK: If model abstains even with certified evidence,
-            # try deterministic extraction from hop2 (still grounded)
-            if chain and (answer == ABSTAIN_STR or _is_abstain_answer(answer)):
-                fb = regex_extract_answer_from_hop2(
-                    question=query,
-                    facets=[f.to_dict() for f in facets],
-                    hop2_text=chain.hop2.passage_text
-                )
+            # TYPED FALLBACK: If model abstains even with certified evidence,
+            # use typed extraction from the RELATION-winning passage (not arbitrary hop2!)
+            if answer == ABSTAIN_STR or _is_abstain_answer(answer):
+                fb = None
+
+                # PRIORITY 1: Typed extraction from RELATION-winning passage
+                if relation_info:
+                    fb = typed_extract_from_winning_passage(
+                        question=query,
+                        relation_info=relation_info
+                    )
+                    if debug_chain and fb:
+                        print(f"[TYPED FALLBACK DEBUG] Extracted from RELATION-winning passage:")
+                        print(f"  Extracted answer: {fb}")
+
+                # FALLBACK: Old regex extraction from hop2 (less accurate)
+                if not fb and chain:
+                    fb = regex_extract_answer_from_hop2(
+                        question=query,
+                        facets=facet_dicts,
+                        hop2_text=chain.hop2.passage_text
+                    )
+                    if debug_chain and fb:
+                        print(f"[REGEX FALLBACK DEBUG] Extracted from hop2 (less reliable):")
+                        print(f"  Extracted answer: {fb}")
+
                 if fb:
-                    if debug_chain:
-                        print(f"[CHAIN DEBUG] Regex fallback triggered:")
-                        print(f"  LLM abstained with: {answer[:50]}...")
-                        print(f"  Regex extracted: {fb}")
                     answer = fb
                     is_grounded = True
                     used_regex_fallback = True
@@ -602,6 +652,7 @@ class TridentPipeline:
             total_tokens = 0
             prompt_tokens = 0
             completion_tokens = 0
+            prompt_type = "none"
         
         # Calculate total latency
         latency_ms = (time.time() - start_time) * 1000
@@ -620,7 +671,12 @@ class TridentPipeline:
             'total_tokens': total_tokens,
             'overhead_tokens': max(total_tokens - evidence_tokens, 0),
             'model_abstained': model_abstained,  # Track when model says "I cannot answer"
-            # Chain-based reasoning metrics
+            # Prompt type tracking (certificate_aware > chain_based > regular > none)
+            'prompt_type': prompt_type,
+            # Certificate-aware reasoning metrics
+            'relation_winning_passage': relation_info['passage_id'] if relation_info else None,
+            'relation_winning_pvalue': relation_info['p_value'] if relation_info else None,
+            # Chain-based reasoning metrics (fallback)
             'chain_built': chain is not None,
             'chain_score': chain.score if chain else 0.0,
             'bridge_entity': chain.bridge_entity if chain else None,
