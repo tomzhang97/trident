@@ -34,6 +34,12 @@ from .chain_builder import (
     regex_extract_answer_from_hop2,
     typed_extract_from_winning_passage,
     bind_entity_from_hop1_winner,
+    # Certified Span Selection (CSS) - general, relation-agnostic extraction
+    certified_span_select,
+    bind_entity_via_css,
+    build_inner_question_from_facet,
+    get_winner_passages_only,
+    CSSResult,
     ReasoningChain
 )
 
@@ -526,25 +532,70 @@ class TridentPipeline:
         else:
             raise ValueError(f"Unknown mode: {mode}")
         
-        # Step 5: Generate answer using CERTIFICATE-AWARE reasoning
-        # CRITICAL: Use the passages that actually certified each facet!
-        # The "winning" passage per facet is identified from certificates.
+        # Step 5: Generate answer using CERTIFIED SPAN SELECTION (CSS)
+        # CRITICAL: Use only certificate-winning passages, require verbatim grounding.
+        # This is general, relation-agnostic, and auditable.
         answer = ""
         chain = None
         is_grounded = False
         used_regex_fallback = False
+        used_css = False  # Track if CSS was used
+        css_result = None  # Track CSS result for metrics
         relation_info = None  # Track the RELATION-winning passage for typed fallback
         facet_id_map = {}  # Track all facet_id -> winning passage mappings
         prompt_type = "none"  # Track which prompt type was used
 
         if not result['abstained'] and result['selected_passages']:
             debug_chain = os.environ.get("TRIDENT_DEBUG_CHAIN", "0") == "1"
+            debug_css = os.environ.get("TRIDENT_DEBUG_CSS", "0") == "1"
             facet_dicts = [f.to_dict() for f in facets]
             certificates = result.get('certificates', [])
             prompt = ""  # Initialize prompt
 
-            # PRIORITY 1: Use certificate-aware prompt (uses the actual winning passages)
+            # ================================================================
+            # PRIORITY 0: Certified Span Selection (CSS)
+            # ================================================================
+            # Use only certificate-winning passages, require exact substring.
+            # This is the most reliable and auditable extraction method.
             if certificates:
+                winner_passages = get_winner_passages_only(
+                    certificates,
+                    result['selected_passages']
+                )
+
+                if debug_chain or debug_css:
+                    print(f"\n[CSS] Attempting Certified Span Selection")
+                    print(f"  Winner passages: {len(winner_passages)}")
+                    for wp in winner_passages[:3]:
+                        print(f"    - {wp.get('pid', '')[:12]}... ({len(wp.get('text', ''))} chars)")
+
+                if winner_passages:
+                    css_result = certified_span_select(
+                        llm=self.llm,
+                        question=query,
+                        winner_passages=winner_passages,
+                        max_chars_per_passage=800
+                    )
+
+                    if not css_result.abstain:
+                        answer = css_result.answer
+                        is_grounded = True
+                        used_css = True
+                        prompt_type = "css"
+
+                        if debug_chain or debug_css:
+                            print(f"[CSS] Success: '{answer[:50]}...' from {css_result.passage_id}")
+                            print(f"[CSS] Reason: {css_result.reason}, Confidence: {css_result.confidence}")
+                    else:
+                        if debug_chain or debug_css:
+                            print(f"[CSS] Abstained: {css_result.reason}")
+                            if css_result.answer:
+                                print(f"[CSS] Attempted answer: '{css_result.answer[:50]}...'")
+
+            # ================================================================
+            # FALLBACK: Certificate-aware prompting (if CSS abstains)
+            # ================================================================
+            if not answer and certificates:
                 prompt, relation_info, facet_id_map = build_certificate_aware_prompt(
                     question=query,
                     certificates=certificates,
@@ -561,71 +612,75 @@ class TridentPipeline:
                         print(f"  RELATION-winning p-value: {relation_info['p_value']:.4g}")
                         print(f"  RELATION passage text: {relation_info['passage'].get('text', '')[:100]}...")
 
-            # FALLBACK: If no certificate-aware prompt, try chain-based approach
-            if not prompt:
-                # Build reasoning chain from certified passages
-                chain = build_chain_from_certified(
-                    certified_passages=result['selected_passages'],
-                    question=query,
-                    facets=facet_dicts,
-                    certificates=certificates
-                )
-
-                if debug_chain and chain:
-                    print(f"\n[CHAIN DEBUG] Built chain (fallback):")
-                    print(f"  Bridge entity: {chain.bridge_entity}")
-                    print(f"  Hop1: {chain.hop1.passage_text[:100]}...")
-                    print(f"  Hop2: {chain.hop2.passage_text[:100]}...")
-                    print(f"  Score: {chain.score}")
-
-                if chain:
-                    # Use chain-based prompt for structured reasoning
-                    prompt = build_chain_prompt(
+            # ================================================================
+            # FALLBACK PATH: Only if CSS didn't produce an answer
+            # ================================================================
+            if not answer:
+                # FALLBACK: If no certificate-aware prompt, try chain-based approach
+                if not prompt:
+                    # Build reasoning chain from certified passages
+                    chain = build_chain_from_certified(
+                        certified_passages=result['selected_passages'],
                         question=query,
-                        chain=chain,
-                        facets=facet_dicts
+                        facets=facet_dicts,
+                        certificates=certificates
                     )
-                    prompt_type = "chain_based"
 
-            # FINAL FALLBACK: Regular prompt if nothing else works
-            if not prompt:
-                dataset_name = getattr(self.config.evaluation, 'dataset', 'multi-hop QA')
-                prompt = self.llm.build_multi_hop_prompt(
-                    question=query,
-                    passages=result['selected_passages'],
-                    facets=facet_dicts,
-                    dataset=dataset_name
-                )
-                prompt_type = "regular"
+                    if debug_chain and chain:
+                        print(f"\n[CHAIN DEBUG] Built chain (fallback):")
+                        print(f"  Bridge entity: {chain.bridge_entity}")
+                        print(f"  Hop1: {chain.hop1.passage_text[:100]}...")
+                        print(f"  Hop2: {chain.hop2.passage_text[:100]}...")
+                        print(f"  Score: {chain.score}")
 
-            llm_output = self.llm.generate(prompt)
-            raw_answer = llm_output.text
+                    if chain:
+                        # Use chain-based prompt for structured reasoning
+                        prompt = build_chain_prompt(
+                            question=query,
+                            chain=chain,
+                            facets=facet_dicts
+                        )
+                        prompt_type = "chain_based"
 
-            # Extract and clean the final answer
-            answer = extract_final_answer(raw_answer, query)
+                # FINAL FALLBACK: Regular prompt if nothing else works
+                if not prompt:
+                    dataset_name = getattr(self.config.evaluation, 'dataset', 'multi-hop QA')
+                    prompt = self.llm.build_multi_hop_prompt(
+                        question=query,
+                        passages=result['selected_passages'],
+                        facets=facet_dicts,
+                        dataset=dataset_name
+                    )
+                    prompt_type = "regular"
 
-            # GROUNDED EXTRACTION: Verify answer is in the RELATION-winning passage (or hop2)
-            grounding_text = None
-            if relation_info:
-                grounding_text = relation_info['passage'].get('text', '')
-            elif chain:
-                grounding_text = chain.hop2.passage_text
+                llm_output = self.llm.generate(prompt)
+                raw_answer = llm_output.text
 
-            if grounding_text and answer:
-                grounded_answer, is_grounded = extract_grounded_answer(
-                    llm_answer=answer,
-                    hop2_text=grounding_text
-                )
-                if debug_chain:
-                    print(f"[GROUNDING DEBUG] Grounding check:")
-                    print(f"  Raw answer: {answer[:100]}...")
-                    print(f"  Grounded: {is_grounded}")
+                # Extract and clean the final answer
+                answer = extract_final_answer(raw_answer, query)
+
+                # GROUNDED EXTRACTION: Verify answer is in the RELATION-winning passage (or hop2)
+                grounding_text = None
+                if relation_info:
+                    grounding_text = relation_info['passage'].get('text', '')
+                elif chain:
+                    grounding_text = chain.hop2.passage_text
+
+                if grounding_text and answer:
+                    grounded_answer, is_grounded = extract_grounded_answer(
+                        llm_answer=answer,
+                        hop2_text=grounding_text
+                    )
+                    if debug_chain:
+                        print(f"[GROUNDING DEBUG] Grounding check:")
+                        print(f"  Raw answer: {answer[:100]}...")
+                        print(f"  Grounded: {is_grounded}")
+                        if is_grounded:
+                            print(f"  Grounded answer: {grounded_answer[:100]}...")
+
+                    # Use grounded answer if found
                     if is_grounded:
-                        print(f"  Grounded answer: {grounded_answer[:100]}...")
-
-                # Use grounded answer if found
-                if is_grounded:
-                    answer = grounded_answer
+                        answer = grounded_answer
 
             # ANSWER VALIDATION: Check for garbage answers even with certified evidence
             # LLM can still output: empty, underscores, partial clauses, instruction text
@@ -707,16 +762,29 @@ class TridentPipeline:
                 if os.environ.get("TRIDENT_DEBUG_EMPTY_ANSWER", "0") == "1":
                     print(f"\n[EMPTY ANSWER DEBUG]")
                     print(f"  Query: {query[:100]}...")
-                    print(f"  Prompt (last 300 chars): ...{prompt[-300:]}")
-                    print(f"  Raw LLM output ({len(raw_answer)} chars): {raw_answer[:500]}...")
+                    if prompt:
+                        print(f"  Prompt (last 300 chars): ...{prompt[-300:]}")
+                    print(f"  Used CSS: {used_css}")
+                    if css_result:
+                        print(f"  CSS result: abstain={css_result.abstain}, reason={css_result.reason}")
                     print(f"  Extracted answer: '{answer}'")
                     print(f"  Mode: {mode}")
                     print(f"  Num passages: {len(result['selected_passages'])}")
-                    print(f"  Chain built: {chain is not None}")
 
-            total_tokens = llm_output.tokens_used
-            prompt_tokens = self.llm.compute_token_cost(prompt)
-            completion_tokens = max(total_tokens - prompt_tokens, 0)
+            # Compute token usage
+            if used_css:
+                # CSS uses a single LLM call with structured output
+                total_tokens = 0  # CSS token usage is internal to the call
+                prompt_tokens = 0
+                completion_tokens = 0
+            elif prompt:
+                total_tokens = llm_output.tokens_used
+                prompt_tokens = self.llm.compute_token_cost(prompt)
+                completion_tokens = max(total_tokens - prompt_tokens, 0)
+            else:
+                total_tokens = 0
+                prompt_tokens = 0
+                completion_tokens = 0
         else:
             answer = "ABSTAINED" if result['abstained'] else ""
             total_tokens = 0
@@ -741,9 +809,14 @@ class TridentPipeline:
             'total_tokens': total_tokens,
             'overhead_tokens': max(total_tokens - evidence_tokens, 0),
             'model_abstained': model_abstained,  # Track when model says "I cannot answer"
-            # Prompt type tracking (certificate_aware > chain_based > regular > none)
+            # Extraction method tracking (css > certificate_aware > chain_based > regular > none)
             'prompt_type': prompt_type,
-            # Certificate-aware reasoning metrics
+            # Certified Span Selection (CSS) metrics - primary extraction method
+            'used_css': used_css,
+            'css_reason': css_result.reason if css_result else None,
+            'css_confidence': css_result.confidence if css_result else None,
+            'css_passage_id': css_result.passage_id if css_result else None,
+            # Certificate-aware reasoning metrics (fallback)
             'num_certified_facets': len(facet_id_map),
             'relation_winning_passage': relation_info['passage_id'] if relation_info else None,
             'relation_winning_pvalue': relation_info['p_value'] if relation_info else None,
@@ -1300,37 +1373,67 @@ class TridentPipeline:
             return hop1_result
 
         # ============================================================
-        # TYPED BINDING: Extract bridge entity from hop-1 winner
+        # CERTIFIED SPAN SELECTION: Bind bridge entity from hop-1 winners
         # ============================================================
+        # Use CSS for relation-agnostic entity binding (no per-relation patterns)
         bound_entity = None
         inner_relation_type = None
+        inner_question = None
 
-        # Find the best hop-1 certificate (lowest p-value)
+        # Get winner passages from hop-1 certificates
         hop1_certs = hop1_result.get('certificates', [])
+        hop1_winners = get_winner_passages_only(
+            hop1_certs,
+            hop1_result.get('selected_passages', [])
+        )
+
+        if debug:
+            print(f"  Hop-1 winners: {len(hop1_winners)} passages")
+
+        # Find the best certified hop-1 facet and build inner question
         hop1_certs_sorted = sorted(hop1_certs, key=lambda c: c.get('p_value', 1.0))
 
         for hop1_cert in hop1_certs_sorted:
-            # Find the corresponding facet to get inner_relation_type
             cert_fid = hop1_cert.get('facet_id', '')
-            cert_pid = hop1_cert.get('passage_id', '')
 
             for f in hop1_facets:
                 if f.facet_id == cert_fid:
+                    # Check if this is a compositional hop-1 facet
                     inner_type = f.template.get('inner_relation_type', '')
-                    if inner_type:
-                        # Find the winning passage
-                        for p in hop1_result.get('selected_passages', []):
-                            if p.get('pid') == cert_pid:
-                                passage_text = p.get('text', '')
-                                bound_entity = bind_entity_from_hop1_winner(inner_type, passage_text)
-                                if bound_entity:
-                                    inner_relation_type = inner_type
-                                    if debug:
-                                        print(f"  Bound entity: {bound_entity} (from {inner_type})")
-                                    break
-                    break
-            if bound_entity:
+                    if inner_type or f.template.get('compositional'):
+                        inner_relation_type = inner_type
+                        # Build inner question from facet template
+                        inner_question = build_inner_question_from_facet(f.to_dict())
+                        if debug:
+                            print(f"  Inner question: {inner_question}")
+                        break
+            if inner_question:
                 break
+
+        # Use CSS to bind entity (general, relation-agnostic)
+        if inner_question and hop1_winners:
+            bound_entity = bind_entity_via_css(
+                llm=self.llm,
+                inner_question=inner_question,
+                hop1_passages=hop1_winners,
+                max_chars=600
+            )
+            if debug:
+                print(f"  Bound entity (CSS): {bound_entity}")
+
+        # Fallback to relation-specific binding if CSS fails
+        if not bound_entity and inner_relation_type:
+            if debug:
+                print(f"  CSS binding failed, trying relation-specific fallback")
+            for p in hop1_winners:
+                bound_entity = bind_entity_from_hop1_winner(
+                    inner_relation_type,
+                    p.get('text', '')
+                )
+                if bound_entity:
+                    if debug:
+                        print(f"  Bound entity (fallback): {bound_entity}")
+                    break
 
         if not bound_entity:
             if debug:

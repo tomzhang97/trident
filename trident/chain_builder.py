@@ -992,3 +992,304 @@ def regex_extract_answer_from_hop2(
                 return m.group(1).strip()
 
     return None
+
+
+# ==============================================================================
+# CERTIFIED SPAN SELECTION (CSS)
+# ==============================================================================
+# General, relation-agnostic answer extraction that requires exact substring
+# grounding in certified evidence. No per-relation regex patterns.
+# ==============================================================================
+
+@dataclass
+class CSSResult:
+    """Result from Certified Span Selection."""
+    abstain: bool
+    answer: str
+    passage_id: str
+    reason: str  # OK, NO_SPAN, SPAN_NOT_VERBATIM, PID_NOT_IN_WINNERS, PARSE_ERROR
+    confidence: float = 0.0
+
+
+def _find_exact_substring(haystack: str, needle: str) -> Optional[Tuple[int, int]]:
+    """Find exact substring match (case-sensitive first, then case-insensitive)."""
+    if not needle or not haystack:
+        return None
+
+    # Try case-sensitive first
+    i = haystack.find(needle)
+    if i >= 0:
+        return (i, i + len(needle))
+
+    # Try case-insensitive
+    i = haystack.lower().find(needle.lower())
+    if i >= 0:
+        return (i, i + len(needle))
+
+    return None
+
+
+def _find_fuzzy_substring(haystack: str, needle: str, max_distance: int = 2) -> Optional[Tuple[int, int, str]]:
+    """
+    Find fuzzy substring match allowing for minor differences.
+
+    Returns (start, end, matched_text) or None.
+    Used as fallback when exact match fails due to punctuation/whitespace differences.
+    """
+    if not needle or not haystack:
+        return None
+
+    # Normalize both strings
+    def normalize(s: str) -> str:
+        s = s.lower().strip()
+        s = re.sub(r'[^\w\s]', '', s)  # Remove punctuation
+        s = ' '.join(s.split())  # Normalize whitespace
+        return s
+
+    needle_norm = normalize(needle)
+    if not needle_norm:
+        return None
+
+    # Sliding window search
+    words = haystack.split()
+    needle_words = needle_norm.split()
+
+    if not needle_words:
+        return None
+
+    for i in range(len(words) - len(needle_words) + 1):
+        window = words[i:i + len(needle_words)]
+        window_norm = [normalize(w) for w in window]
+
+        # Check if normalized words match
+        if window_norm == needle_words:
+            # Find the actual span in the original text
+            start_word = ' '.join(words[:i])
+            matched_text = ' '.join(window)
+            start_pos = len(start_word) + (1 if start_word else 0)
+            return (start_pos, start_pos + len(matched_text), matched_text)
+
+    return None
+
+
+def certified_span_select(
+    llm,
+    question: str,
+    winner_passages: List[Dict[str, Any]],
+    max_chars_per_passage: int = 800
+) -> CSSResult:
+    """
+    Certified Span Selection: Extract answer as exact substring from evidence.
+
+    This is relation-agnostic and requires verbatim grounding.
+
+    Args:
+        llm: LLM interface with generate() method
+        question: The question to answer
+        winner_passages: List of certificate-winning passages [{pid, text, title}, ...]
+        max_chars_per_passage: Max chars to include per passage (for context limits)
+
+    Returns:
+        CSSResult with answer span and verification status
+    """
+    import json as json_module
+    import os
+
+    debug = os.environ.get("TRIDENT_DEBUG_CSS", "0") == "1"
+
+    if not winner_passages:
+        return CSSResult(abstain=True, answer="", passage_id="", reason="NO_PASSAGES")
+
+    # Build compact evidence
+    evidence_parts = []
+    for p in winner_passages:
+        pid = p.get("pid", "")
+        title = p.get("title", "")
+        text = (p.get("text") or "")[:max_chars_per_passage]
+        evidence_parts.append(f"[{pid}] {title}\n{text}")
+
+    evidence_text = "\n\n".join(evidence_parts)
+
+    prompt = f"""You must answer ONLY using the Evidence below.
+Return a JSON object with keys:
+  "pid": string, the evidence passage id you copied from
+  "answer": string, an EXACT substring copied verbatim from that passage
+  "confidence": number between 0 and 1
+
+Rules:
+1) The answer MUST be copied exactly from the evidence text (verbatim).
+2) Copy the shortest complete answer span - usually a name, place, date, or short phrase.
+3) If you cannot find an exact answer substring, output: {{"pid": "", "answer": "", "confidence": 0}}
+
+Question: {question}
+
+Evidence:
+{evidence_text}
+
+JSON:"""
+
+    try:
+        raw = llm.generate(prompt)
+        raw_text = raw.text if hasattr(raw, 'text') else str(raw)
+    except Exception as e:
+        if debug:
+            print(f"[CSS] LLM generation failed: {e}")
+        return CSSResult(abstain=True, answer="", passage_id="", reason="LLM_ERROR")
+
+    if debug:
+        print(f"[CSS] Raw LLM output: {raw_text[:200]}...")
+
+    # Parse JSON response
+    try:
+        # Try to find JSON object in response
+        json_match = re.search(r'\{[^{}]*\}', raw_text, flags=re.DOTALL)
+        if json_match:
+            out = json_module.loads(json_match.group(0))
+        else:
+            out = json_module.loads(raw_text.strip())
+    except Exception as e:
+        if debug:
+            print(f"[CSS] JSON parse failed: {e}")
+        return CSSResult(abstain=True, answer="", passage_id="", reason="PARSE_ERROR")
+
+    pid = (out.get("pid") or "").strip()
+    answer = (out.get("answer") or "").strip()
+    confidence = float(out.get("confidence", 0))
+
+    if debug:
+        print(f"[CSS] Parsed: pid={pid}, answer={answer[:50]}..., conf={confidence}")
+
+    # Check for empty response (LLM abstention)
+    if not pid or not answer:
+        return CSSResult(abstain=True, answer="", passage_id=pid, reason="NO_SPAN", confidence=confidence)
+
+    # Verify passage ID is in winners
+    passage_map = {p.get("pid", ""): p for p in winner_passages}
+    if pid not in passage_map:
+        if debug:
+            print(f"[CSS] PID {pid} not in winners: {list(passage_map.keys())}")
+        return CSSResult(abstain=True, answer=answer, passage_id=pid, reason="PID_NOT_IN_WINNERS", confidence=confidence)
+
+    # Verify exact grounding
+    passage_text = passage_map[pid].get("text", "")
+
+    # Try exact match first
+    match = _find_exact_substring(passage_text, answer)
+    if match is not None:
+        if debug:
+            print(f"[CSS] Exact match found at {match}")
+        return CSSResult(abstain=False, answer=answer, passage_id=pid, reason="OK", confidence=confidence)
+
+    # Try fuzzy match as fallback
+    fuzzy = _find_fuzzy_substring(passage_text, answer)
+    if fuzzy is not None:
+        start, end, matched_text = fuzzy
+        if debug:
+            print(f"[CSS] Fuzzy match: '{answer}' -> '{matched_text}'")
+        # Return the actual text from passage (properly grounded)
+        return CSSResult(abstain=False, answer=matched_text, passage_id=pid, reason="OK_FUZZY", confidence=confidence)
+
+    if debug:
+        print(f"[CSS] No match found for '{answer}' in passage")
+    return CSSResult(abstain=True, answer=answer, passage_id=pid, reason="SPAN_NOT_VERBATIM", confidence=confidence)
+
+
+def bind_entity_via_css(
+    llm,
+    inner_question: str,
+    hop1_passages: List[Dict[str, Any]],
+    max_chars: int = 600
+) -> Optional[str]:
+    """
+    Generic entity binding using Certified Span Selection.
+
+    This replaces relation-specific binding (bind_entity_from_hop1_winner).
+    The inner_question is built from the hop1 facet template.
+
+    Example:
+        inner_question: "Who is the director of Polish-Russian War (film)?"
+        Returns: "Xawery Żuławski" (verbatim from passage)
+
+    Args:
+        llm: LLM interface
+        inner_question: The hop-1 question asking for the bridge entity
+        hop1_passages: Certificate-winning passages from hop-1
+        max_chars: Max chars per passage
+
+    Returns:
+        The bound entity string, or None if binding failed
+    """
+    result = certified_span_select(
+        llm=llm,
+        question=inner_question,
+        winner_passages=hop1_passages,
+        max_chars_per_passage=max_chars
+    )
+
+    if result.abstain:
+        return None
+
+    return result.answer
+
+
+def build_inner_question_from_facet(facet: Dict[str, Any]) -> str:
+    """
+    Build the inner question from a hop-1 facet for entity binding.
+
+    Example facet template:
+        {"subject": "Who", "predicate": "is the director of", "object": "Polish-Russian War"}
+
+    Returns:
+        "Who is the director of Polish-Russian War?"
+    """
+    template = facet.get("template", {})
+    subject = template.get("subject", "Who")
+    predicate = template.get("predicate", "")
+    obj = template.get("object", "")
+
+    # Build natural question
+    question = f"{subject} {predicate} {obj}".strip()
+
+    # Ensure it ends with question mark
+    if not question.endswith("?"):
+        question += "?"
+
+    return question
+
+
+def get_winner_passages_only(
+    certificates: List[Dict[str, Any]],
+    passages: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Extract only the certificate-winning passages (deduplicated).
+
+    This is the minimal set needed for CSS - no extra passages.
+
+    Args:
+        certificates: List of certificates with passage_id
+        passages: List of all selected passages
+
+    Returns:
+        List of unique winning passages (ordered by certificate p-value)
+    """
+    if not certificates:
+        return []
+
+    # Build passage lookup
+    pid_to_passage = {p.get("pid", ""): p for p in passages}
+
+    # Sort certificates by p-value (best first)
+    sorted_certs = sorted(certificates, key=lambda c: c.get("p_value", 1.0))
+
+    # Collect unique winning passages
+    seen_pids = set()
+    winners = []
+
+    for cert in sorted_certs:
+        pid = cert.get("passage_id", "")
+        if pid and pid not in seen_pids and pid in pid_to_passage:
+            seen_pids.add(pid)
+            winners.append(pid_to_passage[pid])
+
+    return winners
