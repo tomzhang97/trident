@@ -511,17 +511,18 @@ class TridentPipeline:
         is_grounded = False
         used_regex_fallback = False
         relation_info = None  # Track the RELATION-winning passage for typed fallback
+        facet_id_map = {}  # Track all facet_id -> winning passage mappings
+        prompt_type = "none"  # Track which prompt type was used
 
         if not result['abstained'] and result['selected_passages']:
             debug_chain = os.environ.get("TRIDENT_DEBUG_CHAIN", "0") == "1"
             facet_dicts = [f.to_dict() for f in facets]
             certificates = result.get('certificates', [])
             prompt = ""  # Initialize prompt
-            prompt_type = "none"  # Track which prompt type was used
 
             # PRIORITY 1: Use certificate-aware prompt (uses the actual winning passages)
             if certificates:
-                prompt, relation_info = build_certificate_aware_prompt(
+                prompt, relation_info, facet_id_map = build_certificate_aware_prompt(
                     question=query,
                     certificates=certificates,
                     passages=result['selected_passages'],
@@ -529,11 +530,13 @@ class TridentPipeline:
                 )
                 if prompt:
                     prompt_type = "certificate_aware"
-                if debug_chain and relation_info:
-                    print(f"\n[CERT-AWARE DEBUG] Using certificate-aware prompt:")
-                    print(f"  RELATION-winning passage: {relation_info['passage_id'][:12]}...")
-                    print(f"  RELATION-winning p-value: {relation_info['p_value']:.4g}")
-                    print(f"  RELATION passage text: {relation_info['passage'].get('text', '')[:100]}...")
+                if debug_chain:
+                    print(f"\n[CERT-AWARE DEBUG] Built certificate-aware prompt:")
+                    print(f"  Facets with winners: {list(facet_id_map.keys())[:5]}...")
+                    if relation_info:
+                        print(f"  RELATION-winning passage: {relation_info['passage_id'][:12]}...")
+                        print(f"  RELATION-winning p-value: {relation_info['p_value']:.4g}")
+                        print(f"  RELATION passage text: {relation_info['passage'].get('text', '')[:100]}...")
 
             # FALLBACK: If no certificate-aware prompt, try chain-based approach
             if not prompt:
@@ -601,9 +604,53 @@ class TridentPipeline:
                 if is_grounded:
                     answer = grounded_answer
 
-            # TYPED FALLBACK: If model abstains even with certified evidence,
-            # use typed extraction from the RELATION-winning passage (not arbitrary hop2!)
-            if answer == ABSTAIN_STR or _is_abstain_answer(answer):
+            # ANSWER VALIDATION: Check for garbage answers even with certified evidence
+            # LLM can still output: empty, underscores, partial clauses, instruction text
+            def _is_garbage_answer(ans: str) -> bool:
+                """Check if answer is garbage (empty, meta, punctuation-only, etc.)."""
+                if not ans or not ans.strip():
+                    return True
+                ans_stripped = ans.strip()
+                # Punctuation/underscore only
+                if re.fullmatch(r"[_\-\s\.\,\!\?\:]+", ans_stripped):
+                    return True
+                # Too short (likely garbage)
+                if len(ans_stripped) < 2:
+                    return True
+                # Looks like meta/instruction text
+                if _looks_like_meta(ans_stripped):
+                    return True
+                # Abstention pattern
+                if _is_abstain_answer(ans_stripped):
+                    return True
+                return False
+
+            def _is_grounded_in_text(ans: str, text: str) -> bool:
+                """Check if answer is a substring of the text (case-insensitive)."""
+                if not ans or not text:
+                    return False
+                return ans.strip().lower() in text.lower()
+
+            # TYPED FALLBACK: If model abstains OR produces garbage, use typed extraction
+            answer_is_invalid = _is_garbage_answer(answer)
+
+            # Extra validation: if we have RELATION-winning passage, check grounding
+            if not answer_is_invalid and relation_info and not is_grounded:
+                rel_text = relation_info['passage'].get('text', '')
+                if rel_text and not _is_grounded_in_text(answer, rel_text):
+                    # Answer not grounded in RELATION-winning passage - suspicious
+                    if debug_chain:
+                        print(f"[VALIDATION DEBUG] Answer not grounded in RELATION-winning passage")
+                        print(f"  Answer: {answer[:50]}...")
+                    # Only mark as invalid if it looks like a partial clause
+                    if len(answer.split()) <= 3 and answer.lower().startswith(('of ', 'the ', 'a ', 'in ')):
+                        answer_is_invalid = True
+
+            if answer_is_invalid:
+                if debug_chain:
+                    print(f"[VALIDATION DEBUG] Answer invalid, triggering typed fallback:")
+                    print(f"  Original answer: {answer[:50]}...")
+
                 fb = None
 
                 # PRIORITY 1: Typed extraction from RELATION-winning passage
@@ -674,6 +721,7 @@ class TridentPipeline:
             # Prompt type tracking (certificate_aware > chain_based > regular > none)
             'prompt_type': prompt_type,
             # Certificate-aware reasoning metrics
+            'num_certified_facets': len(facet_id_map),
             'relation_winning_passage': relation_info['passage_id'] if relation_info else None,
             'relation_winning_pvalue': relation_info['p_value'] if relation_info else None,
             # Chain-based reasoning metrics (fallback)
@@ -681,7 +729,8 @@ class TridentPipeline:
             'chain_score': chain.score if chain else 0.0,
             'bridge_entity': chain.bridge_entity if chain else None,
             'answer_grounded': is_grounded,
-            'answer_from_regex_fallback': used_regex_fallback,
+            'answer_from_typed_fallback': used_regex_fallback and relation_info is not None,
+            'answer_from_regex_fallback': used_regex_fallback and relation_info is None,
         })
 
         return PipelineOutput(

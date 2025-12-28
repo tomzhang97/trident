@@ -449,18 +449,20 @@ def get_winning_passages_from_certificates(
     certificates: List[Dict[str, Any]],
     passages: List[Dict[str, Any]],
     facets: List[Dict[str, Any]]
-) -> Dict[str, Dict[str, Any]]:
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
     """
-    Map facet types to their certificate-winning passages.
+    Map facet_id -> winning passage, plus facet_type -> [winning passages].
 
-    The "winning" passage is the one that certified the facet (lowest p-value).
-    This is the passage that should be used for answer extraction!
+    CRITICAL: Maps by facet_id to preserve all facets (a query can have multiple
+    RELATION or ENTITY facets). Also provides a grouped view by facet_type.
 
     Returns:
-        Dict mapping facet_type -> {'passage': passage_dict, 'facet': facet_dict, 'p_value': float}
+        Tuple of:
+        - facet_id_map: Dict[facet_id -> {'passage', 'facet', 'p_value', 'passage_id', 'facet_id'}]
+        - facet_type_map: Dict[facet_type -> List[winning info dicts]] (stable order by p_value)
     """
     if not certificates:
-        return {}
+        return {}, {}
 
     # Build passage lookup by pid
     pid_to_passage = {p.get('pid', ''): p for p in passages}
@@ -468,8 +470,8 @@ def get_winning_passages_from_certificates(
     # Build facet lookup by facet_id
     fid_to_facet = {f.get('facet_id', ''): f for f in facets}
 
-    # Group certificates by facet type, keeping best (lowest p-value) per type
-    type_to_best: Dict[str, Dict[str, Any]] = {}
+    # Primary map: facet_id -> winning info
+    facet_id_map: Dict[str, Dict[str, Any]] = {}
 
     for cert in certificates:
         fid = cert.get('facet_id', '')
@@ -484,17 +486,30 @@ def get_winning_passages_from_certificates(
 
         ftype = facet.get('facet_type', '')
 
-        # Keep the best (lowest p-value) certificate per facet type
-        if ftype not in type_to_best or p_val < type_to_best[ftype]['p_value']:
-            type_to_best[ftype] = {
+        # Only keep best certificate per facet_id (in case of duplicates)
+        if fid not in facet_id_map or p_val < facet_id_map[fid]['p_value']:
+            facet_id_map[fid] = {
                 'passage': passage,
                 'facet': facet,
                 'p_value': p_val,
                 'passage_id': pid,
-                'facet_id': fid
+                'facet_id': fid,
+                'facet_type': ftype
             }
 
-    return type_to_best
+    # Derived map: facet_type -> [winning info dicts] (sorted by p_value)
+    facet_type_map: Dict[str, List[Dict[str, Any]]] = {}
+    for info in facet_id_map.values():
+        ftype = info['facet_type']
+        if ftype not in facet_type_map:
+            facet_type_map[ftype] = []
+        facet_type_map[ftype].append(info)
+
+    # Sort each list by p_value (best first)
+    for ftype in facet_type_map:
+        facet_type_map[ftype].sort(key=lambda x: x['p_value'])
+
+    return facet_id_map, facet_type_map
 
 
 def build_certificate_aware_prompt(
@@ -502,33 +517,40 @@ def build_certificate_aware_prompt(
     certificates: List[Dict[str, Any]],
     passages: List[Dict[str, Any]],
     facets: List[Dict[str, Any]]
-) -> Tuple[str, Optional[Dict[str, Any]]]:
+) -> Tuple[str, Optional[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     """
     Build a prompt using the certificate-winning passages.
 
     CRITICAL: Uses the passages that actually certified each facet,
-    not arbitrary chain hops based on entity overlap.
+    not arbitrary chain hops based on entity overlap. Includes ALL
+    winning passages (not just one per facet type).
 
     Returns:
-        Tuple of (prompt_string, relation_winning_info) where relation_winning_info
-        contains the passage that certified the RELATION facet (the answer source).
+        Tuple of:
+        - prompt_string: The constructed prompt
+        - relation_winning_info: The best RELATION facet winner (for typed extraction)
+        - facet_id_map: Complete facet_id -> winning info map (for debugging/validation)
     """
-    winning = get_winning_passages_from_certificates(certificates, passages, facets)
+    facet_id_map, facet_type_map = get_winning_passages_from_certificates(
+        certificates, passages, facets
+    )
 
-    if not winning:
+    if not facet_id_map:
         # Fallback: no certificates, can't build certificate-aware prompt
-        return "", None
+        return "", None, {}
 
-    # Get the RELATION-winning passage (this is the answer source!)
-    relation_info = winning.get('RELATION')
-    entity_info = winning.get('ENTITY')
+    # Get ALL RELATION-winning passages (sorted by p_value, best first)
+    relation_winners = facet_type_map.get('RELATION', [])
+    entity_winners = facet_type_map.get('ENTITY', [])
 
     # Also check for BRIDGE_HOP types
-    bridge_info = None
+    bridge_winners = []
     for ftype in ['BRIDGE_HOP', 'BRIDGE_HOP1', 'BRIDGE_HOP2']:
-        if ftype in winning:
-            bridge_info = winning[ftype]
-            break
+        if ftype in facet_type_map:
+            bridge_winners.extend(facet_type_map[ftype])
+
+    # The best RELATION winner (lowest p-value) is the primary answer source
+    best_relation_info = relation_winners[0] if relation_winners else None
 
     prompt_parts = []
     prompt_parts.append("Answer the following question using ONLY the provided certified evidence.")
@@ -537,15 +559,15 @@ def build_certificate_aware_prompt(
     prompt_parts.append(f"Question: {question}")
     prompt_parts.append("")
 
-    # Include passages in order: ENTITY first (context), then RELATION (answer source)
+    # Include ALL winning passages (deduplicated by pid)
     seen_pids = set()
     passage_num = 1
 
-    # ENTITY passage (context/hop1)
-    if entity_info:
-        p = entity_info['passage']
+    # ENTITY passages first (context)
+    for info in entity_winners:
+        p = info['passage']
         pid = p.get('pid', '')
-        if pid not in seen_pids:
+        if pid and pid not in seen_pids:
             seen_pids.add(pid)
             title = p.get('title', '')
             text = p.get('text', '')
@@ -556,11 +578,11 @@ def build_certificate_aware_prompt(
             prompt_parts.append("")
             passage_num += 1
 
-    # BRIDGE passage (if different from ENTITY)
-    if bridge_info:
-        p = bridge_info['passage']
+    # BRIDGE passages (if different from ENTITY)
+    for info in bridge_winners:
+        p = info['passage']
         pid = p.get('pid', '')
-        if pid not in seen_pids:
+        if pid and pid not in seen_pids:
             seen_pids.add(pid)
             title = p.get('title', '')
             text = p.get('text', '')
@@ -571,33 +593,35 @@ def build_certificate_aware_prompt(
             prompt_parts.append("")
             passage_num += 1
 
-    # RELATION passage (answer source - MOST IMPORTANT!)
-    if relation_info:
-        p = relation_info['passage']
+    # RELATION passages (answer sources - MOST IMPORTANT!)
+    for i, info in enumerate(relation_winners):
+        p = info['passage']
         pid = p.get('pid', '')
-        if pid not in seen_pids:
+        if pid and pid not in seen_pids:
             seen_pids.add(pid)
             title = p.get('title', '')
             text = p.get('text', '')
-            prompt_parts.append(f"=== Evidence {passage_num} (Answer Source) ===")
+            label = "Answer Source" if i == 0 else f"Answer Source {i + 1}"
+            prompt_parts.append(f"=== Evidence {passage_num} ({label}) ===")
             if title:
                 prompt_parts.append(f"[{title}]")
             prompt_parts.append(text)
             prompt_parts.append("")
             passage_num += 1
-        elif passage_num == 1:
+        elif passage_num == 1 and i == 0:
             # RELATION is the only passage - still show it
             title = p.get('title', '')
             text = p.get('text', '')
-            prompt_parts.append(f"=== Certified Evidence ===")
+            prompt_parts.append("=== Certified Evidence ===")
             if title:
                 prompt_parts.append(f"[{title}]")
             prompt_parts.append(text)
             prompt_parts.append("")
+            passage_num += 1
 
     # If no passages were added, bail
-    if passage_num == 1 and not relation_info:
-        return "", None
+    if passage_num == 1:
+        return "", None, facet_id_map
 
     prompt_parts.append("Instructions:")
     prompt_parts.append("1. The answer IS GUARANTEED to be in the evidence above - these passages were verified to contain it.")
@@ -608,7 +632,7 @@ def build_certificate_aware_prompt(
     prompt_parts.append("")
     prompt_parts.append("Answer:")
 
-    return "\n".join(prompt_parts), relation_info
+    return "\n".join(prompt_parts), best_relation_info, facet_id_map
 
 
 def typed_extract_from_winning_passage(
