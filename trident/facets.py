@@ -271,9 +271,62 @@ def instantiate_facets(
             facet_type=facet.facet_type,
             template=new_tpl,
             weight=facet.weight,
-            metadata=new_meta
+            metadata=new_meta,
+            required=facet.required,  # Preserve required flag
         )
         new_facets.append(new_facet)
+
+    return new_facets
+
+
+def is_wh_question(question: str) -> bool:
+    """Check if question is a WH-question (who, what, where, when, which, how)."""
+    q_lower = question.lower().strip()
+    wh_starters = ('who ', 'what ', 'where ', 'when ', 'which ', 'how ', 'whose ')
+    return q_lower.startswith(wh_starters) or any(f' {w}' in q_lower[:30] for w in ['who', 'what', 'where', 'when', 'which'])
+
+
+def mark_required_facets(facets: List["Facet"], question: str) -> List["Facet"]:
+    """
+    Mark RELATION facets as required for WH-questions.
+
+    For questions like "Who is X?" or "Where was Y born?", the RELATION facet
+    MUST be covered for a valid answer. Without it, the answer is unreliable.
+
+    Args:
+        facets: List of facets
+        question: The original question
+
+    Returns:
+        List of facets with required flags set appropriately
+    """
+    if not is_wh_question(question):
+        return facets
+
+    import os
+    debug = os.environ.get("TRIDENT_DEBUG_REQUIRED", "0") == "1"
+
+    new_facets = []
+    for facet in facets:
+        # Mark RELATION facets as required for WH-questions
+        if facet.facet_type == FacetType.RELATION:
+            if not facet.required:
+                # Create new facet with required=True
+                new_facet = Facet(
+                    facet_id=facet.facet_id,
+                    facet_type=facet.facet_type,
+                    template=facet.template,
+                    weight=facet.weight,
+                    metadata=facet.metadata,
+                    required=True,
+                )
+                if debug:
+                    print(f"[REQUIRED] Marking RELATION facet as required: {facet.facet_id}")
+                new_facets.append(new_facet)
+            else:
+                new_facets.append(facet)
+        else:
+            new_facets.append(facet)
 
     return new_facets
 
@@ -284,6 +337,7 @@ class Facet:
     template: Dict[str, Any]
     weight: float = 1.0
     metadata: Dict[str, Any] = None
+    required: bool = False  # If True, this facet MUST be covered for certification
 
     def __post_init__(self):
         if self.metadata is None:
@@ -610,6 +664,7 @@ class Facet:
             "template": self.template,
             "weight": self.weight,
             "metadata": self.metadata,
+            "required": self.required,
         }
 
     @classmethod
@@ -620,6 +675,7 @@ class Facet:
             template=data["template"],
             weight=data.get("weight", 1.0),
             metadata=data.get("metadata"),
+            required=data.get("required", False),
         )
 
 class FacetMiner:

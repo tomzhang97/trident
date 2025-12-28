@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Set, Tuple, Any
 # Entity extraction regex - Title Case spans
 ENTITY_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,4})\b")
 
-# Relation triggers for different relation kinds
+# Relation triggers for different relation kinds (used as fallback when LLM router unavailable)
 REL_TRIGGERS = {
     "DIRECTOR": ["directed by", "director", "film directed by", "directed", "filmmaker"],
     "BORN": ["was born", "born in", "birthplace", "native of", "born on"],
@@ -22,7 +22,156 @@ REL_TRIGGERS = {
     "CREATED": ["created", "founded", "wrote", "written by", "author", "composed"],
     "LOCATION": ["located in", "capital of", "situated", "based in", "headquarters"],
     "MARRIAGE": ["married", "spouse", "wife", "husband", "wed"],
+    "MOTHER": ["mother", "mom", "son of", "daughter of", "child of"],
+    "FATHER": ["father", "dad", "son of", "daughter of", "child of"],
+    "PARENT": ["parent", "mother", "father", "son of", "daughter of", "child of"],
+    "SPOUSE": ["married", "spouse", "wife", "husband", "wed", "partner"],
+    "NATIONALITY": ["nationality", "citizen", "national of", "from"],
+    "BIRTHPLACE": ["born in", "birthplace", "native of", "birth place"],
 }
+
+# All known relation types for LLM router
+KNOWN_RELATION_TYPES = [
+    "DIRECTOR", "PRODUCER", "CREATOR", "AUTHOR", "COMPOSER", "PERFORMER",
+    "MOTHER", "FATHER", "PARENT", "CHILD", "SPOUSE", "SIBLING",
+    "BIRTHPLACE", "BIRTHDATE", "NATIONALITY", "OCCUPATION",
+    "AWARD", "LOCATION", "CAPITAL", "HEADQUARTERS",
+    "OTHER"
+]
+
+
+def llm_route_relation(
+    llm,
+    question: str,
+    available_types: Optional[List[str]] = None
+) -> Tuple[str, float]:
+    """
+    Use LLM to determine the primary relation type being asked about.
+
+    This replaces keyword-based relation detection with semantic understanding.
+
+    Args:
+        llm: LLM interface with generate() method
+        question: The question to analyze
+        available_types: Optional list of relation types to choose from
+
+    Returns:
+        Tuple of (relation_type, confidence)
+    """
+    import json as json_module
+    import os
+
+    debug = os.environ.get("TRIDENT_DEBUG_ROUTER", "0") == "1"
+
+    if available_types is None:
+        available_types = KNOWN_RELATION_TYPES
+
+    types_str = ", ".join(available_types)
+
+    prompt = f"""Identify the relation type being asked about in this question.
+
+Question: {question}
+
+Available relation types: {types_str}
+
+Rules:
+1. Pick the SINGLE most specific relation type
+2. For "who is the mother of X" -> MOTHER (not PARENT)
+3. For "where was X born" -> BIRTHPLACE
+4. For "who directed X" -> DIRECTOR
+5. Return JSON: {{"relation": "TYPE", "confidence": 0.9}}
+
+JSON:"""
+
+    try:
+        raw = llm.generate(prompt)
+        raw_text = raw.text if hasattr(raw, 'text') else str(raw)
+    except Exception as e:
+        if debug:
+            print(f"[LLM-ROUTER] Error: {e}")
+        return keyword_route_relation(question), 0.5
+
+    if debug:
+        print(f"[LLM-ROUTER] Raw output: {raw_text[:100]}...")
+
+    # Parse JSON response
+    try:
+        json_match = re.search(r'\{[^{}]*\}', raw_text, flags=re.DOTALL)
+        if json_match:
+            out = json_module.loads(json_match.group(0))
+        else:
+            out = json_module.loads(raw_text.strip())
+    except Exception as e:
+        if debug:
+            print(f"[LLM-ROUTER] Parse error: {e}")
+        return keyword_route_relation(question), 0.5
+
+    relation = (out.get("relation") or "").upper().strip()
+    confidence = float(out.get("confidence", 0.7))
+
+    # Validate relation type
+    if relation not in available_types and relation != "OTHER":
+        # Try to find closest match
+        for t in available_types:
+            if t in relation or relation in t:
+                relation = t
+                break
+        else:
+            # Fallback to keyword-based
+            if debug:
+                print(f"[LLM-ROUTER] Unknown relation '{relation}', falling back to keywords")
+            return keyword_route_relation(question), 0.5
+
+    if debug:
+        print(f"[LLM-ROUTER] Result: {relation} (confidence={confidence})")
+
+    return relation, confidence
+
+
+def keyword_route_relation(question: str) -> str:
+    """
+    Fallback keyword-based relation routing.
+
+    Used when LLM router is unavailable or fails.
+    """
+    q_lower = question.lower()
+
+    # Check each relation type's triggers
+    for relation_type, triggers in REL_TRIGGERS.items():
+        for trigger in triggers:
+            if trigger in q_lower:
+                return relation_type
+
+    return "OTHER"
+
+
+def route_relation(
+    question: str,
+    llm: Optional[Any] = None,
+    use_llm: bool = True
+) -> Tuple[str, float, str]:
+    """
+    Route question to relation type using LLM (if available) or keywords.
+
+    Args:
+        question: The question to analyze
+        llm: Optional LLM interface
+        use_llm: Whether to use LLM routing (default True)
+
+    Returns:
+        Tuple of (relation_type, confidence, method)
+        method is "llm" or "keyword"
+    """
+    if use_llm and llm is not None:
+        try:
+            relation, confidence = llm_route_relation(llm, question)
+            return relation, confidence, "llm"
+        except Exception:
+            pass
+
+    # Fallback to keyword routing
+    relation = keyword_route_relation(question)
+    return relation, 0.5, "keyword"
 
 
 def _looks_like_person(name: str) -> bool:
@@ -1242,6 +1391,547 @@ JSON:"""
     if debug:
         print(f"[CSS] No match found for '{answer}' in passage")
     return CSSResult(abstain=True, answer=answer, passage_id=pid, reason="SPAN_NOT_VERBATIM", confidence=confidence)
+
+
+# ==============================================================================
+# CONSTRAINED CANDIDATE SELECTION
+# ==============================================================================
+# Instead of free-form extraction, build a candidate set and have LLM pick by
+# index. This ensures verbatim answers and enables support-based ranking.
+# ==============================================================================
+
+@dataclass
+class QuestionType:
+    """Detected question type for constraining candidates."""
+    category: str  # "either_or", "who", "what", "where", "when", "how_many", "yes_no", "other"
+    expected_type: str  # "PERSON", "PLACE", "DATE", "NUMBER", "BINARY", "ENTITY", "OTHER"
+    options: Optional[List[str]] = None  # For either/or questions
+
+
+def detect_question_type(question: str) -> QuestionType:
+    """
+    Detect question type to constrain candidate extraction.
+
+    Returns:
+        QuestionType with category, expected_type, and options (for either/or)
+    """
+    q = question.strip()
+    q_lower = q.lower()
+
+    # Either/or questions: "X or Y?" pattern
+    # Match patterns like "was it A or B", "is this X or Y", "A or B?"
+    either_or_match = re.search(
+        r'\b(is|was|are|were|did|does|do|can|could|would|should|will)\s+.{1,50}?\s+(\w+(?:\s+\w+){0,3})\s+or\s+(\w+(?:\s+\w+){0,3})\s*\??$',
+        q_lower
+    )
+    if either_or_match:
+        opt1 = either_or_match.group(2).strip()
+        opt2 = either_or_match.group(3).strip("?. ")
+        return QuestionType(
+            category="either_or",
+            expected_type="BINARY_CHOICE",
+            options=[opt1, opt2]
+        )
+
+    # Simple "A or B?" at end
+    simple_or = re.search(r'(\w+(?:\s+\w+){0,4})\s+or\s+(\w+(?:\s+\w+){0,4})\s*\??$', q_lower)
+    if simple_or:
+        opt1 = simple_or.group(1).strip()
+        opt2 = simple_or.group(2).strip("?. ")
+        # Make sure these look like answer options (not "this or that")
+        if opt1.lower() not in {'this', 'that', 'it', 'he', 'she', 'they'}:
+            return QuestionType(
+                category="either_or",
+                expected_type="BINARY_CHOICE",
+                options=[opt1, opt2]
+            )
+
+    # Yes/No questions
+    if q_lower.startswith(('is ', 'are ', 'was ', 'were ', 'do ', 'does ', 'did ',
+                           'can ', 'could ', 'should ', 'would ', 'has ', 'have ', 'had ')):
+        return QuestionType(category="yes_no", expected_type="BINARY", options=["yes", "no"])
+
+    # Who questions -> PERSON
+    if q_lower.startswith('who ') or ' who ' in q_lower[:30]:
+        return QuestionType(category="who", expected_type="PERSON")
+
+    # Where questions -> PLACE
+    if q_lower.startswith('where ') or ' where ' in q_lower[:30]:
+        return QuestionType(category="where", expected_type="PLACE")
+
+    # When questions -> DATE
+    if q_lower.startswith('when ') or ' when ' in q_lower[:30]:
+        return QuestionType(category="when", expected_type="DATE")
+
+    # How many/much -> NUMBER
+    if q_lower.startswith('how many ') or q_lower.startswith('how much '):
+        return QuestionType(category="how_many", expected_type="NUMBER")
+
+    # What questions -> ENTITY (generic)
+    if q_lower.startswith('what ') or ' what ' in q_lower[:30]:
+        # Check for more specific "what [type]" patterns
+        what_person = re.match(r'what\s+(person|actor|actress|director|author|singer|player)', q_lower)
+        if what_person:
+            return QuestionType(category="what", expected_type="PERSON")
+        what_place = re.match(r'what\s+(city|country|place|location|state|region)', q_lower)
+        if what_place:
+            return QuestionType(category="what", expected_type="PLACE")
+        what_date = re.match(r'what\s+(year|date|time|day|month)', q_lower)
+        if what_date:
+            return QuestionType(category="what", expected_type="DATE")
+        return QuestionType(category="what", expected_type="ENTITY")
+
+    # Default: other
+    return QuestionType(category="other", expected_type="OTHER")
+
+
+def extract_candidates(
+    winner_passages: List[Dict[str, Any]],
+    question_type: QuestionType,
+    max_candidates: int = 10
+) -> List[Tuple[str, float, str]]:
+    """
+    Extract candidate answers from winner passages based on question type.
+
+    Returns:
+        List of (candidate_text, support_score, source_pid) tuples,
+        sorted by support_score descending.
+    """
+    candidates: Dict[str, Tuple[float, str]] = {}  # text -> (score, pid)
+
+    # For either/or questions, use the provided options
+    if question_type.category == "either_or" and question_type.options:
+        for opt in question_type.options:
+            # Find which passage(s) support this option
+            support = 0.0
+            source_pid = ""
+            for p in winner_passages:
+                text_lower = (p.get("text") or "").lower()
+                if opt.lower() in text_lower:
+                    support += 1.0
+                    if not source_pid:
+                        source_pid = p.get("pid", "")
+            if support > 0 or True:  # Always include options for either/or
+                candidates[opt] = (support, source_pid)
+        # Return sorted by support
+        return sorted(
+            [(text, score, pid) for text, (score, pid) in candidates.items()],
+            key=lambda x: x[1],
+            reverse=True
+        )[:max_candidates]
+
+    # For yes/no questions
+    if question_type.category == "yes_no":
+        # Count evidence for yes vs no
+        yes_support = 0.0
+        no_support = 0.0
+        yes_pid = ""
+        no_pid = ""
+
+        for p in winner_passages:
+            text = (p.get("text") or "").lower()
+            pid = p.get("pid", "")
+            # Look for affirmative/negative language
+            if any(w in text for w in ['is a', 'was a', 'are the', 'were the', 'did ', 'does ', 'has ', 'had ']):
+                yes_support += 0.5
+                if not yes_pid:
+                    yes_pid = pid
+            if any(w in text for w in ['not ', "n't ", 'never ', 'no ', 'none ']):
+                no_support += 0.5
+                if not no_pid:
+                    no_pid = pid
+
+        return [
+            ("yes", yes_support, yes_pid),
+            ("no", no_support, no_pid)
+        ]
+
+    # For PERSON questions
+    if question_type.expected_type == "PERSON":
+        person_pattern = re.compile(
+            r'\b([A-Z][a-zA-ZÀ-ÿ\']+(?:\s+(?:de|van|von|la|el|al|bin|ibn)?[A-Z][a-zA-ZÀ-ÿ\']+){0,4})\b'
+        )
+        for p in winner_passages:
+            text = p.get("text") or ""
+            pid = p.get("pid", "")
+            for match in person_pattern.finditer(text):
+                name = match.group(1).strip()
+                # Validate: looks like a person name
+                if _looks_like_person(name):
+                    # Compute support: count occurrences across all passages
+                    support = sum(
+                        1 for pp in winner_passages
+                        if name.lower() in (pp.get("text") or "").lower()
+                    )
+                    if name not in candidates or support > candidates[name][0]:
+                        candidates[name] = (support, pid)
+
+    # For PLACE questions
+    elif question_type.expected_type == "PLACE":
+        # Extract capitalized spans that look like places
+        place_pattern = re.compile(
+            r'\b([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})\b'
+        )
+        for p in winner_passages:
+            text = p.get("text") or ""
+            pid = p.get("pid", "")
+            for match in place_pattern.finditer(text):
+                place = match.group(1).strip()
+                # Filter out obvious non-places
+                if len(place) >= 2 and place.lower() not in {
+                    'the', 'a', 'an', 'he', 'she', 'they', 'it', 'his', 'her',
+                    'their', 'was', 'were', 'is', 'are', 'has', 'had', 'have'
+                }:
+                    support = sum(
+                        1 for pp in winner_passages
+                        if place.lower() in (pp.get("text") or "").lower()
+                    )
+                    if place not in candidates or support > candidates[place][0]:
+                        candidates[place] = (support, pid)
+
+    # For DATE questions
+    elif question_type.expected_type == "DATE":
+        # Extract date patterns
+        date_patterns = [
+            # Year only: 1990, 2024
+            re.compile(r'\b(1[0-9]{3}|20[0-2][0-9])\b'),
+            # Month Day, Year: January 1, 2020
+            re.compile(r'\b([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})\b'),
+            # Day Month Year: 1 January 2020
+            re.compile(r'\b(\d{1,2}\s+[A-Z][a-z]+\s+\d{4})\b'),
+            # Month Year: January 2020
+            re.compile(r'\b([A-Z][a-z]+\s+\d{4})\b'),
+        ]
+        for p in winner_passages:
+            text = p.get("text") or ""
+            pid = p.get("pid", "")
+            for pattern in date_patterns:
+                for match in pattern.finditer(text):
+                    date_str = match.group(1).strip()
+                    support = sum(
+                        1 for pp in winner_passages
+                        if date_str in (pp.get("text") or "")
+                    )
+                    if date_str not in candidates or support > candidates[date_str][0]:
+                        candidates[date_str] = (support, pid)
+
+    # For NUMBER questions
+    elif question_type.expected_type == "NUMBER":
+        number_pattern = re.compile(r'\b(\d+(?:,\d{3})*(?:\.\d+)?)\b')
+        for p in winner_passages:
+            text = p.get("text") or ""
+            pid = p.get("pid", "")
+            for match in number_pattern.finditer(text):
+                num = match.group(1).strip()
+                support = sum(
+                    1 for pp in winner_passages
+                    if num in (pp.get("text") or "")
+                )
+                if num not in candidates or support > candidates[num][0]:
+                    candidates[num] = (support, pid)
+
+    # For ENTITY or OTHER: extract all capitalized spans
+    else:
+        entity_pattern = re.compile(
+            r'\b([A-Z][a-zA-ZÀ-ÿ\-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ\-]+){0,4})\b'
+        )
+        for p in winner_passages:
+            text = p.get("text") or ""
+            pid = p.get("pid", "")
+            for match in entity_pattern.finditer(text):
+                entity = match.group(1).strip()
+                if len(entity) >= 2:
+                    support = sum(
+                        1 for pp in winner_passages
+                        if entity.lower() in (pp.get("text") or "").lower()
+                    )
+                    if entity not in candidates or support > candidates[entity][0]:
+                        candidates[entity] = (support, pid)
+
+    # Sort by support score and return top candidates
+    sorted_candidates = sorted(
+        [(text, score, pid) for text, (score, pid) in candidates.items()],
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    return sorted_candidates[:max_candidates]
+
+
+def compute_support_score(
+    candidate: str,
+    passages: List[Dict[str, Any]]
+) -> float:
+    """
+    Compute deterministic support score for a candidate.
+
+    Score = count of passages mentioning candidate, weighted by passage rank.
+    """
+    if not candidate or not passages:
+        return 0.0
+
+    candidate_lower = candidate.lower()
+    score = 0.0
+
+    for i, p in enumerate(passages):
+        text_lower = (p.get("text") or "").lower()
+        title_lower = (p.get("title") or "").lower()
+
+        # Check if candidate appears
+        if candidate_lower in text_lower or candidate_lower in title_lower:
+            # Weight by rank (earlier passages = higher weight)
+            weight = 1.0 / (1 + i * 0.1)
+            score += weight
+
+    return score
+
+
+@dataclass
+class ConstrainedSelectionResult:
+    """Result from constrained candidate selection."""
+    answer: str
+    candidate_index: int
+    confidence: float
+    passage_id: str
+    candidates: List[str]
+    support_scores: List[float]
+    reason: str  # OK, NO_CANDIDATES, LLM_ERROR, INVALID_INDEX
+
+
+def llm_pick_candidate(
+    llm,
+    question: str,
+    passages: List[Dict[str, Any]],
+    candidates: List[Tuple[str, float, str]],
+    max_chars_per_passage: int = 600
+) -> ConstrainedSelectionResult:
+    """
+    Ask LLM to pick ONE candidate by index from a constrained set.
+
+    CRITICAL: LLM can ONLY pick from the provided candidates by index.
+    This ensures the answer is always a verbatim substring from evidence.
+
+    Args:
+        llm: LLM interface with generate() method
+        question: The question to answer
+        passages: Winner passages for context
+        candidates: List of (text, support_score, source_pid) tuples
+        max_chars_per_passage: Max chars per passage in prompt
+
+    Returns:
+        ConstrainedSelectionResult with selected answer and metadata
+    """
+    import json as json_module
+    import os
+
+    debug = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
+
+    if not candidates:
+        return ConstrainedSelectionResult(
+            answer="",
+            candidate_index=-1,
+            confidence=0.0,
+            passage_id="",
+            candidates=[],
+            support_scores=[],
+            reason="NO_CANDIDATES"
+        )
+
+    # Build evidence text
+    evidence_parts = []
+    for i, p in enumerate(passages[:5]):  # Limit to 5 passages
+        pid = p.get("pid", f"P{i}")
+        title = p.get("title", "")
+        text = (p.get("text") or "")[:max_chars_per_passage]
+        evidence_parts.append(f"[{pid}] {title}\n{text}")
+    evidence_text = "\n\n".join(evidence_parts)
+
+    # Build candidate list with indices
+    candidate_list = []
+    candidate_texts = []
+    support_scores = []
+    for i, (text, score, pid) in enumerate(candidates):
+        candidate_list.append(f"{i}: {text}")
+        candidate_texts.append(text)
+        support_scores.append(score)
+    candidates_text = "\n".join(candidate_list)
+
+    # Prompt: LLM must pick by index ONLY
+    prompt = f"""Pick the ONE candidate that best answers the question.
+
+RULES:
+1. You MUST pick from the numbered candidates below
+2. Return ONLY a JSON object with "index" (integer) and "confidence" (0-1)
+3. If no candidate answers the question, return {{"index": -1, "confidence": 0}}
+
+Question: {question}
+
+Candidates:
+{candidates_text}
+
+Evidence:
+{evidence_text}
+
+JSON:"""
+
+    if debug:
+        print(f"[CONSTRAINED] Prompt:\n{prompt[:500]}...")
+        print(f"[CONSTRAINED] {len(candidates)} candidates")
+
+    try:
+        raw = llm.generate(prompt)
+        raw_text = raw.text if hasattr(raw, 'text') else str(raw)
+    except Exception as e:
+        if debug:
+            print(f"[CONSTRAINED] LLM error: {e}")
+        return ConstrainedSelectionResult(
+            answer="",
+            candidate_index=-1,
+            confidence=0.0,
+            passage_id="",
+            candidates=candidate_texts,
+            support_scores=support_scores,
+            reason="LLM_ERROR"
+        )
+
+    if debug:
+        print(f"[CONSTRAINED] Raw output: {raw_text[:200]}...")
+
+    # Parse JSON response
+    try:
+        json_match = re.search(r'\{[^{}]*\}', raw_text, flags=re.DOTALL)
+        if json_match:
+            out = json_module.loads(json_match.group(0))
+        else:
+            out = json_module.loads(raw_text.strip())
+    except Exception as e:
+        if debug:
+            print(f"[CONSTRAINED] JSON parse error: {e}")
+        # Try to extract just the index
+        index_match = re.search(r'\b(\d+)\b', raw_text)
+        if index_match:
+            out = {"index": int(index_match.group(1)), "confidence": 0.5}
+        else:
+            return ConstrainedSelectionResult(
+                answer="",
+                candidate_index=-1,
+                confidence=0.0,
+                passage_id="",
+                candidates=candidate_texts,
+                support_scores=support_scores,
+                reason="PARSE_ERROR"
+            )
+
+    index = out.get("index", -1)
+    confidence = float(out.get("confidence", 0.5))
+
+    # Validate index
+    if not isinstance(index, int) or index < 0 or index >= len(candidates):
+        if debug:
+            print(f"[CONSTRAINED] Invalid index: {index}")
+        # Fallback: pick the candidate with highest support score
+        if candidates:
+            best_idx = 0
+            best_score = candidates[0][1]
+            for i, (_, score, _) in enumerate(candidates):
+                if score > best_score:
+                    best_score = score
+                    best_idx = i
+            return ConstrainedSelectionResult(
+                answer=candidates[best_idx][0],
+                candidate_index=best_idx,
+                confidence=0.3,  # Low confidence for fallback
+                passage_id=candidates[best_idx][2],
+                candidates=candidate_texts,
+                support_scores=support_scores,
+                reason="FALLBACK_SUPPORT"
+            )
+        return ConstrainedSelectionResult(
+            answer="",
+            candidate_index=-1,
+            confidence=0.0,
+            passage_id="",
+            candidates=candidate_texts,
+            support_scores=support_scores,
+            reason="INVALID_INDEX"
+        )
+
+    # Valid selection
+    selected = candidates[index]
+    if debug:
+        print(f"[CONSTRAINED] Selected index {index}: '{selected[0]}'")
+
+    return ConstrainedSelectionResult(
+        answer=selected[0],
+        candidate_index=index,
+        confidence=confidence,
+        passage_id=selected[2],
+        candidates=candidate_texts,
+        support_scores=support_scores,
+        reason="OK"
+    )
+
+
+def constrained_span_select(
+    llm,
+    question: str,
+    winner_passages: List[Dict[str, Any]],
+    max_candidates: int = 10,
+    max_chars_per_passage: int = 600
+) -> ConstrainedSelectionResult:
+    """
+    Full constrained selection pipeline: detect type -> extract candidates -> LLM pick.
+
+    This is the main entry point for constrained candidate selection.
+
+    Args:
+        llm: LLM interface
+        question: The question to answer
+        winner_passages: Certificate-winning passages
+        max_candidates: Max candidates to extract
+        max_chars_per_passage: Max chars per passage in prompt
+
+    Returns:
+        ConstrainedSelectionResult with answer and metadata
+    """
+    import os
+    debug = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
+
+    # Step 1: Detect question type
+    qtype = detect_question_type(question)
+    if debug:
+        print(f"[CONSTRAINED] Question type: {qtype.category}, expected: {qtype.expected_type}")
+        if qtype.options:
+            print(f"[CONSTRAINED] Options: {qtype.options}")
+
+    # Step 2: Extract candidates
+    candidates = extract_candidates(winner_passages, qtype, max_candidates)
+    if debug:
+        print(f"[CONSTRAINED] Extracted {len(candidates)} candidates")
+        for i, (text, score, pid) in enumerate(candidates[:5]):
+            print(f"  {i}: '{text}' (support={score}, pid={pid[:12]}...)")
+
+    if not candidates:
+        return ConstrainedSelectionResult(
+            answer="",
+            candidate_index=-1,
+            confidence=0.0,
+            passage_id="",
+            candidates=[],
+            support_scores=[],
+            reason="NO_CANDIDATES"
+        )
+
+    # Step 3: LLM picks from candidates
+    result = llm_pick_candidate(
+        llm=llm,
+        question=question,
+        passages=winner_passages,
+        candidates=candidates,
+        max_chars_per_passage=max_chars_per_passage
+    )
+
+    return result
 
 
 def bind_entity_via_css(

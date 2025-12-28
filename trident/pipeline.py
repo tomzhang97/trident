@@ -14,7 +14,7 @@ import torch
 from transformers import AutoTokenizer, AutoModel
 
 from .config import TridentConfig, SafeCoverConfig, ParetoConfig
-from .facets import Facet, FacetMiner, FacetType, instantiate_facets
+from .facets import Facet, FacetMiner, FacetType, instantiate_facets, mark_required_facets, is_wh_question
 from .candidates import Passage
 from .calibration import ReliabilityCalibrator, CalibrationMonitor
 from .safe_cover import SafeCoverAlgorithm, SafeCoverResult
@@ -40,7 +40,20 @@ from .chain_builder import (
     build_inner_question_from_facet,
     get_winner_passages_only,
     CSSResult,
-    ReasoningChain
+    ReasoningChain,
+    # Constrained Candidate Selection - LLM picks from extracted candidates by index
+    detect_question_type,
+    extract_candidates,
+    compute_support_score,
+    llm_pick_candidate,
+    constrained_span_select,
+    ConstrainedSelectionResult,
+    QuestionType,
+    # LLM-based relation routing
+    llm_route_relation,
+    keyword_route_relation,
+    route_relation,
+    KNOWN_RELATION_TYPES,
 )
 
 
@@ -408,7 +421,16 @@ class TridentPipeline:
 
         # Step 1: Facet mining
         facets = self.facet_miner.extract_facets(query, supporting_facts)
-        self.telemetry.log("facet_mining", {"num_facets": len(facets)})
+
+        # Mark RELATION facets as required for WH-questions
+        # This ensures that the key relation must be certified for valid answers
+        facets = mark_required_facets(facets, query)
+
+        self.telemetry.log("facet_mining", {
+            "num_facets": len(facets),
+            "num_required": sum(1 for f in facets if f.required),
+            "is_wh_question": is_wh_question(query),
+        })
 
         # CRITICAL FIX: Handle zero facets early with proper abstention
         if not facets:
@@ -532,15 +554,17 @@ class TridentPipeline:
         else:
             raise ValueError(f"Unknown mode: {mode}")
         
-        # Step 5: Generate answer using CERTIFIED SPAN SELECTION (CSS)
-        # CRITICAL: Use only certificate-winning passages, require verbatim grounding.
-        # This is general, relation-agnostic, and auditable.
+        # Step 5: Generate answer using CONSTRAINED CANDIDATE SELECTION
+        # CRITICAL: Build candidate set from evidence, LLM picks by index.
+        # This ensures verbatim answers and enables support-based ranking.
         answer = ""
         chain = None
         is_grounded = False
         used_regex_fallback = False
         used_css = False  # Track if CSS was used
+        used_constrained = False  # Track if constrained selection was used
         css_result = None  # Track CSS result for metrics
+        constrained_result = None  # Track constrained selection result
         relation_info = None  # Track the RELATION-winning passage for typed fallback
         facet_id_map = {}  # Track all facet_id -> winning passage mappings
         prompt_type = "none"  # Track which prompt type was used
@@ -548,26 +572,76 @@ class TridentPipeline:
         if not result['abstained'] and result['selected_passages']:
             debug_chain = os.environ.get("TRIDENT_DEBUG_CHAIN", "0") == "1"
             debug_css = os.environ.get("TRIDENT_DEBUG_CSS", "0") == "1"
+            debug_constrained = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
             facet_dicts = [f.to_dict() for f in facets]
             certificates = result.get('certificates', [])
             prompt = ""  # Initialize prompt
 
             # ================================================================
-            # PRIORITY 0: Certified Span Selection (CSS)
+            # PRIORITY 0: Constrained Candidate Selection
             # ================================================================
-            # Use only certificate-winning passages, require exact substring.
-            # This is the most reliable and auditable extraction method.
+            # Extract candidates from evidence, have LLM pick by index.
+            # This guarantees verbatim answers and enables support-based ranking.
             if certificates:
                 winner_passages = get_winner_passages_only(
                     certificates,
                     result['selected_passages']
                 )
 
-                if debug_chain or debug_css:
-                    print(f"\n[CSS] Attempting Certified Span Selection")
+                if debug_chain or debug_constrained:
+                    print(f"\n[CONSTRAINED] Attempting Constrained Candidate Selection")
                     print(f"  Winner passages: {len(winner_passages)}")
                     for wp in winner_passages[:3]:
                         print(f"    - {wp.get('pid', '')[:12]}... ({len(wp.get('text', ''))} chars)")
+
+                if winner_passages:
+                    constrained_result = constrained_span_select(
+                        llm=self.llm,
+                        question=query,
+                        winner_passages=winner_passages,
+                        max_candidates=10,
+                        max_chars_per_passage=600
+                    )
+
+                    if constrained_result.reason == "OK":
+                        answer = constrained_result.answer
+                        is_grounded = True
+                        used_constrained = True
+                        prompt_type = "constrained"
+
+                        if debug_chain or debug_constrained:
+                            print(f"[CONSTRAINED] Success: '{answer[:50] if answer else ''}' (index={constrained_result.candidate_index})")
+                            print(f"[CONSTRAINED] Confidence: {constrained_result.confidence}")
+                            print(f"[CONSTRAINED] Candidates: {constrained_result.candidates[:3]}...")
+                    elif constrained_result.reason == "FALLBACK_SUPPORT":
+                        # LLM gave invalid index, but we used support-based fallback
+                        answer = constrained_result.answer
+                        is_grounded = True
+                        used_constrained = True
+                        prompt_type = "constrained_fallback"
+
+                        if debug_chain or debug_constrained:
+                            print(f"[CONSTRAINED] Fallback to support-based: '{answer[:50] if answer else ''}'")
+                    else:
+                        if debug_chain or debug_constrained:
+                            print(f"[CONSTRAINED] Failed: {constrained_result.reason}")
+                            if constrained_result.candidates:
+                                print(f"[CONSTRAINED] Had {len(constrained_result.candidates)} candidates")
+
+            # ================================================================
+            # PRIORITY 1: Certified Span Selection (CSS) - fallback
+            # ================================================================
+            # If constrained selection failed, try free-form CSS with verbatim check.
+            if not answer and certificates:
+                if not winner_passages:
+                    winner_passages = get_winner_passages_only(
+                        certificates,
+                        result['selected_passages']
+                    )
+
+                if debug_chain or debug_css:
+                    print(f"\n[CSS] Attempting Certified Span Selection (fallback)")
+                    print(f"  Winner passages: {len(winner_passages)}")
 
                 if winner_passages:
                     css_result = certified_span_select(
@@ -772,7 +846,12 @@ class TridentPipeline:
                     print(f"  Num passages: {len(result['selected_passages'])}")
 
             # Compute token usage
-            if used_css:
+            if used_constrained:
+                # Constrained selection uses a single LLM call with structured output
+                total_tokens = 0  # Token usage is internal to the call
+                prompt_tokens = 0
+                completion_tokens = 0
+            elif used_css:
                 # CSS uses a single LLM call with structured output
                 total_tokens = 0  # CSS token usage is internal to the call
                 prompt_tokens = 0
@@ -809,9 +888,16 @@ class TridentPipeline:
             'total_tokens': total_tokens,
             'overhead_tokens': max(total_tokens - evidence_tokens, 0),
             'model_abstained': model_abstained,  # Track when model says "I cannot answer"
-            # Extraction method tracking (css > certificate_aware > chain_based > regular > none)
+            # Extraction method tracking (constrained > css > certificate_aware > chain_based > regular > none)
             'prompt_type': prompt_type,
-            # Certified Span Selection (CSS) metrics - primary extraction method
+            # Constrained Candidate Selection metrics - primary extraction method
+            'used_constrained': used_constrained,
+            'constrained_reason': constrained_result.reason if constrained_result else None,
+            'constrained_confidence': constrained_result.confidence if constrained_result else None,
+            'constrained_candidate_index': constrained_result.candidate_index if constrained_result else None,
+            'constrained_num_candidates': len(constrained_result.candidates) if constrained_result else 0,
+            'constrained_passage_id': constrained_result.passage_id if constrained_result else None,
+            # Certified Span Selection (CSS) metrics - fallback extraction method
             'used_css': used_css,
             'css_reason': css_result.reason if css_result else None,
             'css_confidence': css_result.confidence if css_result else None,
