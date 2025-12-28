@@ -1421,20 +1421,19 @@ class TridentPipeline:
             if debug:
                 print(f"  Bound entity (CSS): {bound_entity}")
 
-        # Fallback to relation-specific binding if CSS fails
-        if not bound_entity and inner_relation_type:
-            if debug:
-                print(f"  CSS binding failed, trying relation-specific fallback")
-            for p in hop1_winners:
-                bound_entity = bind_entity_from_hop1_winner(
-                    inner_relation_type,
-                    p.get('text', '')
-                )
-                if bound_entity:
-                    if debug:
-                        print(f"  Bound entity (fallback): {bound_entity}")
-                    break
-
+        # ================================================================
+        # ABORT IF CSS BINDING FAILS - DON'T USE GARBAGE FALLBACK
+        # ================================================================
+        # The regex-based fallback (bind_entity_from_hop1_winner) can produce
+        # garbage like "Polish film" which poisons hop-2 retrieval.
+        # Better to abort hop-2 and return hop-1 result than continue with garbage.
+        #
+        # If CSS binding fails, it means either:
+        # 1. The LLM couldn't extract a valid person name from the passage
+        # 2. The extracted name isn't a verbatim substring (hallucination)
+        # 3. The extracted name failed type validation (not PERSON-like)
+        #
+        # In all cases, proceeding with hop-2 would produce wrong answers.
         if not bound_entity:
             if debug:
                 print(f"  Failed to bind entity from hop-1 - using hop-1 result only")
@@ -1574,6 +1573,18 @@ class TridentPipeline:
         # ============================================================
         # STAGE B: Score and certify hop-2 facets
         # ============================================================
+        # CRITICAL INVARIANT: Hop-2 facets must be fully instantiated before scoring.
+        # If any facet still contains placeholders like [DIRECTOR_RESULT], the scorer
+        # will see meaningless input and produce p≈1 (no certification possible).
+        for f in hop2_facets:
+            s = (f.template or {}).get("subject", "")
+            if "[" in s and "_RESULT]" in s:
+                # This is a fatal bug - instantiation was not applied
+                if debug:
+                    print(f"  ERROR: Hop-2 facet not instantiated: {f.facet_id} subject={s}")
+                # Don't raise in production - just log and return hop-1 result
+                return hop1_result
+
         # Re-score with new passages (if any were added)
         if len(hop2_passages) > len(passages):
             hop2_scores = self._two_stage_scoring(hop2_passages, hop2_facets)

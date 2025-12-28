@@ -219,7 +219,14 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         # (e.g., "MOTHER") which must take precedence over keyword inference.
         # Without this, a hop-2 MOTHER facet with subject "[DIRECTOR_RESULT]"
         # would incorrectly be classified as DIRECTOR because of the keyword.
-        explicit_relation_kind = tpl.get('outer_relation_type') or tpl.get('relation_kind')
+        #
+        # PARENT NORMALIZATION: Prefer scoring_relation_kind over outer_relation_type.
+        # This allows MOTHER/FATHER to be scored as PARENT for better NLI matching.
+        explicit_relation_kind = (
+            tpl.get('scoring_relation_kind') or
+            tpl.get('outer_relation_type') or
+            tpl.get('relation_kind')
+        )
 
         if explicit_relation_kind:
             relation_kind = explicit_relation_kind
@@ -337,19 +344,29 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         # The subject is just a placeholder, not a real entity to find
         #
         # CRITICAL: Include ALL relation kinds here, including explicit ones from compositional facets.
-        # For hop-2 facets AFTER instantiation, the subject is a concrete entity (not WH),
-        # so is_wh_subject=False and we check (s_match or o_match) && predicate_match.
         all_known_relation_kinds = {
             "DIRECTOR", "BORN", "AWARD", "CREATED", "LOCATION", "MARRIAGE",
             # Explicit relation kinds from compositional facets
             "MOTHER", "FATHER", "PARENT", "CHILD", "SPOUSE", "NATIONALITY", "BIRTHPLACE"
         }
 
-        if is_wh_subject and relation_kind in all_known_relation_kinds:
+        # Check if this is a hop-2 compositional facet
+        is_hop2 = tpl.get("hop") == 2 or tpl.get("compositional", False)
+
+        if is_hop2 and relation_kind in all_known_relation_kinds:
+            # HOP-2 COMPOSITIONAL: Predicate-first gate (relaxed)
+            # For hop-2, the passage often expresses the relation differently:
+            # - "X is the son of Y" instead of repeating "Xawery Żuławski's mother"
+            # - Gate should NOT block on subject match failure
+            # Only require predicate anchors - NLI will do the semantic work
+            result = predicate_match
+            if debug_rel:
+                print(f"[RELATION GATE] HOP-2 predicate-first: predicate_match={predicate_match}")
+        elif is_wh_subject and relation_kind in all_known_relation_kinds:
             # WH-subject: only require object match + predicate match
             result = o_match and predicate_match
         elif relation_kind in all_known_relation_kinds:
-            # Concrete subject (e.g., after instantiation): require subject OR object match + predicate match
+            # Concrete subject: require subject OR object match + predicate match
             result = (s_match or o_match) and predicate_match
         else:
             # Unknown relation kind: only require at least one endpoint match (no predicate gate)
@@ -357,7 +374,7 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
 
         if debug_rel:
             print(f"[RELATION GATE] subj_raw='{s_raw}' subj_clean='{s}' obj_raw='{o_raw}' obj_clean='{o}' "
-                  f"s_match={s_match} o_match={o_match} predicate_match={predicate_match} -> gate={result}")
+                  f"s_match={s_match} o_match={o_match} predicate_match={predicate_match} is_hop2={is_hop2} -> gate={result}")
         return result
 
     if ft == FacetType.COMPARISON:

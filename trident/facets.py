@@ -250,6 +250,20 @@ def instantiate_facets(
             new_meta["instantiated"] = True
             new_meta["bindings_applied"] = list(bindings.keys())
 
+        # ================================================================
+        # PARENT NORMALIZATION: Normalize MOTHER/FATHER to PARENT for scoring
+        # ================================================================
+        # Evidence often says "X is the son of Y" which doesn't contain "mother".
+        # NLI fails to entail "mother of X" from "son of Y" reliably.
+        # Fix: Score as PARENT (hypothesis: "The passage states a parent of X")
+        # and gate anchors include {mother, father, son of, daughter of, parent}.
+        # Keep outer_relation_type for reporting/analysis.
+        outer_rel = new_tpl.get("outer_relation_type", "")
+        if outer_rel in ("MOTHER", "FATHER"):
+            new_tpl["scoring_relation_kind"] = "PARENT"
+            if debug:
+                print(f"[INSTANTIATE] {facet.facet_id} normalized {outer_rel} -> scoring_relation_kind=PARENT")
+
         # Create new facet with updated template
         # Note: Facet is frozen=True, so we create a new instance
         new_facet = Facet(
@@ -320,7 +334,14 @@ class Facet:
             # CRITICAL FIX: Check for EXPLICIT relation_kind in template FIRST
             # This is needed for compositional hop-2 facets where the subject
             # contains "[DIRECTOR_RESULT]" but the actual relation is MOTHER
-            explicit_relation_kind = tpl.get('outer_relation_type') or tpl.get('relation_kind')
+            #
+            # PARENT NORMALIZATION: Prefer scoring_relation_kind over outer_relation_type.
+            # This allows MOTHER/FATHER to be scored as PARENT for better NLI matching.
+            explicit_relation_kind = (
+                tpl.get('scoring_relation_kind') or
+                tpl.get('outer_relation_type') or
+                tpl.get('relation_kind')
+            )
 
             # For hop-2 compositional facets, use the bound entity variable as subject
             bound_entity_var = None

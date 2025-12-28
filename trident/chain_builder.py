@@ -25,6 +25,56 @@ REL_TRIGGERS = {
 }
 
 
+def _looks_like_person(name: str) -> bool:
+    """
+    General PERSON-ish validator for CSS entity binding.
+
+    This is NOT relation-specific - it's a lightweight type check that accepts
+    strings that look like person names and rejects obvious non-names.
+
+    Accepts: "Xawery Żuławski", "John Smith", "Madonna", "李明"
+    Rejects: "Polish film", "the movie", "123", "", "directed by someone"
+    """
+    if not name or len(name) < 2:
+        return False
+
+    # Must contain at least one letter (handles Unicode)
+    if not re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]", name):
+        return False
+
+    # Split into tokens
+    toks = [t for t in re.split(r"\s+", name.strip()) if t]
+    if not toks:
+        return False
+
+    # Single-token names must start with uppercase (or be CJK)
+    if len(toks) == 1:
+        first_char = toks[0][0]
+        # Allow CJK characters
+        if re.match(r"[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]", first_char):
+            return True
+        # Must start with uppercase for Latin names
+        return bool(re.match(r"^[A-ZÀ-ÖØ-Þ]", toks[0]))
+
+    # Multi-token: reject if starts with true lowercase (not uppercase/CJK)
+    first_char = name[0]
+    if re.match(r"^[a-zà-öø-ÿ]", first_char):
+        return False
+
+    # Too many tokens is suspicious (likely a description, not a name)
+    if len(toks) > 5:
+        return False
+
+    # Reject obvious non-name patterns (case-insensitive for these)
+    bad_words = {"film", "movie", "city", "country", "war", "book", "song",
+                 "album", "series", "the", "directed", "starring", "featuring"}
+    toks_lower = [t.lower().strip(".,()") for t in toks]
+    if any(t in bad_words for t in toks_lower):
+        return False
+
+    return True
+
+
 @dataclass
 class ChainHop:
     """A single hop in the reasoning chain."""
@@ -1288,26 +1338,12 @@ JSON:"""
     if not answer:
         return None
 
-    # Validate: must look like a person's name (2-4 words, capitalized)
-    words = answer.split()
-    if len(words) < 1 or len(words) > 5:
+    # Validate: must look like a person's name
+    # This is a general PERSON-ish validator, not relation-specific
+    if not _looks_like_person(answer):
         if debug:
-            print(f"[CSS-BIND] Rejected: '{answer}' doesn't look like a name (word count)")
+            print(f"[CSS-BIND] Rejected: '{answer}' doesn't look like a person name")
         return None
-
-    # Check for garbage patterns (film titles, descriptions, etc.)
-    garbage_patterns = [
-        r'^(the|a|an)\s',  # Articles at start
-        r'film|movie|book|song|album|series',  # Media types
-        r'polish|russian|american|british',  # Nationalities (as adjectives)
-        r'^\d',  # Starts with digit
-        r'^[a-z]',  # Starts with lowercase (not a proper name)
-    ]
-    for pat in garbage_patterns:
-        if re.search(pat, answer, re.IGNORECASE):
-            if debug:
-                print(f"[CSS-BIND] Rejected: '{answer}' matches garbage pattern '{pat}'")
-            return None
 
     # Verify it's a verbatim substring of a passage
     passage_map = {p.get("pid", ""): p for p in hop1_passages}
