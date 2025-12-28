@@ -1872,6 +1872,134 @@ JSON:"""
     )
 
 
+def get_answer_facet_passages(
+    question: str,
+    certificates: List[Dict[str, Any]],
+    all_passages: List[Dict[str, Any]],
+    facets: Optional[List[Dict[str, Any]]] = None
+) -> Tuple[List[Dict[str, Any]], List[str], str]:
+    """
+    Get passages that won the answer-determining facet(s).
+
+    For WH-questions, the answer facet is typically RELATION/TEMPORAL/NUMERIC.
+    ENTITY facets just confirm the question subject exists, not the answer.
+
+    Args:
+        question: The question
+        certificates: List of certificate dicts with passage_id, facet_id, etc.
+        all_passages: All passages
+        facets: Optional list of facet dicts for filtering
+
+    Returns:
+        Tuple of (answer_passages, answer_facet_ids, selection_reason)
+    """
+    import os
+    debug = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
+
+    if not certificates:
+        return [], [], "NO_CERTIFICATES"
+
+    # Build passage lookup
+    pid_to_passage = {p.get("pid"): p for p in all_passages if p.get("pid")}
+
+    # Build facet_id -> certificates mapping
+    facet_to_certs: Dict[str, List[Dict[str, Any]]] = {}
+    for cert in certificates:
+        fid = cert.get("facet_id", "")
+        if fid:
+            if fid not in facet_to_certs:
+                facet_to_certs[fid] = []
+            facet_to_certs[fid].append(cert)
+
+    # Detect question type to determine answer facet priority
+    qtype = detect_question_type(question)
+
+    if debug:
+        print(f"[ANSWER-FACET] qtype={qtype.category} expected={qtype.expected_type}")
+        print(f"[ANSWER-FACET] facet_ids with certs: {list(facet_to_certs.keys())}")
+
+    # Build facet type lookup if facets provided
+    facet_types: Dict[str, str] = {}
+    if facets:
+        for f in facets:
+            fid = f.get("facet_id", "")
+            ftype = f.get("facet_type", "")
+            if fid and ftype:
+                facet_types[fid] = ftype
+
+    # Priority order for answer facets based on question type
+    # WH-questions need RELATION/TEMPORAL/NUMERIC facets for the actual answer
+    # ENTITY facets just confirm the question subject exists
+    priority_facet_types = []
+
+    if qtype.category == "when":
+        priority_facet_types = ["TEMPORAL", "RELATION", "NUMERIC"]
+    elif qtype.category == "where":
+        priority_facet_types = ["RELATION", "TEMPORAL"]
+    elif qtype.category in ("who", "what"):
+        priority_facet_types = ["RELATION", "TEMPORAL", "NUMERIC"]
+    elif qtype.category == "how_many":
+        priority_facet_types = ["NUMERIC", "RELATION", "TEMPORAL"]
+    else:
+        # Default: prefer RELATION over ENTITY
+        priority_facet_types = ["RELATION", "TEMPORAL", "NUMERIC", "ENTITY"]
+
+    # Find answer facets in priority order
+    answer_facet_ids = []
+    for ptype in priority_facet_types:
+        for fid in facet_to_certs:
+            if facet_types.get(fid) == ptype and fid not in answer_facet_ids:
+                answer_facet_ids.append(fid)
+
+    # If no priority facets, use all non-ENTITY facets first, then ENTITY
+    if not answer_facet_ids:
+        non_entity = [fid for fid in facet_to_certs if facet_types.get(fid) != "ENTITY"]
+        entity = [fid for fid in facet_to_certs if facet_types.get(fid) == "ENTITY"]
+        answer_facet_ids = non_entity + entity
+
+    # If still empty, use all facets
+    if not answer_facet_ids:
+        answer_facet_ids = list(facet_to_certs.keys())
+
+    if debug:
+        print(f"[ANSWER-FACET] priority_types={priority_facet_types}")
+        print(f"[ANSWER-FACET] answer_facet_ids={answer_facet_ids}")
+
+    # Get passages that won answer facets
+    answer_pids = set()
+    for fid in answer_facet_ids:
+        for cert in facet_to_certs.get(fid, []):
+            pid = cert.get("passage_id")
+            if pid:
+                answer_pids.add(pid)
+
+    # Order passages: answer-facet winners first, by p-value
+    answer_passages = []
+    seen_pids = set()
+
+    # Get all certs for answer facets, sorted by p-value
+    answer_certs = []
+    for fid in answer_facet_ids:
+        answer_certs.extend(facet_to_certs.get(fid, []))
+
+    answer_certs.sort(key=lambda c: c.get("p_value", 1.0))
+
+    for cert in answer_certs:
+        pid = cert.get("passage_id")
+        if pid and pid not in seen_pids and pid in pid_to_passage:
+            seen_pids.add(pid)
+            answer_passages.append(pid_to_passage[pid])
+
+    selection_reason = f"FACET_TARGETED:{','.join(answer_facet_ids[:3])}"
+
+    if debug:
+        print(f"[ANSWER-FACET] answer_passages: {len(answer_passages)}")
+        for ap in answer_passages[:3]:
+            print(f"  - {ap.get('pid', '')[:12]}... ({len(ap.get('text', ''))} chars)")
+
+    return answer_passages, answer_facet_ids, selection_reason
+
+
 def constrained_span_select(
     llm,
     question: str,

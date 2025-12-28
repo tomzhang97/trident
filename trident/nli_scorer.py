@@ -167,12 +167,12 @@ def _clean_relation_endpoint(x: str) -> str:
 def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
     ft = facet.facet_type
     tpl = facet.template or {}
-    
+
     if ft == FacetType.ENTITY:
         return _contains_exact_phrase(passage_text, str(tpl.get("mention", "")))
     if ft == FacetType.NUMERIC:
         return _contains_value(passage_text, str(tpl.get("value", "")))
-    
+
     # Generic BRIDGE_HOP
     if "BRIDGE_HOP" in ft.value:
         e1 = str(tpl.get("entity1", "") or tpl.get("entity", "") or "")
@@ -194,9 +194,16 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         o = _clean_relation_endpoint(o_raw)
         debug_rel = os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1"
 
+        # ================================================================
+        # CRITICAL: Detect PLACEHOLDER subjects like "[DIRECTOR_RESULT]"
+        # ================================================================
+        # Placeholder subjects are variable references from compositional facets
+        # They should be treated like WH-subjects (no subject match required)
+        is_placeholder_subject = "[" in s_raw and "_RESULT]" in s_raw
+
         # Detect if subject is a WH-word (meaningless for matching)
         # For queries like "Who directed X?", subject="Who" is not a real entity
-        is_wh_subject = (not s) or (s_raw.strip().lower() in _WH_WORDS)
+        is_wh_subject = (not s) or (s_raw.strip().lower() in _WH_WORDS) or is_placeholder_subject
 
         # If both endpoints are empty after cleaning, can't gate reliably - let NLI decide
         if not s and not o:
@@ -252,7 +259,7 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         if debug_rel:
             s_tokens = _token_set(s) if s else set()
             o_tokens = _token_set(o) if o else set()
-            print(f"[RELATION GATE] relation_kind={relation_kind} is_wh_subject={is_wh_subject}")
+            print(f"[RELATION GATE] relation_kind={relation_kind} is_wh_subject={is_wh_subject} is_placeholder={is_placeholder_subject}")
             print(f"[RELATION GATE] s_tokens={s_tokens} o_tokens={o_tokens} s_match={s_match} o_match={o_match}")
 
         # PREDICATE-SPECIFIC ANCHOR GATES
@@ -339,10 +346,9 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
             if debug_rel:
                 print(f"[RELATION GATE] BIRTHPLACE relation, predicate_match={predicate_match}")
 
+        # ================================================================
         # FINAL GATE LOGIC
-        # For WH-subject relations (like "Who directed X?"), don't require subject match
-        # The subject is just a placeholder, not a real entity to find
-        #
+        # ================================================================
         # CRITICAL: Include ALL relation kinds here, including explicit ones from compositional facets.
         all_known_relation_kinds = {
             "DIRECTOR", "BORN", "AWARD", "CREATED", "LOCATION", "MARRIAGE",
@@ -353,6 +359,9 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         # Check if this is a hop-2 compositional facet
         is_hop2 = tpl.get("hop") == 2 or tpl.get("compositional", False)
 
+        # Determine gate policy for logging
+        gate_policy = "STRICT"
+
         if is_hop2 and relation_kind in all_known_relation_kinds:
             # HOP-2 COMPOSITIONAL: Predicate-first gate (relaxed)
             # For hop-2, the passage often expresses the relation differently:
@@ -360,11 +369,20 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
             # - Gate should NOT block on subject match failure
             # Only require predicate anchors - NLI will do the semantic work
             result = predicate_match
+            gate_policy = "HOP2_RELAXED"
             if debug_rel:
                 print(f"[RELATION GATE] HOP-2 predicate-first: predicate_match={predicate_match}")
+        elif is_placeholder_subject and relation_kind in all_known_relation_kinds:
+            # PLACEHOLDER SUBJECT: Treat like WH-subject, predicate-first
+            # The subject "[DIRECTOR_RESULT]" is not a real entity to find
+            result = predicate_match
+            gate_policy = "PLACEHOLDER_RELAXED"
+            if debug_rel:
+                print(f"[RELATION GATE] PLACEHOLDER predicate-first: predicate_match={predicate_match}")
         elif is_wh_subject and relation_kind in all_known_relation_kinds:
             # WH-subject: only require object match + predicate match
             result = o_match and predicate_match
+            gate_policy = "WH_RELAXED"
         elif relation_kind in all_known_relation_kinds:
             # Concrete subject: require subject OR object match + predicate match
             result = (s_match or o_match) and predicate_match
@@ -374,7 +392,8 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
 
         if debug_rel:
             print(f"[RELATION GATE] subj_raw='{s_raw}' subj_clean='{s}' obj_raw='{o_raw}' obj_clean='{o}' "
-                  f"s_match={s_match} o_match={o_match} predicate_match={predicate_match} is_hop2={is_hop2} -> gate={result}")
+                  f"s_match={s_match} o_match={o_match} predicate_match={predicate_match} "
+                  f"is_hop2={is_hop2} gate_policy={gate_policy} -> gate={result}")
         return result
 
     if ft == FacetType.COMPARISON:
@@ -384,7 +403,7 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
 
     if ft == FacetType.TEMPORAL:
         return _contains_exact_phrase(passage_text, str(tpl.get("time", "")))
-        
+
     return None
 
 class NLIScorer:

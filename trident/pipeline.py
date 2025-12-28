@@ -49,6 +49,8 @@ from .chain_builder import (
     constrained_span_select,
     ConstrainedSelectionResult,
     QuestionType,
+    # Answer-facet targeted passage selection
+    get_answer_facet_passages,
     # LLM-based relation routing
     llm_route_relation,
     keyword_route_relation,
@@ -569,6 +571,11 @@ class TridentPipeline:
         facet_id_map = {}  # Track all facet_id -> winning passage mappings
         prompt_type = "none"  # Track which prompt type was used
 
+        # Initialize variables for metrics (must be set before if block for scoping)
+        answer_facet_ids = []
+        answer_selection_reason = ""
+        winner_passages = []
+
         if not result['abstained'] and result['selected_passages']:
             debug_chain = os.environ.get("TRIDENT_DEBUG_CHAIN", "0") == "1"
             debug_css = os.environ.get("TRIDENT_DEBUG_CSS", "0") == "1"
@@ -578,27 +585,43 @@ class TridentPipeline:
             prompt = ""  # Initialize prompt
 
             # ================================================================
-            # PRIORITY 0: Constrained Candidate Selection
+            # PRIORITY 0: Constrained Candidate Selection (FACET-TARGETED)
             # ================================================================
-            # Extract candidates from evidence, have LLM pick by index.
-            # This guarantees verbatim answers and enables support-based ranking.
+            # CRITICAL: Extract candidates from ANSWER-FACET winning passages only.
+            # This ensures we pick from passages that won the answer-determining facet,
+            # not just any passage that happened to certify an ENTITY facet.
             if certificates:
+                # Get passages that won the ANSWER facet (RELATION/TEMPORAL/NUMERIC)
+                # NOT just any winning passage (which may only have ENTITY facet)
+                answer_passages, answer_facet_ids, answer_selection_reason = get_answer_facet_passages(
+                    question=query,
+                    certificates=certificates,
+                    all_passages=result['selected_passages'],
+                    facets=facet_dicts
+                )
+
+                # Also get all winner passages for fallback
                 winner_passages = get_winner_passages_only(
                     certificates,
                     result['selected_passages']
                 )
 
                 if debug_chain or debug_constrained:
-                    print(f"\n[CONSTRAINED] Attempting Constrained Candidate Selection")
-                    print(f"  Winner passages: {len(winner_passages)}")
-                    for wp in winner_passages[:3]:
+                    print(f"\n[CONSTRAINED] Attempting FACET-TARGETED Candidate Selection")
+                    print(f"  Answer facets: {answer_facet_ids}")
+                    print(f"  Answer passages: {len(answer_passages)} (from answer facets)")
+                    print(f"  All winner passages: {len(winner_passages)}")
+                    for wp in answer_passages[:3]:
                         print(f"    - {wp.get('pid', '')[:12]}... ({len(wp.get('text', ''))} chars)")
 
-                if winner_passages:
+                # Use answer-facet passages if available, else fall back to all winners
+                constrained_passages = answer_passages if answer_passages else winner_passages
+
+                if constrained_passages:
                     constrained_result = constrained_span_select(
                         llm=self.llm,
                         question=query,
-                        winner_passages=winner_passages,
+                        winner_passages=constrained_passages,
                         max_candidates=10,
                         max_chars_per_passage=600
                     )
@@ -612,6 +635,7 @@ class TridentPipeline:
                         if debug_chain or debug_constrained:
                             print(f"[CONSTRAINED] Success: '{answer[:50] if answer else ''}' (index={constrained_result.candidate_index})")
                             print(f"[CONSTRAINED] Confidence: {constrained_result.confidence}")
+                            print(f"[CONSTRAINED] Pool: {answer_selection_reason}")
                             print(f"[CONSTRAINED] Candidates: {constrained_result.candidates[:3]}...")
                     elif constrained_result.reason == "FALLBACK_SUPPORT":
                         # LLM gave invalid index, but we used support-based fallback
@@ -881,6 +905,12 @@ class TridentPipeline:
         # Prepare output
         metrics = result.get('metrics', {})
         evidence_tokens = result.get('evidence_tokens', 0)
+        certificates = result.get('certificates', [])
+
+        # CRITICAL FIX: num_certified_facets must match len(certificates)
+        # Count unique facet_ids in certificates
+        certified_facet_ids = set(c.get("facet_id") for c in certificates if c.get("facet_id"))
+
         metrics.update({
             'evidence_tokens': evidence_tokens,
             'prompt_tokens': prompt_tokens,
@@ -897,13 +927,19 @@ class TridentPipeline:
             'constrained_candidate_index': constrained_result.candidate_index if constrained_result else None,
             'constrained_num_candidates': len(constrained_result.candidates) if constrained_result else 0,
             'constrained_passage_id': constrained_result.passage_id if constrained_result else None,
+            # Answer-facet targeting metrics
+            'answer_facet_ids': answer_facet_ids,
+            'answer_selection_reason': answer_selection_reason,
             # Certified Span Selection (CSS) metrics - fallback extraction method
             'used_css': used_css,
             'css_reason': css_result.reason if css_result else None,
             'css_confidence': css_result.confidence if css_result else None,
             'css_passage_id': css_result.passage_id if css_result else None,
+            # Certificate metrics - FIXED: use actual certificate count, not facet_id_map
+            'num_certificates': len(certificates),
+            'num_certified_facets': len(certified_facet_ids),
+            'certified_facet_ids': list(certified_facet_ids),
             # Certificate-aware reasoning metrics (fallback)
-            'num_certified_facets': len(facet_id_map),
             'relation_winning_passage': relation_info['passage_id'] if relation_info else None,
             'relation_winning_pvalue': relation_info['p_value'] if relation_info else None,
             # Chain-based reasoning metrics (fallback)
@@ -1657,33 +1693,40 @@ class TridentPipeline:
                     existing_pids.add(pid)
 
         # ============================================================
+        # ============================================================
         # STAGE B: Score and certify hop-2 facets
         # ============================================================
         # CRITICAL INVARIANT: Hop-2 facets must be fully instantiated before scoring.
         # If any facet still contains placeholders like [DIRECTOR_RESULT], the scorer
         # will see meaningless input and produce p≈1 (no certification possible).
+        placeholder_count = 0
         for f in hop2_facets:
             s = (f.template or {}).get("subject", "")
-            if "[" in s and "_RESULT]" in s:
+            o = (f.template or {}).get("object", "")
+            if ("[" in s and "_RESULT]" in s) or ("[" in o and "_RESULT]" in o):
+                placeholder_count += 1
                 # This is a fatal bug - instantiation was not applied
                 if debug:
                     print(f"  ERROR: Hop-2 facet not instantiated: {f.facet_id} subject={s}")
-                # Don't raise in production - just log and return hop-1 result
-                return hop1_result
 
-        # Re-score with new passages (if any were added)
-        if len(hop2_passages) > len(passages):
-            hop2_scores = self._two_stage_scoring(hop2_passages, hop2_facets)
-        else:
-            # Filter existing scores to hop-2 facet pairs
-            hop2_scores = TwoStageScores(
-                stage1_scores={k: v for k, v in scores.stage1_scores.items()
-                               if any(k[1] == f.facet_id for f in hop2_facets)},
-                stage2_scores={k: v for k, v in scores.stage2_scores.items()
-                               if any(k[1] == f.facet_id for f in hop2_facets)},
-                p_values={k: v for k, v in scores.p_values.items()
-                          if any(k[1] == f.facet_id for f in hop2_facets)}
-            )
+        if placeholder_count > 0:
+            if debug:
+                print(f"  [HOP2-INST] FATAL: {placeholder_count} facets still have placeholders")
+            # Don't raise in production - just log and return hop-1 result
+            return hop1_result
+
+        if debug:
+            print(f"  [HOP2-INST] All {len(hop2_facets)} facets instantiated, no placeholders")
+
+        # CRITICAL FIX: ALWAYS re-score hop2_facets after instantiation.
+        # The initial scoring at process_query was done with UNINSTANTIATED facets
+        # (with placeholders like [DIRECTOR_RESULT]) which produced meaningless scores.
+        # Those old scores are cached and MUST NOT be reused.
+        # We must always re-score with the instantiated facets.
+        hop2_scores = self._two_stage_scoring(hop2_passages, hop2_facets)
+
+        if debug:
+            print(f"  [HOP2-SCORE] Re-scored {len(hop2_facets)} instantiated facets on {len(hop2_passages)} passages")
 
         hop2_result = self._run_safe_cover(hop2_facets, hop2_passages, hop2_scores)
 
