@@ -1,5 +1,4 @@
 """Multi-hop chain builder for extracting answers from certified passages.
-
 This module builds explicit reasoning chains from certified evidence,
 ensuring that the answer is grounded in the actual passages selected.
 """
@@ -7,6 +6,7 @@ ensuring that the answer is grounded in the actual passages selected.
 from __future__ import annotations
 
 import re
+import string
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple, Any
@@ -40,7 +40,7 @@ class ChainHop:
 class ReasoningChain:
     """A complete multi-hop reasoning chain."""
     hop1: ChainHop
-    bridge_entity: str
+    bridge_entity: Optional[str]
     hop2: ChainHop
     score: float
 
@@ -155,11 +155,11 @@ def build_chain_from_certified(
         certificates: Optional certificate info for filtering
 
     Returns:
-        ReasoningChain if a valid 2-hop chain is found, None otherwise
+        ReasoningChain if a valid chain is found, None otherwise
     """
     if len(certified_passages) < 2:
         # Need at least 2 passages for a 2-hop chain
-        # If only 1 passage, return it as both hops (single-passage answer)
+        # If only 1 passage, return it as a single-hop chain (no bridge required)
         if len(certified_passages) == 1:
             p = certified_passages[0]
             ents = extract_entities(p.get('text', ''), p.get('title'))
@@ -172,9 +172,8 @@ def build_chain_from_certified(
                 relation_kinds=kinds,
                 hop_number=1
             )
-            # Single passage chain - use first entity as "bridge"
-            bridge = next(iter(ents), "")
-            return ReasoningChain(hop1=hop, bridge_entity=bridge, hop2=hop, score=0.5)
+            # Single passage chain - explicit None for bridge
+            return ReasoningChain(hop1=hop, bridge_entity=None, hop2=hop, score=0.5)
         return None
 
     # Get question entities and required relation kinds
@@ -280,7 +279,8 @@ def build_chain_from_certified(
 
         # Find a common entity as bridge
         common = hop1.entities & hop2.entities
-        bridge = next(iter(common), next(iter(hop1.entities), ""))
+        # Use None if no common bridge exists to avoid prompt hallucinations
+        bridge = next(iter(common), None)
 
         hop1_copy = ChainHop(
             passage_id=hop1.passage_id,
@@ -326,14 +326,30 @@ def extract_grounded_answer(
     if not llm_answer or not hop2_text:
         return llm_answer, False
 
-    # Normalize for matching
+    # Helper for normalization
+    def norm(s):
+        s = s.lower().strip()
+        # Remove punctuation
+        s = s.translate(str.maketrans("", "", string.punctuation))
+        # Normalize whitespace
+        s = " ".join(s.split())
+        return s
+
+    # 1. Exact substring check (original)
     answer_lower = llm_answer.lower().strip()
     hop2_lower = hop2_text.lower()
 
-    # Check if answer is a substring of hop2
     if answer_lower in hop2_lower:
         return llm_answer.strip(), True
 
+    # 2. Normalized substring check (punctuation agnostic)
+    norm_answer = norm(llm_answer)
+    norm_hop2 = norm(hop2_text)
+
+    if norm_answer and norm_answer in norm_hop2:
+        return llm_answer.strip(), True
+
+    # 3. Sliding window token overlap (fallback)
     # Try to find the best matching substring
     answer_tokens = answer_lower.split()
     if not answer_tokens:
@@ -361,6 +377,27 @@ def extract_grounded_answer(
     return llm_answer.strip(), False
 
 
+def build_single_hop_prompt(question: str, chain: ReasoningChain) -> str:
+    """Build a simplified prompt for single-passage questions."""
+    prompt_parts = []
+    prompt_parts.append("Answer the following question using ONLY the provided evidence passage.")
+    prompt_parts.append("")
+    prompt_parts.append(f"Question: {question}")
+    prompt_parts.append("")
+    prompt_parts.append("=== Evidence ===")
+    if chain.hop1.passage_title:
+        prompt_parts.append(f"[{chain.hop1.passage_title}]")
+    prompt_parts.append(chain.hop1.passage_text)
+    prompt_parts.append("")
+    prompt_parts.append("Instructions:")
+    prompt_parts.append("1. The answer must be found in the Evidence passage")
+    prompt_parts.append("2. Extract the exact answer span")
+    prompt_parts.append("3. If the answer cannot be found, respond with: I cannot answer based on the given context.")
+    prompt_parts.append("")
+    prompt_parts.append("Answer:")
+    return "\n".join(prompt_parts)
+
+
 def build_chain_prompt(
     question: str,
     chain: ReasoningChain,
@@ -371,15 +408,22 @@ def build_chain_prompt(
     This prompt explicitly shows the hop structure and asks the LLM
     to extract an answer that is grounded in the evidence.
     """
-    prompt_parts = []
+    # Use simplified prompt for single-hop cases (Hop1 == Hop2)
+    if chain.hop1.passage_id == chain.hop2.passage_id:
+        return build_single_hop_prompt(question, chain)
 
+    prompt_parts = []
     prompt_parts.append("Answer the following question using ONLY the provided evidence passages.")
     prompt_parts.append("The passages are ordered as a reasoning chain: Hop 1 introduces context, Hop 2 contains the answer.")
     prompt_parts.append("")
     prompt_parts.append(f"Question: {question}")
     prompt_parts.append("")
-    prompt_parts.append(f"Bridge Entity: {chain.bridge_entity}")
-    prompt_parts.append("")
+
+    # Only include Bridge Entity if it exists (multi-hop with overlap)
+    if chain.bridge_entity:
+        prompt_parts.append(f"Bridge Entity: {chain.bridge_entity}")
+        prompt_parts.append("")
+        
     prompt_parts.append("=== HOP 1 (Context) ===")
     if chain.hop1.passage_title:
         prompt_parts.append(f"[{chain.hop1.passage_title}]")
@@ -391,11 +435,15 @@ def build_chain_prompt(
     prompt_parts.append(chain.hop2.passage_text)
     prompt_parts.append("")
     prompt_parts.append("Instructions:")
-    prompt_parts.append("1. First identify the bridge entity that connects both passages")
+    if chain.bridge_entity:
+        prompt_parts.append("1. First identify the bridge entity that connects both passages")
+    else:
+        prompt_parts.append("1. Read the passages carefully")
+        
     prompt_parts.append("2. The answer MUST be found in Hop 2")
     prompt_parts.append("3. Extract the exact answer span from Hop 2")
     prompt_parts.append("4. If the answer cannot be found in Hop 2, respond with: I cannot answer based on the given context.")
     prompt_parts.append("")
-    prompt_parts.append("Answer (exact span from Hop 2):")
+    prompt_parts.append("Answer:")
 
     return "\n".join(prompt_parts)
