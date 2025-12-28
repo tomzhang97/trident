@@ -33,6 +33,7 @@ from .chain_builder import (
     extract_grounded_answer,
     regex_extract_answer_from_hop2,
     typed_extract_from_winning_passage,
+    bind_entity_from_hop1_winner,
     ReasoningChain
 )
 
@@ -455,8 +456,30 @@ class TridentPipeline:
         self.telemetry.log("scoring", {"num_scores": len(scores.stage2_scores)})
         
         # Step 4: Mode-specific selection
+        # For compositional questions, check if we need two-pass certification
+        hop1_facets, hop2_facets = self._split_facets_by_hop(facets)
+        is_compositional = len(hop2_facets) > 0
+
+        if is_compositional:
+            self.telemetry.log("compositional_detected", {
+                "hop1_facets": len(hop1_facets),
+                "hop2_facets": len(hop2_facets)
+            })
+
         if mode == "safe_cover":
-            result = self._run_safe_cover(facets, passages, scores)
+            if is_compositional:
+                # Use two-pass Certified Adaptive Safe-Cover
+                result = self._run_two_pass_safe_cover(
+                    query=query,
+                    hop1_facets=hop1_facets,
+                    hop2_facets=hop2_facets,
+                    passages=passages,
+                    scores=scores,
+                    context=context
+                )
+            else:
+                # Standard single-pass Safe-Cover
+                result = self._run_safe_cover(facets, passages, scores)
             
             # CRITICAL FIX: If Safe-Cover is infeasible or abstains, optionally fall back to Pareto
             is_abstained = result.get('abstained', False)
@@ -1205,6 +1228,251 @@ class TridentPipeline:
             return "BRIDGE_HOP"
 
         return facet_type_str
+
+    def _split_facets_by_hop(
+        self,
+        facets: List[Facet]
+    ) -> Tuple[List[Facet], List[Facet]]:
+        """
+        Split facets into hop-1 and hop-2 for compositional questions.
+
+        Hop-1 facets have template.hop == 1 or no hop field (default single-hop).
+        Hop-2 facets have template.hop == 2 (depend on hop-1 result).
+
+        Returns:
+            Tuple of (hop1_facets, hop2_facets)
+        """
+        hop1_facets = []
+        hop2_facets = []
+
+        for f in facets:
+            template = f.template or {}
+            hop = template.get('hop', 1)  # Default to hop-1
+
+            if hop == 2:
+                hop2_facets.append(f)
+            else:
+                hop1_facets.append(f)
+
+        return hop1_facets, hop2_facets
+
+    def _run_two_pass_safe_cover(
+        self,
+        query: str,
+        hop1_facets: List[Facet],
+        hop2_facets: List[Facet],
+        passages: List[Passage],
+        scores: TwoStageScores,
+        context: Optional[List[List[str]]] = None
+    ) -> Dict[str, Any]:
+        """
+        Certified Adaptive Safe-Cover for compositional (2-hop) questions.
+
+        Two-stage algorithm with typed binding:
+        1. Stage A: Certify hop-1 facets (find bridge entity)
+        2. Typed bind: Extract bridge entity from hop-1 winner
+        3. Conditioned retrieval: Retrieve using bridge entity + relation keyword
+        4. Stage B: Certify hop-2 facets (find final answer)
+        5. Return union of winners from both stages
+        """
+        import os
+        debug = os.environ.get("TRIDENT_DEBUG_TWOPASS", "0") == "1"
+
+        if debug:
+            print(f"\n[TWO-PASS] Running Certified Adaptive Safe-Cover")
+            print(f"  Hop-1 facets: {len(hop1_facets)}")
+            print(f"  Hop-2 facets: {len(hop2_facets)}")
+
+        # ============================================================
+        # STAGE A: Certify hop-1 facets
+        # ============================================================
+        hop1_result = self._run_safe_cover(hop1_facets, passages, scores)
+
+        if debug:
+            hop1_coverage = hop1_result.get('metrics', {}).get('coverage', 0)
+            print(f"  Hop-1 coverage: {hop1_coverage:.2f}")
+            print(f"  Hop-1 selected: {len(hop1_result.get('selected_passages', []))}")
+
+        # If hop-1 fails completely, we can't proceed with hop-2
+        if hop1_result.get('abstained', False) or not hop1_result.get('certificates'):
+            if debug:
+                print(f"  Hop-1 failed/abstained - returning hop-1 result only")
+            return hop1_result
+
+        # ============================================================
+        # TYPED BINDING: Extract bridge entity from hop-1 winner
+        # ============================================================
+        bound_entity = None
+        inner_relation_type = None
+
+        # Find the best hop-1 certificate (lowest p-value)
+        hop1_certs = hop1_result.get('certificates', [])
+        hop1_certs_sorted = sorted(hop1_certs, key=lambda c: c.get('p_value', 1.0))
+
+        for hop1_cert in hop1_certs_sorted:
+            # Find the corresponding facet to get inner_relation_type
+            cert_fid = hop1_cert.get('facet_id', '')
+            cert_pid = hop1_cert.get('passage_id', '')
+
+            for f in hop1_facets:
+                if f.facet_id == cert_fid:
+                    inner_type = f.template.get('inner_relation_type', '')
+                    if inner_type:
+                        # Find the winning passage
+                        for p in hop1_result.get('selected_passages', []):
+                            if p.get('pid') == cert_pid:
+                                passage_text = p.get('text', '')
+                                bound_entity = bind_entity_from_hop1_winner(inner_type, passage_text)
+                                if bound_entity:
+                                    inner_relation_type = inner_type
+                                    if debug:
+                                        print(f"  Bound entity: {bound_entity} (from {inner_type})")
+                                    break
+                    break
+            if bound_entity:
+                break
+
+        if not bound_entity:
+            if debug:
+                print(f"  Failed to bind entity from hop-1 - using hop-1 result only")
+            # Fall back to hop-1 result only
+            return hop1_result
+
+        # ============================================================
+        # CONDITIONED RETRIEVAL: Retrieve using bound entity + relation
+        # ============================================================
+        # Get the outer relation keyword from hop-2 facets
+        outer_relation_keyword = ""
+        for f in hop2_facets:
+            outer_type = f.template.get('outer_relation_type', '')
+            if outer_type:
+                # Map relation type to search keyword
+                outer_keywords = {
+                    'MOTHER': 'mother',
+                    'FATHER': 'father',
+                    'SPOUSE': 'married spouse wife husband',
+                    'CHILD': 'son daughter child',
+                    'NATIONALITY': 'nationality national citizen',
+                    'BIRTHPLACE': 'born birthplace',
+                    'AWARD': 'award prize won',
+                }
+                outer_relation_keyword = outer_keywords.get(outer_type, '')
+                break
+
+        # Build conditioned query: "bound_entity outer_relation"
+        conditioned_query = f"{bound_entity} {outer_relation_keyword}".strip()
+
+        if debug:
+            print(f"  Conditioned query: {conditioned_query}")
+
+        # Retrieve additional passages for hop-2
+        hop2_passages = passages.copy()  # Start with existing passages
+
+        if conditioned_query and hasattr(self, 'retriever'):
+            try:
+                conditioned_result = self.retriever.retrieve(
+                    conditioned_query,
+                    top_k=self.config.retrieval.top_k
+                )
+                # Add new passages (avoiding duplicates by pid)
+                existing_pids = {p.pid for p in hop2_passages}
+                for p in conditioned_result.passages:
+                    if p.pid not in existing_pids:
+                        hop2_passages.append(p)
+                        existing_pids.add(p.pid)
+
+                if debug:
+                    print(f"  Retrieved {len(conditioned_result.passages)} new passages for hop-2")
+            except Exception as e:
+                if debug:
+                    print(f"  Conditioned retrieval failed: {e}")
+
+        # ============================================================
+        # STAGE B: Score and certify hop-2 facets
+        # ============================================================
+        # Re-score with new passages (if any were added)
+        if len(hop2_passages) > len(passages):
+            hop2_scores = self._two_stage_scoring(hop2_passages, hop2_facets)
+        else:
+            # Filter existing scores to hop-2 facet pairs
+            hop2_scores = TwoStageScores(
+                stage1_scores={k: v for k, v in scores.stage1_scores.items()
+                               if any(k[1] == f.facet_id for f in hop2_facets)},
+                stage2_scores={k: v for k, v in scores.stage2_scores.items()
+                               if any(k[1] == f.facet_id for f in hop2_facets)},
+                p_values={k: v for k, v in scores.p_values.items()
+                          if any(k[1] == f.facet_id for f in hop2_facets)}
+            )
+
+        hop2_result = self._run_safe_cover(hop2_facets, hop2_passages, hop2_scores)
+
+        if debug:
+            hop2_coverage = hop2_result.get('metrics', {}).get('coverage', 0)
+            print(f"  Hop-2 coverage: {hop2_coverage:.2f}")
+            print(f"  Hop-2 selected: {len(hop2_result.get('selected_passages', []))}")
+
+        # ============================================================
+        # COMBINE: Union of hop-1 and hop-2 winners
+        # ============================================================
+        # Merge selected passages (dedup by pid)
+        combined_passages = []
+        seen_pids = set()
+
+        for p in hop1_result.get('selected_passages', []):
+            pid = p.get('pid', '')
+            if pid and pid not in seen_pids:
+                seen_pids.add(pid)
+                combined_passages.append(p)
+
+        for p in hop2_result.get('selected_passages', []):
+            pid = p.get('pid', '')
+            if pid and pid not in seen_pids:
+                seen_pids.add(pid)
+                combined_passages.append(p)
+
+        # Merge certificates
+        combined_certificates = []
+        combined_certificates.extend(hop1_result.get('certificates', []))
+        combined_certificates.extend(hop2_result.get('certificates', []))
+
+        # Combined metrics
+        total_facets = len(hop1_facets) + len(hop2_facets)
+        hop1_covered = hop1_result.get('metrics', {}).get('utility', 0)
+        hop2_covered = hop2_result.get('metrics', {}).get('utility', 0)
+
+        combined_coverage = (hop1_covered + hop2_covered) / total_facets if total_facets > 0 else 0
+
+        # Both must pass for non-abstention
+        combined_abstained = hop1_result.get('abstained', False) or hop2_result.get('abstained', False)
+
+        # Calculate token costs
+        hop1_tokens = hop1_result.get('evidence_tokens', 0)
+        hop2_tokens = hop2_result.get('evidence_tokens', 0)
+
+        if debug:
+            print(f"  Combined coverage: {combined_coverage:.2f}")
+            print(f"  Combined passages: {len(combined_passages)}")
+            print(f"  Combined certificates: {len(combined_certificates)}")
+            print(f"  Abstained: {combined_abstained}")
+
+        return {
+            'selected_passages': combined_passages,
+            'certificates': combined_certificates,
+            'abstained': combined_abstained,
+            'infeasible': hop1_result.get('infeasible', False) or hop2_result.get('infeasible', False),
+            'evidence_tokens': hop1_tokens + hop2_tokens,
+            'metrics': {
+                'coverage': combined_coverage,
+                'utility': hop1_covered + hop2_covered,
+                'num_units': len(combined_passages),
+                'num_facets': total_facets,
+                'hop1_coverage': hop1_result.get('metrics', {}).get('coverage', 0),
+                'hop2_coverage': hop2_result.get('metrics', {}).get('coverage', 0),
+                'bound_entity': bound_entity,
+                'inner_relation_type': inner_relation_type,
+                'two_pass': True,
+            }
+        }
 
     def _run_safe_cover(
         self,
