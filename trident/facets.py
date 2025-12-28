@@ -472,14 +472,18 @@ class FacetMiner:
         facets.extend(self._extract_numeric_facets(query))
         facets.extend(self._extract_comparison_facets(query))
         facets.extend(self._extract_causal_facets(query))
-        
+
+        # CRITICAL: Extract compositional (2-hop) facets BEFORE bridge facets
+        # e.g., "mother of the director of film X" -> DIRECTOR + MOTHER facets
+        facets.extend(self._extract_compositional_facets(query))
+
         dataset = str(getattr(self.config, "dataset", "")).lower()
         if "hotpot" not in dataset:
             facets.extend(self._extract_procedural_facets(query))
-        
+
         if self._is_multi_hop(query):
             facets.extend(self._extract_bridge_facets(query, supporting_facts))
-            
+
         return self._deduplicate_facets(facets)
 
     # ---- entity ----
@@ -609,6 +613,201 @@ class FacetMiner:
         procedural_patterns = [r"\bhow\s+to\b", r"\bwhat\s+are\s+the\s+steps\b", r"\bsteps?\s+to\b", r"\bprocedure\b", r"\bwalk\s+me\s+through\b", r"\bprocess\s+for\b", r"\bmethod\s+for\b"]
         if any(re.search(p, q) for p in procedural_patterns):
             facets.append(Facet(facet_id="procedural_0", facet_type=FacetType.PROCEDURAL, template={"trigger": "procedural"}))
+        return facets
+
+    # ---- compositional (2-hop) facets ----
+    def _extract_compositional_facets(self, query: str) -> List[Facet]:
+        """
+        Extract facets for compositional (2-hop) questions.
+
+        Patterns like:
+        - "Who is the mother of the director of film X?"
+        - "Where was the director of film X born?"
+        - "What nationality is the creator of X?"
+
+        These require TWO facets:
+        - Hop1: Inner relation (director of X) -> yields bridge entity
+        - Hop2: Outer relation (mother of [bridge]) -> yields final answer
+        """
+        facets: List[Facet] = []
+        q = _clean_text(query)
+        q_lower = q.lower()
+
+        # Outer relations (the final answer type)
+        # Maps pattern -> (relation_type, hypothesis_template)
+        outer_relations = {
+            'mother': ('MOTHER', 'mother'),
+            'father': ('FATHER', 'father'),
+            'wife': ('SPOUSE', 'wife'),
+            'husband': ('SPOUSE', 'husband'),
+            'spouse': ('SPOUSE', 'spouse'),
+            'son': ('CHILD', 'son'),
+            'daughter': ('CHILD', 'daughter'),
+            'child': ('CHILD', 'child'),
+            'nationality': ('NATIONALITY', 'nationality'),
+            'birthplace': ('BIRTHPLACE', 'birthplace'),
+            'born': ('BIRTHPLACE', 'birthplace'),  # "where was X born"
+        }
+
+        # Inner relations (the intermediate hop)
+        inner_relations = {
+            'director': 'DIRECTOR',
+            'directed': 'DIRECTOR',
+            'creator': 'CREATOR',
+            'created': 'CREATOR',
+            'founder': 'FOUNDER',
+            'founded': 'FOUNDER',
+            'author': 'AUTHOR',
+            'wrote': 'AUTHOR',
+            'written': 'AUTHOR',
+            'producer': 'PRODUCER',
+            'produced': 'PRODUCER',
+            'composer': 'COMPOSER',
+            'composed': 'COMPOSER',
+            'performer': 'PERFORMER',
+            'performed': 'PERFORMER',
+            'singer': 'PERFORMER',
+            'actor': 'PERFORMER',
+            'actress': 'PERFORMER',
+            'starring': 'PERFORMER',
+        }
+
+        # Pattern: "(outer) of the (inner) of (object)"
+        # e.g., "mother of the director of film Polish-Russian War"
+        pattern1 = r"(?:who\s+is\s+the\s+|what\s+is\s+the\s+)?(\w+)\s+of\s+(?:the\s+)?(\w+)\s+of\s+(?:(?:the\s+)?(?:film|movie|book|song|album|show|series|novel|play)\s+)?(.+?)(?:\?|$)"
+        for m in re.finditer(pattern1, q, flags=re.IGNORECASE):
+            outer_word = m.group(1).lower()
+            inner_word = m.group(2).lower()
+            inner_object = _safe_phrase(m.group(3))
+
+            if outer_word in outer_relations and inner_word in inner_relations:
+                outer_type, outer_name = outer_relations[outer_word]
+                inner_type = inner_relations[inner_word]
+
+                # Hop1: Inner relation facet (e.g., director of film X)
+                hop1_facet = Facet(
+                    facet_id=f"comp_hop1_{len(facets)}",
+                    facet_type=FacetType.RELATION,
+                    template={
+                        "subject": "Who",
+                        "predicate": f"is the {inner_word} of",
+                        "object": inner_object,
+                        "hop": 1,
+                        "compositional": True,
+                        "inner_relation_type": inner_type,
+                    },
+                    metadata={"compositional_hop": 1, "outer_relation": outer_type}
+                )
+                facets.append(hop1_facet)
+
+                # Hop2: Outer relation facet (e.g., mother of [hop1_result])
+                # Note: subject is a variable reference to hop1 result
+                hop2_facet = Facet(
+                    facet_id=f"comp_hop2_{len(facets)}",
+                    facet_type=FacetType.RELATION,
+                    template={
+                        "subject": f"[{inner_type}_RESULT]",  # Variable reference
+                        "predicate": f"'s {outer_name}",
+                        "object": "",
+                        "hop": 2,
+                        "compositional": True,
+                        "outer_relation_type": outer_type,
+                        "depends_on_hop": 1,
+                    },
+                    metadata={"compositional_hop": 2, "depends_on": f"comp_hop1_{len(facets)-1}"}
+                )
+                facets.append(hop2_facet)
+
+                import os
+                if os.environ.get("TRIDENT_DEBUG_COMPOSITIONAL", "0") == "1":
+                    print(f"[COMPOSITIONAL] Detected 2-hop pattern:")
+                    print(f"  Outer: {outer_type} ({outer_word})")
+                    print(f"  Inner: {inner_type} ({inner_word})")
+                    print(f"  Object: {inner_object}")
+
+        # Pattern: "Where was the (inner) of (object) born?"
+        # e.g., "Where was the director of film X born?"
+        pattern2 = r"where\s+(?:was|is)\s+(?:the\s+)?(\w+)\s+of\s+(?:(?:the\s+)?(?:film|movie|book|song|album|show|series|novel|play)\s+)?(.+?)\s+born\s*\?"
+        for m in re.finditer(pattern2, q, flags=re.IGNORECASE):
+            inner_word = m.group(1).lower()
+            inner_object = _safe_phrase(m.group(2))
+
+            if inner_word in inner_relations:
+                inner_type = inner_relations[inner_word]
+
+                # Hop1: Inner relation facet
+                hop1_facet = Facet(
+                    facet_id=f"comp_hop1_{len(facets)}",
+                    facet_type=FacetType.RELATION,
+                    template={
+                        "subject": "Who",
+                        "predicate": f"is the {inner_word} of",
+                        "object": inner_object,
+                        "hop": 1,
+                        "compositional": True,
+                        "inner_relation_type": inner_type,
+                    },
+                    metadata={"compositional_hop": 1, "outer_relation": "BIRTHPLACE"}
+                )
+                facets.append(hop1_facet)
+
+                # Hop2: Birthplace facet
+                hop2_facet = Facet(
+                    facet_id=f"comp_hop2_{len(facets)}",
+                    facet_type=FacetType.RELATION,
+                    template={
+                        "subject": f"[{inner_type}_RESULT]",
+                        "predicate": "was born in",
+                        "object": "",
+                        "hop": 2,
+                        "compositional": True,
+                        "outer_relation_type": "BIRTHPLACE",
+                        "depends_on_hop": 1,
+                    },
+                    metadata={"compositional_hop": 2, "depends_on": f"comp_hop1_{len(facets)-1}"}
+                )
+                facets.append(hop2_facet)
+
+        # Pattern: "What award did the (inner) of (object) win?"
+        pattern3 = r"what\s+(?:award|prize)\s+did\s+(?:the\s+)?(\w+)\s+of\s+(?:(?:the\s+)?(?:film|movie|book|song|album|show|series|novel|play)\s+)?(.+?)\s+(?:win|receive)\s*\?"
+        for m in re.finditer(pattern3, q, flags=re.IGNORECASE):
+            inner_word = m.group(1).lower()
+            inner_object = _safe_phrase(m.group(2))
+
+            if inner_word in inner_relations:
+                inner_type = inner_relations[inner_word]
+
+                hop1_facet = Facet(
+                    facet_id=f"comp_hop1_{len(facets)}",
+                    facet_type=FacetType.RELATION,
+                    template={
+                        "subject": "Who",
+                        "predicate": f"is the {inner_word} of",
+                        "object": inner_object,
+                        "hop": 1,
+                        "compositional": True,
+                        "inner_relation_type": inner_type,
+                    },
+                    metadata={"compositional_hop": 1, "outer_relation": "AWARD"}
+                )
+                facets.append(hop1_facet)
+
+                hop2_facet = Facet(
+                    facet_id=f"comp_hop2_{len(facets)}",
+                    facet_type=FacetType.RELATION,
+                    template={
+                        "subject": f"[{inner_type}_RESULT]",
+                        "predicate": "won",
+                        "object": "",
+                        "hop": 2,
+                        "compositional": True,
+                        "outer_relation_type": "AWARD",
+                        "depends_on_hop": 1,
+                    },
+                    metadata={"compositional_hop": 2, "depends_on": f"comp_hop1_{len(facets)-1}"}
+                )
+                facets.append(hop2_facet)
+
         return facets
 
     # ---- bridge (GENERIC HOPS) ----
