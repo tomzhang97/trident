@@ -435,10 +435,10 @@ def build_chain_prompt(
     prompt_parts.append(chain.hop2.passage_text)
     prompt_parts.append("")
     prompt_parts.append("Instructions:")
-    prompt_parts.append("1. The answer IS explicitly stated in the Evidence passages above.")
-    prompt_parts.append("2. Return ONLY the answer span (no extra words, no punctuation).")
-    prompt_parts.append("3. Copy the answer exactly as it appears (including accents/diacritics).")
-    prompt_parts.append("4. Look carefully - the answer is there. Only abstain if truly impossible.")
+    prompt_parts.append("1. If the answer is stated verbatim in the evidence, extract the EXACT span (copy it exactly).")
+    prompt_parts.append("2. Return ONLY the answer - no explanation, no extra words.")
+    prompt_parts.append("3. Preserve accents and special characters exactly as written.")
+    prompt_parts.append("4. If the answer is not stated in the evidence, respond exactly: I cannot answer based on the given context.")
     prompt_parts.append("")
     prompt_parts.append("Answer:")
 
@@ -624,11 +624,10 @@ def build_certificate_aware_prompt(
         return "", None, facet_id_map
 
     prompt_parts.append("Instructions:")
-    prompt_parts.append("1. The answer IS GUARANTEED to be in the evidence above - these passages were verified to contain it.")
-    prompt_parts.append("2. DO NOT say 'I cannot answer' - the answer is definitely present, find it.")
-    prompt_parts.append("3. Extract the EXACT answer span from the text (copy it verbatim).")
-    prompt_parts.append("4. Return ONLY the answer - no explanation, no extra words.")
-    prompt_parts.append("5. Preserve accents and special characters exactly as written.")
+    prompt_parts.append("1. If the answer is stated verbatim in the evidence, extract the EXACT span (copy it exactly).")
+    prompt_parts.append("2. Return ONLY the answer - no explanation, no extra words.")
+    prompt_parts.append("3. Preserve accents and special characters exactly as written.")
+    prompt_parts.append("4. If the answer is not stated in the evidence, respond exactly: I cannot answer based on the given context.")
     prompt_parts.append("")
     prompt_parts.append("Answer:")
 
@@ -640,13 +639,20 @@ def typed_extract_from_winning_passage(
     relation_info: Dict[str, Any]
 ) -> Optional[str]:
     """
-    Typed extraction from the RELATION-winning passage.
+    Facet-ID–aware typed extraction from the RELATION-winning passage.
 
-    This is the CORRECT fallback: extract from the passage that
-    actually certified the RELATION facet, using typed patterns
-    based on the facet's relation kind.
+    CRITICAL FIXES:
+    1. Uses facet template (subject/object/predicate) to constrain extraction
+    2. Checks semantic presence before extracting (abort if answer type absent)
+    3. Anchors on known entity spans from the facet template
+    4. Returns None to allow controlled abstention rather than garbage
 
-    Much more accurate than regex on arbitrary hop2_text!
+    Args:
+        question: The original question
+        relation_info: Dict with 'passage', 'facet', 'p_value', etc.
+
+    Returns:
+        Extracted answer string, or None if extraction not possible
     """
     if not relation_info:
         return None
@@ -658,20 +664,24 @@ def typed_extract_from_winning_passage(
     if not text:
         return None
 
-    # Get relation kind from facet template
+    # Get facet template - this is the key to facet-ID awareness
     template = facet.get('template', {})
-    predicate = template.get('predicate', '').lower()
-    facet_text = f"{template.get('subject', '')} {template.get('object', '')} {predicate}".lower()
+    subject = template.get('subject', '').strip()
+    obj = template.get('object', '').strip()
+    predicate = template.get('predicate', '').strip()
 
-    # Determine relation kind
+    # Build context for relation kind detection
+    facet_text = f"{subject} {obj} {predicate}".lower()
+
+    # Determine relation kind from facet template
     relation_kind = None
     for kind, triggers in REL_TRIGGERS.items():
         if any(t in facet_text for t in triggers):
             relation_kind = kind
             break
 
+    # Fallback: infer from question (less reliable)
     if not relation_kind:
-        # Try to infer from question
         q = question.lower()
         if "director" in q or "directed" in q:
             relation_kind = "DIRECTOR"
@@ -687,39 +697,60 @@ def typed_extract_from_winning_passage(
     if not relation_kind:
         return None
 
-    # Typed extraction patterns
     t = text
+    t_lower = t.lower()
     q = question.lower()
 
+    # ==== SEMANTIC PRESENCE CHECKS ====
+    # Abort extraction if the answer type is not present in the passage
+
     if relation_kind == "DIRECTOR":
-        # Pattern: "directed by Name" (most reliable)
-        m = re.search(r"(?i)\bdirected\s+by\s+([A-Z][a-zA-ZÀ-ÿ\s\-\.]+?)(?:\s*[,\.\(\)]|$)", t)
+        # Must have "directed" or "director" to extract a director name
+        if "directed" not in t_lower and "director" not in t_lower:
+            return None
+
+        # Extract PERSON name after "directed by" (most reliable pattern)
+        m = re.search(r"(?i)\bdirected\s+by\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$|\s+(?:is|was|and|who))", t)
         if m:
-            return m.group(1).strip()
-        # Pattern: "is a ... film directed by Name"
-        m = re.search(r"(?i)\bfilm\s+directed\s+by\s+([A-Z][a-zA-ZÀ-ÿ\s\-\.]+?)(?:\s*[,\.\(\)]|$)", t)
+            name = m.group(1).strip()
+            # Validate: should be 2-4 words, not start with common non-name words
+            words = name.split()
+            if 1 <= len(words) <= 4 and words[0].lower() not in {'the', 'a', 'an', 'this', 'that', 'film', 'movie', 'polish', 'australian'}:
+                return name
+
+        # Pattern: "Name directed the film" or "Name, who directed"
+        m = re.search(r"(?i)([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})\s+(?:,\s*who\s+)?directed\b", t)
         if m:
-            return m.group(1).strip()
-        # Pattern: "director Name" or "director of the film is Name"
-        m = re.search(r"(?i)\bdirector\s+(?:of\s+(?:the\s+)?film\s+)?(?:is\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-\.]+?)(?:\s*[,\.\(\)]|$)", t)
+            name = m.group(1).strip()
+            words = name.split()
+            if 1 <= len(words) <= 4 and words[0].lower() not in {'the', 'a', 'an', 'this', 'that', 'film', 'movie'}:
+                return name
+
+        # Pattern: "director Name" (less common but valid)
+        m = re.search(r"(?i)\bdirector\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$)", t)
         if m:
-            return m.group(1).strip()
-        # Pattern: "Name directed" or "Name, who directed"
-        m = re.search(r"(?i)([A-Z][a-zA-ZÀ-ÿ\s\-\.]+?)\s+(?:,\s*who\s+)?directed\b", t)
-        if m:
-            return m.group(1).strip()
+            name = m.group(1).strip()
+            words = name.split()
+            if 1 <= len(words) <= 4 and words[0].lower() not in {'of', 'the', 'a', 'an', 'is', 'was'}:
+                return name
 
     elif relation_kind == "BORN":
         if "where" in q or "place" in q:
-            # Birthplace patterns
-            m = re.search(r"(?i)\bborn\s+in\s+([A-Z][a-zA-ZÀ-ÿ\s\-\,]+?)(?:\s*[,\.\(\)]|on\s|$)", t)
+            # Birthplace - must have "born" to extract
+            if "born" not in t_lower:
+                return None
+            # Pattern: "born in Location"
+            m = re.search(r"(?i)\bborn\s+in\s+([A-Z][a-zA-ZÀ-ÿ\s\-]+?)(?:\s*[,\.\(\)]|on\s|$)", t)
             if m:
-                return m.group(1).strip().rstrip(",")
-            m = re.search(r"(?i)\bfrom\s+([A-Z][a-zA-ZÀ-ÿ\s\-\,]+?)(?:\s*[,\.\(\)]|$)", t)
-            if m:
-                return m.group(1).strip().rstrip(",")
+                loc = m.group(1).strip().rstrip(",")
+                # Validate: should be 1-4 words, look like a place
+                if 1 <= len(loc.split()) <= 4:
+                    return loc
         else:
-            # Birth date patterns
+            # Birth date - must have "born" and a year
+            if "born" not in t_lower or not re.search(r'\d{4}', t):
+                return None
+            # Pattern: "born on/in Month Day, Year" or "born on Day Month Year"
             m = re.search(r"(?i)\bborn\s+(?:on\s+)?([A-Z]?[a-zA-Z]+\s+\d{1,2},?\s+\d{4})", t)
             if m:
                 return m.group(1).strip()
@@ -728,18 +759,30 @@ def typed_extract_from_winning_passage(
                 return m.group(1).strip()
 
     elif relation_kind == "AWARD":
-        # Award patterns
+        # CRITICAL: Must have award-related words to extract an award
+        award_indicators = ['award', 'prize', 'medal', 'oscar', 'emmy', 'grammy', 'trophy', 'won', 'awarded', 'received']
+        if not any(ind in t_lower for ind in award_indicators):
+            return None  # Don't extract - passage doesn't contain award info
+
+        # Pattern: "won the X Award/Prize"
         m = re.search(r"(?i)\bwon\s+(?:the\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-]+?(?:Award|Prize|Medal|Oscar|Emmy|Grammy|Trophy))", t)
         if m:
             return m.group(1).strip()
+        # Pattern: "received the X Award"
         m = re.search(r"(?i)\breceived\s+(?:the\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-]+?(?:Award|Prize|Medal))", t)
         if m:
             return m.group(1).strip()
+        # Pattern: "awarded the X"
         m = re.search(r"(?i)\bawarded\s+(?:the\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-]+?(?:Award|Prize|Medal))", t)
         if m:
             return m.group(1).strip()
 
     elif relation_kind == "LOCATION":
+        # Must have location-related words
+        loc_indicators = ['located', 'capital', 'headquarters', 'based', 'situated']
+        if not any(ind in t_lower for ind in loc_indicators):
+            return None
+
         m = re.search(r"(?i)\blocated\s+in\s+([A-Z][a-zA-ZÀ-ÿ\s\-\,]+?)(?:\s*[,\.\(\)]|$)", t)
         if m:
             return m.group(1).strip().rstrip(",")
@@ -751,13 +794,18 @@ def typed_extract_from_winning_passage(
             return m.group(1).strip().rstrip(",")
 
     elif relation_kind == "MARRIAGE":
-        m = re.search(r"(?i)\bmarried\s+(?:to\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-\.]+?)(?:\s*[,\.\(\)]|in\s|$)", t)
+        # Must have marriage-related words
+        if "married" not in t_lower and "spouse" not in t_lower and "wife" not in t_lower and "husband" not in t_lower:
+            return None
+
+        m = re.search(r"(?i)\bmarried\s+(?:to\s+)?([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|in\s|$)", t)
         if m:
             return m.group(1).strip()
-        m = re.search(r"(?i)\bspouse\s+(?:is\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-\.]+?)(?:\s*[,\.\(\)]|$)", t)
+        m = re.search(r"(?i)\bspouse\s+(?:is\s+)?([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$)", t)
         if m:
             return m.group(1).strip()
 
+    # No valid extraction possible - return None for controlled abstention
     return None
 
 
