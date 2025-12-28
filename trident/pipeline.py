@@ -1442,36 +1442,41 @@ class TridentPipeline:
             return hop1_result
 
         # ============================================================
-        # CONDITIONED RETRIEVAL: Retrieve using bound entity + relation
+        # CONDITIONED CANDIDATE GENERATION: Filter/retrieve for hop-2
         # ============================================================
         # Get the outer relation keyword from hop-2 facets
-        outer_relation_keyword = ""
+        outer_relation_type = ""
+        outer_relation_keywords = []
         for f in hop2_facets:
             outer_type = f.template.get('outer_relation_type', '')
             if outer_type:
-                # Map relation type to search keyword
-                outer_keywords = {
-                    'MOTHER': 'mother',
-                    'FATHER': 'father',
-                    'SPOUSE': 'married spouse wife husband',
-                    'CHILD': 'son daughter child',
-                    'NATIONALITY': 'nationality national citizen',
-                    'BIRTHPLACE': 'born birthplace',
-                    'AWARD': 'award prize won',
+                outer_relation_type = outer_type
+                # Map relation type to search keywords (multiple for matching)
+                keyword_map = {
+                    'MOTHER': ['mother', 'son of', 'daughter of', 'child of', 'parent'],
+                    'FATHER': ['father', 'son of', 'daughter of', 'child of', 'parent'],
+                    'SPOUSE': ['married', 'spouse', 'wife', 'husband', 'wed'],
+                    'CHILD': ['son', 'daughter', 'child', 'parent'],
+                    'NATIONALITY': ['nationality', 'national', 'citizen', 'born in'],
+                    'BIRTHPLACE': ['born', 'birthplace', 'native of', 'birth'],
+                    'AWARD': ['award', 'prize', 'won', 'nominated', 'recipient'],
                 }
-                outer_relation_keyword = outer_keywords.get(outer_type, '')
+                outer_relation_keywords = keyword_map.get(outer_type, [outer_type.lower()])
                 break
 
-        # Build conditioned query: "bound_entity outer_relation"
-        conditioned_query = f"{bound_entity} {outer_relation_keyword}".strip()
+        if debug:
+            print(f"  Outer relation: {outer_relation_type}, keywords: {outer_relation_keywords}")
 
+        # Start with existing passages
+        hop2_passages = list(passages)
+        retrieved_new = 0
+
+        # Try retrieval first (if available)
+        conditioned_query = f"{bound_entity} {' '.join(outer_relation_keywords[:2])}".strip()
         if debug:
             print(f"  Conditioned query: {conditioned_query}")
 
-        # Retrieve additional passages for hop-2
-        hop2_passages = passages.copy()  # Start with existing passages
-
-        if conditioned_query and hasattr(self, 'retriever'):
+        if conditioned_query and hasattr(self, 'retriever') and self.retriever is not None:
             try:
                 conditioned_result = self.retriever.retrieve(
                     conditioned_query,
@@ -1483,12 +1488,64 @@ class TridentPipeline:
                     if p.pid not in existing_pids:
                         hop2_passages.append(p)
                         existing_pids.add(p.pid)
+                        retrieved_new += 1
 
                 if debug:
-                    print(f"  Retrieved {len(conditioned_result.passages)} new passages for hop-2")
+                    print(f"  Retrieved {retrieved_new} new passages for hop-2")
             except Exception as e:
                 if debug:
                     print(f"  Conditioned retrieval failed: {e}")
+
+        # ============================================================
+        # CONTEXT-POOL FILTER: If retrieval returned nothing, filter
+        # existing passages that mention bound_entity + relation keyword
+        # ============================================================
+        if retrieved_new == 0 and bound_entity:
+            if debug:
+                print(f"  Retrieval empty - filtering context pool for hop-2 candidates")
+
+            # Normalize bound entity for matching
+            bound_entity_lower = bound_entity.lower()
+            bound_entity_parts = bound_entity_lower.split()
+
+            # Filter passages that contain bound entity + relation keyword
+            filtered_candidates = []
+            for p in passages:
+                p_text = ""
+                p_title = ""
+                if hasattr(p, 'text'):
+                    p_text = (p.text or "").lower()
+                    p_title = (getattr(p, 'title', '') or "").lower()
+                elif isinstance(p, dict):
+                    p_text = (p.get('text') or "").lower()
+                    p_title = (p.get('title') or "").lower()
+                else:
+                    continue
+
+                combined_text = f"{p_title} {p_text}"
+
+                # Check if bound entity is mentioned (full name or parts)
+                entity_match = (
+                    bound_entity_lower in combined_text or
+                    all(part in combined_text for part in bound_entity_parts if len(part) > 2)
+                )
+
+                # Check if any relation keyword is present
+                keyword_match = any(kw.lower() in combined_text for kw in outer_relation_keywords)
+
+                if entity_match and keyword_match:
+                    filtered_candidates.append(p)
+
+            if debug:
+                print(f"  Found {len(filtered_candidates)} context-pool candidates for hop-2")
+
+            # Add filtered candidates to hop2_passages (avoiding duplicates)
+            existing_pids = {p.pid if hasattr(p, 'pid') else p.get('pid', '') for p in hop2_passages}
+            for p in filtered_candidates:
+                pid = p.pid if hasattr(p, 'pid') else p.get('pid', '')
+                if pid and pid not in existing_pids:
+                    hop2_passages.append(p)
+                    existing_pids.add(pid)
 
         # ============================================================
         # STAGE B: Score and certify hop-2 facets

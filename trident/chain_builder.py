@@ -1219,17 +1219,120 @@ def bind_entity_via_css(
     Returns:
         The bound entity string, or None if binding failed
     """
-    result = certified_span_select(
-        llm=llm,
-        question=inner_question,
-        winner_passages=hop1_passages,
-        max_chars_per_passage=max_chars
-    )
+    import json as json_module
+    import os
 
-    if result.abstain:
+    debug = os.environ.get("TRIDENT_DEBUG_CSS", "0") == "1"
+
+    if not hop1_passages:
         return None
 
-    return result.answer
+    # Build compact evidence
+    evidence_parts = []
+    for p in hop1_passages:
+        pid = p.get("pid", "")
+        title = p.get("title", "")
+        text = (p.get("text") or "")[:max_chars]
+        evidence_parts.append(f"[{pid}] {title}\n{text}")
+
+    evidence_text = "\n\n".join(evidence_parts)
+
+    # Specialized prompt for ENTITY BINDING (not general QA)
+    # Emphasizes extracting a PERSON'S NAME as verbatim substring
+    prompt = f"""Extract the PERSON'S NAME that answers the question below.
+
+CRITICAL RULES:
+1) The answer MUST be a person's name (first name + last name)
+2) Copy the name EXACTLY as it appears in the evidence (verbatim)
+3) Do NOT output film names, places, or descriptions - ONLY a person's name
+4) If no person's name answers the question, output empty answer
+
+Return JSON: {{"pid": "passage_id", "answer": "Person Name", "confidence": 0.9}}
+
+Question: {inner_question}
+
+Evidence:
+{evidence_text}
+
+JSON:"""
+
+    try:
+        raw = llm.generate(prompt)
+        raw_text = raw.text if hasattr(raw, 'text') else str(raw)
+    except Exception as e:
+        if debug:
+            print(f"[CSS-BIND] LLM generation failed: {e}")
+        return None
+
+    if debug:
+        print(f"[CSS-BIND] Raw output: {raw_text[:200]}...")
+
+    # Parse JSON response
+    try:
+        json_match = re.search(r'\{[^{}]*\}', raw_text, flags=re.DOTALL)
+        if json_match:
+            out = json_module.loads(json_match.group(0))
+        else:
+            out = json_module.loads(raw_text.strip())
+    except Exception as e:
+        if debug:
+            print(f"[CSS-BIND] JSON parse failed: {e}")
+        return None
+
+    answer = (out.get("answer") or "").strip()
+    pid = (out.get("pid") or "").strip()
+
+    if debug:
+        print(f"[CSS-BIND] Parsed: answer='{answer}', pid='{pid}'")
+
+    if not answer:
+        return None
+
+    # Validate: must look like a person's name (2-4 words, capitalized)
+    words = answer.split()
+    if len(words) < 1 or len(words) > 5:
+        if debug:
+            print(f"[CSS-BIND] Rejected: '{answer}' doesn't look like a name (word count)")
+        return None
+
+    # Check for garbage patterns (film titles, descriptions, etc.)
+    garbage_patterns = [
+        r'^(the|a|an)\s',  # Articles at start
+        r'film|movie|book|song|album|series',  # Media types
+        r'polish|russian|american|british',  # Nationalities (as adjectives)
+        r'^\d',  # Starts with digit
+        r'^[a-z]',  # Starts with lowercase (not a proper name)
+    ]
+    for pat in garbage_patterns:
+        if re.search(pat, answer, re.IGNORECASE):
+            if debug:
+                print(f"[CSS-BIND] Rejected: '{answer}' matches garbage pattern '{pat}'")
+            return None
+
+    # Verify it's a verbatim substring of a passage
+    passage_map = {p.get("pid", ""): p for p in hop1_passages}
+    verified = False
+
+    if pid and pid in passage_map:
+        passage_text = passage_map[pid].get("text", "")
+        if _find_exact_substring(passage_text, answer) is not None:
+            verified = True
+    else:
+        # Try all passages
+        for p in hop1_passages:
+            if _find_exact_substring(p.get("text", ""), answer) is not None:
+                verified = True
+                break
+
+    if not verified:
+        if debug:
+            print(f"[CSS-BIND] Rejected: '{answer}' not found verbatim in passages")
+        return None
+
+    if debug:
+        print(f"[CSS-BIND] Accepted: '{answer}'")
+
+    return answer
 
 
 def build_inner_question_from_facet(facet: Dict[str, Any]) -> str:

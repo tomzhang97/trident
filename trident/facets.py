@@ -232,12 +232,19 @@ class Facet:
             # "The passage states something about X" is TOO PERMISSIVE
             # Use predicate-specific templates that require the actual relation
             #
-            # CRITICAL: Check facet_text (subject + object + predicate combined)
-            # NOT just predicate - because predicate may be generic "is related to"
-            # while the actual relation type is in subject/object (e.g., "director of X")
-            facet_text_lower = f"{s_raw} {o_raw} {p}".lower()
+            # CRITICAL FIX: Check for EXPLICIT relation_kind in template FIRST
+            # This is needed for compositional hop-2 facets where the subject
+            # contains "[DIRECTOR_RESULT]" but the actual relation is MOTHER
+            explicit_relation_kind = tpl.get('outer_relation_type') or tpl.get('relation_kind')
 
-            # Detect relation kind from combined text (same logic as gate)
+            # For hop-2 compositional facets, use the bound entity variable as subject
+            bound_entity_var = None
+            if tpl.get('hop') == 2 and s_raw.startswith('[') and s_raw.endswith('_RESULT]'):
+                bound_entity_var = s_raw  # e.g., "[DIRECTOR_RESULT]"
+                # Don't use the variable reference in hypothesis - use placeholder
+                s = "the person"  # Generic placeholder for bound entity
+
+            # Detect relation kind - explicit first, then keyword fallback
             relation_kind = "DEFAULT"
             hypothesis = None
 
@@ -251,6 +258,60 @@ class Facet:
                 # Build pattern: match any suffix word at end (with optional punctuation)
                 pattern = r'\s+(?:' + '|'.join(re.escape(w) for w in suffixes) + r')[\s\.\?\!]*$'
                 return re.sub(pattern, '', entity, flags=re.IGNORECASE).strip()
+
+            # ================================================================
+            # EXPLICIT RELATION KIND (from compositional facets)
+            # ================================================================
+            if explicit_relation_kind:
+                relation_kind = explicit_relation_kind
+
+                if relation_kind == "MOTHER":
+                    # "The passage states who is the mother of X" or
+                    # "The passage states that X is the son/daughter of Y"
+                    hypothesis = f"The passage states the mother of {s}" if s else "The passage identifies a mother-child relationship"
+
+                elif relation_kind == "FATHER":
+                    hypothesis = f"The passage states the father of {s}" if s else "The passage identifies a father-child relationship"
+
+                elif relation_kind in ("PARENT", "CHILD"):
+                    hypothesis = f"The passage states a parent-child relationship involving {s}" if s else "The passage identifies a parent-child relationship"
+
+                elif relation_kind == "SPOUSE":
+                    hypothesis = f"The passage states who {s} married" if s else "The passage identifies a marriage/spouse relationship"
+
+                elif relation_kind == "NATIONALITY":
+                    hypothesis = f"The passage states the nationality of {s}" if s else "The passage identifies someone's nationality"
+
+                elif relation_kind == "BIRTHPLACE":
+                    hypothesis = f"The passage states where {s} was born" if s else "The passage identifies someone's birthplace"
+
+                elif relation_kind == "AWARD":
+                    hypothesis = f"The passage states what award {s} won" if s else "The passage identifies an award"
+
+                # If explicit relation kind matched, return now
+                if hypothesis:
+                    import os
+                    if os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1":
+                        print(f"[RELATION HYP] EXPLICIT relation_kind={relation_kind} hypothesis={hypothesis}")
+                    return _ensure_sentence(hypothesis)
+
+            # ================================================================
+            # KEYWORD-BASED RELATION KIND (fallback for non-compositional facets)
+            # ================================================================
+            # CRITICAL: For compositional hop-2 facets, we should have matched above.
+            # This section is for regular (non-compositional) RELATION facets.
+            facet_text_lower = f"{s_raw} {o_raw} {p}".lower()
+
+            # Skip keyword detection if this is a hop-2 facet (should have been handled above)
+            if tpl.get('hop') == 2:
+                # Hop-2 without explicit relation_kind - use generic hypothesis
+                if bound_entity_var:
+                    relation_kind = "HOP2_GENERIC"
+                    hypothesis = f"The passage states information about {s}"
+                    import os
+                    if os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1":
+                        print(f"[RELATION HYP] HOP2 generic: {hypothesis}")
+                    return _ensure_sentence(hypothesis)
 
             # Director/directed
             if 'direct' in facet_text_lower or 'director' in facet_text_lower:
