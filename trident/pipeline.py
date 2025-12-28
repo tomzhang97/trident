@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import string
 import time
@@ -84,6 +85,7 @@ def _normalize_for_filter(text: str) -> str:
     t = " ".join(t.split())
     return t
 
+
 def _looks_like_meta(text: str) -> bool:
     """Filter out lines that look like meta / system chatter, not the actual answer."""
     norm = _normalize_for_filter(text)
@@ -164,14 +166,18 @@ def extract_final_answer(raw_text: str, question: str) -> str:
     if _is_abstain_answer(text):
         return ABSTAIN_STR
 
+    # Guard: form-field hallucination (underscores / dashes)
+    if re.fullmatch(r"[_\-\s]{3,}", text):
+        return ABSTAIN_STR
+
     # 0) Strip "Step N:" style reasoning lines (even at end of text)
     text = re.sub(r'(?mi)^step\s+\d+:[^\n]*$', '', text)
     text = re.sub(r'(?i)step\s+\d+:[^\.!\n]*', '', text)
 
-    # 1) First priority: Look for "Final answer:" pattern (case-insensitive)
+    # 1) First priority: Look for "" pattern (case-insensitive)
     # This is the most explicit indicator from our prompt
     final_answer_patterns = [
-        r"(?i)final\s+answer\s*[:\-]\s*(.+?)(?:\n|$)",  # "Final answer: <answer>"
+        r"(?i)final\s+answer\s*[:\-]\s*(.+?)(?:\n|$)",  # " <answer>"
         r"(?i)final\s+answer\s*[:\-]\s*(.+)",  # Fallback without newline requirement
     ]
 
@@ -179,6 +185,11 @@ def extract_final_answer(raw_text: str, question: str) -> str:
         m = re.search(pat, text)
         if m:
             cand = m.group(1).strip()
+            
+            # Guard: form-field hallucination in candidate
+            if re.fullmatch(r"[_\-\s]{3,}", cand):
+                return ABSTAIN_STR
+
             # Clean up common trailing artifacts
             cand = re.sub(r'\s*(Human:|Assistant:|Question:).*$', '', cand, flags=re.IGNORECASE)
             # CRITICAL: Check for abstention BEFORE _looks_like_meta
@@ -226,6 +237,11 @@ def extract_final_answer(raw_text: str, question: str) -> str:
         m = re.search(pat, text)
         if m:
             cand = m.group(1).strip()
+            
+            # Guard: form-field hallucination in candidate
+            if re.fullmatch(r"[_\-\s]{3,}", cand):
+                return ABSTAIN_STR
+
             # Remove trailing punctuation and artifacts
             cand = re.sub(r'[.,;]+$', '', cand)
             # Clean up Human:/Assistant: artifacts
@@ -249,6 +265,11 @@ def extract_final_answer(raw_text: str, question: str) -> str:
             return ABSTAIN_STR
         if _looks_like_meta(line):
             continue
+        
+        # Guard: form-field hallucination
+        if re.fullmatch(r"[_\-\s]{3,}", line):
+            continue
+
         # Look for substantive content (not too short, not too long)
         if 2 <= len(line) <= 100:
             # Clean up
@@ -284,7 +305,7 @@ def extract_final_answer(raw_text: str, question: str) -> str:
 
 class TridentPipeline:
     """Main TRIDENT pipeline orchestrator."""
-    
+
     def __init__(
         self,
         config: TridentConfig,
@@ -360,7 +381,7 @@ class TridentPipeline:
         # Caches
         self.score_cache: Dict[Tuple[str, str, str], float] = {}
         self.retrieval_cache: Dict[str, RetrievalResult] = {}
-    
+
     def process_query(
         self,
         query: str,
@@ -433,29 +454,37 @@ class TridentPipeline:
         # Step 4: Mode-specific selection
         if mode == "safe_cover":
             result = self._run_safe_cover(facets, passages, scores)
+            
             # CRITICAL FIX: If Safe-Cover is infeasible or abstains, optionally fall back to Pareto
-            if result.get('abstained', False) or result.get('infeasible', False):
+            is_abstained = result.get('abstained', False)
+            is_infeasible = result.get('infeasible', False)
+            
+            if is_abstained or is_infeasible:
                 # Access the fallback_to_pareto field directly from the dataclass instance
-                if self.config.safe_cover.fallback_to_pareto:
+                if hasattr(self.config, 'safe_cover') and self.config.safe_cover.fallback_to_pareto:
                     self.telemetry.log("fallback", {"reason": "safe_cover_abstain_or_infeasible"})
+                    
                     # IMPORTANT: Preserve Safe-Cover attempt details before fallback
+                    metrics = result.get('metrics', {})
                     safe_cover_attempt = {
                         'certificates': result.get('certificates', []),
-                        'covered_facets': result.get('metrics', {}).get('coverage', 0),
+                        'covered_facets': metrics.get('coverage', 0),
                         'dual_lower_bound': result.get('dual_lower_bound'),
-                        'abstention_reason': result.get('metrics', {}).get('abstention_reason'),
+                        'abstention_reason': metrics.get('abstention_reason'),
                     }
+                    
                     # Run Pareto with the same data
-                    pareto_result = self._run_pareto(query, facets, passages, scores)
-                    # Use the Pareto result instead, but preserve Safe-Cover attempt info
-                    result = pareto_result
+                    result = self._run_pareto(query, facets, passages, scores)
+                    
                     # Append Safe-Cover attempt details to metrics
+                    if 'metrics' not in result:
+                        result['metrics'] = {}
                     result['metrics']['fallback_from'] = 'safe_cover'
                     result['metrics']['safe_cover_attempt'] = safe_cover_attempt
-                    # Preserve Safe-Cover certificates in the result
+                    
+                    # Preserve Safe-Cover certificates in the result if Pareto doesn't provide them
                     if not result.get('certificates'):
                         result['certificates'] = safe_cover_attempt['certificates']
-                # else: keep the original Safe-Cover result (e.g., abstained=True)
         elif mode == "pareto":
             result = self._run_pareto(query, facets, passages, scores)
         elif mode == "both":
@@ -591,10 +620,7 @@ class TridentPipeline:
             facets=[f.to_dict() for f in facets],
             trace=self.telemetry.get_trace()
         )
-    
-    # Removed the old _extract_final_answer method and _clean_answer method
-    # as they are replaced by the standalone extract_final_answer function.
-    
+
     def _retrieve_passages(
         self,
         query: str,
@@ -675,13 +701,13 @@ class TridentPipeline:
         # Cache result
         self.retrieval_cache[cache_key] = result
         return result
-    
+
     def _estimate_token_cost(self, text: str) -> int:
         """Estimate token cost more accurately."""
         # More realistic estimate: ~1.3 tokens per word + overhead
         words = len(text.split())
         return int(words * 1.3) + 10  # Add overhead for special tokens
-    
+
     def _two_stage_scoring(
         self,
         passages: List[Passage],
@@ -954,7 +980,7 @@ class TridentPipeline:
             stage2_scores=stage2_scores,
             p_values=p_values
         )
-    
+
     def _shortlist_for_facet(
         self,
         passages: List[Passage],
@@ -1033,7 +1059,7 @@ class TridentPipeline:
             if kw_norm and f" {kw_norm} " in text_norm:
                 matches += 1
         return matches / len(keywords)
-    
+
     def _get_calibration_bucket(self, facet: Facet) -> str:
         """
         Get calibration bucket for facet.
@@ -1054,7 +1080,7 @@ class TridentPipeline:
             return "BRIDGE_HOP"
 
         return facet_type_str
-    
+
     def _run_safe_cover(
         self,
         facets: List[Facet],
@@ -1090,9 +1116,14 @@ class TridentPipeline:
             else self.config.safe_cover.token_cap
         )
         for passage in result.selected_passages:
+            title = None
+            if hasattr(passage, "metadata") and isinstance(passage.metadata, dict):
+                title = passage.metadata.get("title")
+                
             selected.append({
                 'pid': passage.pid,
                 'text': passage.text,
+                'title': title,
                 'cost': passage.cost,
                 'covered_facets': result.coverage_map.get(passage.pid, [])
             })
@@ -1145,7 +1176,7 @@ class TridentPipeline:
                 'dual_lower_bound': getattr(result, 'dual_lower_bound', None),
             }
         }
-    
+
     def _run_pareto(
         self,
         query: str,
@@ -1253,11 +1284,16 @@ class TridentPipeline:
         # Convert to output format
         selected = []
         for passage in result.selected_passages:
+            title = None
+            if hasattr(passage, "metadata") and isinstance(passage.metadata, dict):
+                title = passage.metadata.get("title")
+
             selected.append({
                 'pid': passage.pid,
                 'text': passage.text,
+                'title': title,
                 'cost': passage.cost,
-                'utility_contribution': passage.metadata.get('utility', 0)
+                'utility_contribution': passage.metadata.get('utility', 0) if passage.metadata else 0
             })
 
         budget_cap = (
@@ -1290,11 +1326,11 @@ class TridentPipeline:
                 'evidence_tokens_over_budget': evidence_over_budget,
             }
         }
-    
+
     def get_telemetry(self) -> Dict[str, Any]:
         """Get telemetry data."""
         return self.telemetry.get_summary()
-    
+
     def reset_caches(self) -> None:
         """Reset all caches."""
         self.score_cache.clear()
