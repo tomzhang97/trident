@@ -634,6 +634,109 @@ def build_certificate_aware_prompt(
     return "\n".join(prompt_parts), best_relation_info, facet_id_map
 
 
+def bind_entity_from_hop1_winner(
+    relation_type: str,
+    passage_text: str
+) -> Optional[str]:
+    """
+    Typed binding of the intermediate entity from hop-1 winner passage.
+
+    This is NOT answer extraction - it's binding a variable for hop-2.
+    Much easier because we're extracting a named entity from one known relation.
+
+    Args:
+        relation_type: The inner relation type (DIRECTOR, AUTHOR, etc.)
+        passage_text: The text of the hop-1 winning passage
+
+    Returns:
+        The bound entity name (e.g., "Xawery Żuławski"), or None if not found
+    """
+    if not passage_text:
+        return None
+
+    t = passage_text
+    t_lower = t.lower()
+
+    if relation_type == "DIRECTOR":
+        # Must have "directed" to extract director name
+        if "directed" not in t_lower and "director" not in t_lower:
+            return None
+
+        # Pattern: "directed by Name" (most reliable)
+        m = re.search(r"(?i)\bdirected\s+by\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$|\s+(?:is|was|and|who))", t)
+        if m:
+            name = m.group(1).strip()
+            words = name.split()
+            if 1 <= len(words) <= 4:
+                return name
+
+        # Pattern: "Name directed" or "Name, who directed"
+        m = re.search(r"(?i)([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})\s+(?:,\s*who\s+)?directed\b", t)
+        if m:
+            name = m.group(1).strip()
+            words = name.split()
+            if 1 <= len(words) <= 4 and words[0].lower() not in {'the', 'a', 'an', 'film', 'movie'}:
+                return name
+
+        # Pattern: "X is an Australian director" -> extract X
+        m = re.search(r"(?i)([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})\s+(?:is|was)\s+(?:an?\s+)?(?:\w+\s+)?director", t)
+        if m:
+            name = m.group(1).strip()
+            words = name.split()
+            if 1 <= len(words) <= 4:
+                return name
+
+    elif relation_type == "AUTHOR":
+        if "written" not in t_lower and "wrote" not in t_lower and "author" not in t_lower:
+            return None
+
+        m = re.search(r"(?i)\bwritten\s+by\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$)", t)
+        if m:
+            return m.group(1).strip()
+
+        m = re.search(r"(?i)([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})\s+wrote\b", t)
+        if m:
+            return m.group(1).strip()
+
+    elif relation_type == "CREATOR":
+        if "created" not in t_lower and "founder" not in t_lower:
+            return None
+
+        m = re.search(r"(?i)\bcreated\s+by\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$)", t)
+        if m:
+            return m.group(1).strip()
+
+        m = re.search(r"(?i)\bfounded\s+by\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$)", t)
+        if m:
+            return m.group(1).strip()
+
+    elif relation_type == "PRODUCER":
+        if "produced" not in t_lower and "producer" not in t_lower:
+            return None
+
+        m = re.search(r"(?i)\bproduced\s+by\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$)", t)
+        if m:
+            return m.group(1).strip()
+
+    elif relation_type == "COMPOSER":
+        if "composed" not in t_lower and "composer" not in t_lower:
+            return None
+
+        m = re.search(r"(?i)\bcomposed\s+by\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$)", t)
+        if m:
+            return m.group(1).strip()
+
+    elif relation_type == "PERFORMER":
+        if "starred" not in t_lower and "performed" not in t_lower and "starring" not in t_lower:
+            return None
+
+        m = re.search(r"(?i)\bstarring\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$)", t)
+        if m:
+            return m.group(1).strip()
+
+    return None
+
+
 def typed_extract_from_winning_passage(
     question: str,
     relation_info: Dict[str, Any]
