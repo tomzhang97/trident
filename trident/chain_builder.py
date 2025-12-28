@@ -435,15 +435,91 @@ def build_chain_prompt(
     prompt_parts.append(chain.hop2.passage_text)
     prompt_parts.append("")
     prompt_parts.append("Instructions:")
-    if chain.bridge_entity:
-        prompt_parts.append("1. First identify the bridge entity that connects both passages")
-    else:
-        prompt_parts.append("1. Read the passages carefully")
-        
-    prompt_parts.append("2. The answer MUST be found in Hop 2")
-    prompt_parts.append("3. Extract the exact answer span from Hop 2")
-    prompt_parts.append("4. If the answer cannot be found in Hop 2, respond with: I cannot answer based on the given context.")
+    prompt_parts.append("1. The answer IS explicitly stated in the Evidence passages above.")
+    prompt_parts.append("2. Return ONLY the answer span (no extra words, no punctuation).")
+    prompt_parts.append("3. Copy the answer exactly as it appears (including accents/diacritics).")
+    prompt_parts.append("4. Only if the answer is truly not stated, respond exactly: I cannot answer based on the given context.")
     prompt_parts.append("")
     prompt_parts.append("Answer:")
 
     return "\n".join(prompt_parts)
+
+
+def regex_extract_answer_from_hop2(
+    question: str,
+    facets: List[Dict[str, Any]],
+    hop2_text: str
+) -> Optional[str]:
+    """
+    Deterministic fallback extraction when the LLM abstains.
+    Only uses hop2_text (grounded) and simple relation patterns.
+
+    This is a safety net for when the LLM abstains even though
+    the answer is clearly present in the certified evidence.
+    """
+    if not hop2_text:
+        return None
+
+    t = hop2_text
+    q = question.lower()
+
+    # Check if we have RELATION facets
+    has_relation = any(f.get("facet_type") == "RELATION" for f in facets)
+
+    if has_relation:
+        # DIRECTOR: "directed by X" or "X directed"
+        if "director" in q or "directed" in q or "direct" in q:
+            # Pattern: "directed by Name"
+            m = re.search(r"(?i)\bdirected\s+by\s+([A-Z][a-zA-ZÀ-ÿ\s\-\.]+?)(?:\s*[,\.\(\)]|$)", t)
+            if m:
+                return m.group(1).strip()
+            # Pattern: "director Name"
+            m = re.search(r"(?i)\bdirector\s+([A-Z][a-zA-ZÀ-ÿ\s\-\.]+?)(?:\s*[,\.\(\)]|$)", t)
+            if m:
+                return m.group(1).strip()
+            # Pattern: "film by Name"
+            m = re.search(r"(?i)\bfilm\s+by\s+([A-Z][a-zA-ZÀ-ÿ\s\-\.]+?)(?:\s*[,\.\(\)]|$)", t)
+            if m:
+                return m.group(1).strip()
+
+        # BORN: "born in X" or "was born on X"
+        if "born" in q or "birth" in q:
+            # Birthplace
+            if "where" in q or "place" in q:
+                m = re.search(r"(?i)\bborn\s+in\s+([A-Z][a-zA-ZÀ-ÿ\s\-\,]+?)(?:\s*[,\.\(\)]|on\s|$)", t)
+                if m:
+                    return m.group(1).strip().rstrip(",")
+            # Birth date
+            else:
+                m = re.search(r"(?i)\bborn\s+(?:on\s+)?([A-Z]?[a-zA-Z0-9\s\,]+\d{4})", t)
+                if m:
+                    return m.group(1).strip()
+
+        # AWARD: "won X" or "received X award"
+        if "award" in q or "won" in q or "prize" in q:
+            m = re.search(r"(?i)\bwon\s+(?:the\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-]+?(?:Award|Prize|Medal|Oscar|Emmy|Grammy))", t)
+            if m:
+                return m.group(1).strip()
+            m = re.search(r"(?i)\breceived\s+(?:the\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-]+?(?:Award|Prize|Medal))", t)
+            if m:
+                return m.group(1).strip()
+
+        # LOCATION: "located in X" or "capital of X is Y"
+        if "located" in q or "capital" in q or "headquarters" in q:
+            m = re.search(r"(?i)\blocated\s+in\s+([A-Z][a-zA-ZÀ-ÿ\s\-\,]+?)(?:\s*[,\.\(\)]|$)", t)
+            if m:
+                return m.group(1).strip().rstrip(",")
+            m = re.search(r"(?i)\bcapital\s+(?:is|of)\s+([A-Z][a-zA-ZÀ-ÿ\s\-]+?)(?:\s*[,\.\(\)]|$)", t)
+            if m:
+                return m.group(1).strip()
+            m = re.search(r"(?i)\bheadquarters\s+(?:is|are)\s+(?:in\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-\,]+?)(?:\s*[,\.\(\)]|$)", t)
+            if m:
+                return m.group(1).strip().rstrip(",")
+
+        # MARRIAGE: "married X" or "spouse X"
+        if "married" in q or "spouse" in q or "wife" in q or "husband" in q:
+            m = re.search(r"(?i)\bmarried\s+(?:to\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-\.]+?)(?:\s*[,\.\(\)]|in\s|$)", t)
+            if m:
+                return m.group(1).strip()
+
+    return None

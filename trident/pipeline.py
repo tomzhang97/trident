@@ -30,6 +30,7 @@ from .chain_builder import (
     build_chain_from_certified,
     build_chain_prompt,
     extract_grounded_answer,
+    regex_extract_answer_from_hop2,
     ReasoningChain
 )
 
@@ -505,6 +506,7 @@ class TridentPipeline:
         answer = ""
         chain = None
         is_grounded = False
+        used_regex_fallback = False
 
         if not result['abstained'] and result['selected_passages']:
             # Build reasoning chain from certified passages
@@ -563,6 +565,23 @@ class TridentPipeline:
                 if is_grounded:
                     answer = grounded_answer
 
+            # REGEX FALLBACK: If model abstains even with certified evidence,
+            # try deterministic extraction from hop2 (still grounded)
+            if chain and (answer == ABSTAIN_STR or _is_abstain_answer(answer)):
+                fb = regex_extract_answer_from_hop2(
+                    question=query,
+                    facets=[f.to_dict() for f in facets],
+                    hop2_text=chain.hop2.passage_text
+                )
+                if fb:
+                    if debug_chain:
+                        print(f"[CHAIN DEBUG] Regex fallback triggered:")
+                        print(f"  LLM abstained with: {answer[:50]}...")
+                        print(f"  Regex extracted: {fb}")
+                    answer = fb
+                    is_grounded = True
+                    used_regex_fallback = True
+
             # DEBUG: Log when answer becomes empty after extraction
             if not answer or answer.strip() == "":
                 if os.environ.get("TRIDENT_DEBUG_EMPTY_ANSWER", "0") == "1":
@@ -606,6 +625,7 @@ class TridentPipeline:
             'chain_score': chain.score if chain else 0.0,
             'bridge_entity': chain.bridge_entity if chain else None,
             'answer_grounded': is_grounded,
+            'answer_from_regex_fallback': used_regex_fallback,
         })
 
         return PipelineOutput(
