@@ -178,6 +178,91 @@ class FacetType(Enum):
     def core_types(cls) -> list:
         return [cls.ENTITY, cls.RELATION, cls.TEMPORAL, cls.NUMERIC, cls.BRIDGE_HOP]
 
+
+def instantiate_facets(
+    facets: List["Facet"],
+    bindings: Dict[str, str]
+) -> List["Facet"]:
+    """
+    Replace symbolic placeholders in facet templates with concrete bound entities.
+
+    This is the REQUIRED facet instantiation step for hop-2 facets in
+    two-pass Certified Adaptive Safe-Cover.
+
+    Example:
+        bindings = {"DIRECTOR_RESULT": "Xawery Żuławski"}
+
+        Input facet template:
+            {"subject": "[DIRECTOR_RESULT]", "predicate": "'s mother", ...}
+
+        Output facet template:
+            {"subject": "Xawery Żuławski", "predicate": "'s mother", ...}
+
+    CRITICAL: The output facets are NEW objects. Original facets are not mutated.
+
+    Args:
+        facets: List of facets (possibly containing placeholders like [VAR_RESULT])
+        bindings: Dict mapping variable names to bound entity values
+                  e.g., {"DIRECTOR_RESULT": "Xawery Żuławski"}
+
+    Returns:
+        List of new facets with placeholders replaced by concrete values
+    """
+    import os
+    debug = os.environ.get("TRIDENT_DEBUG_INSTANTIATE", "0") == "1"
+
+    if not bindings:
+        return list(facets)
+
+    new_facets = []
+    for facet in facets:
+        # Build new template with placeholders replaced
+        old_tpl = facet.template or {}
+        new_tpl = dict(old_tpl)  # Shallow copy
+
+        # Track if we made any replacements
+        replaced = False
+
+        # Fields that may contain placeholders
+        placeholder_fields = ["subject", "object", "hypothesis", "entity1", "entity2", "bridge_entity"]
+
+        for field in placeholder_fields:
+            if field not in new_tpl:
+                continue
+            value = str(new_tpl[field] or "")
+
+            # Replace each binding
+            for var_name, entity_value in bindings.items():
+                placeholder = f"[{var_name}]"
+                if placeholder in value:
+                    new_value = value.replace(placeholder, entity_value)
+                    new_tpl[field] = new_value
+                    replaced = True
+
+                    if debug:
+                        print(f"[INSTANTIATE] {facet.facet_id} field={field}: "
+                              f"'{value}' -> '{new_value}'")
+
+        # Also update metadata to mark as instantiated
+        old_meta = facet.metadata or {}
+        new_meta = dict(old_meta)
+        if replaced:
+            new_meta["instantiated"] = True
+            new_meta["bindings_applied"] = list(bindings.keys())
+
+        # Create new facet with updated template
+        # Note: Facet is frozen=True, so we create a new instance
+        new_facet = Facet(
+            facet_id=facet.facet_id,
+            facet_type=facet.facet_type,
+            template=new_tpl,
+            weight=facet.weight,
+            metadata=new_meta
+        )
+        new_facets.append(new_facet)
+
+    return new_facets
+
 @dataclass(frozen=True)
 class Facet:
     facet_id: str

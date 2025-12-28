@@ -212,20 +212,34 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         passage_lower = passage_text.lower()
         facet_text_lower = f"{s_raw} {o_raw} {predicate}".lower()
 
-        # Detect relation kind from combined text (same logic as hypothesis generation)
-        relation_kind = "DEFAULT"
-        if 'direct' in predicate_lower or 'director' in facet_text_lower:
-            relation_kind = "DIRECTOR"
-        elif 'born' in predicate_lower or 'birth' in predicate_lower:
-            relation_kind = "BORN"
-        elif any(kw in facet_text_lower for kw in {"won", "award", "prize", "win", "winner"}):
-            relation_kind = "AWARD"
-        elif any(kw in predicate_lower for kw in {"creat", "found", "writ", "author", "compose"}):
-            relation_kind = "CREATED"
-        elif any(kw in predicate_lower for kw in {"locat", "capital", "situat", "based"}):
-            relation_kind = "LOCATION"
-        elif any(kw in predicate_lower for kw in {"marr", "spouse", "wife", "husband"}):
-            relation_kind = "MARRIAGE"
+        # ================================================================
+        # CRITICAL: Check for EXPLICIT relation_kind from template FIRST
+        # ================================================================
+        # For compositional hop-2 facets, the template contains outer_relation_type
+        # (e.g., "MOTHER") which must take precedence over keyword inference.
+        # Without this, a hop-2 MOTHER facet with subject "[DIRECTOR_RESULT]"
+        # would incorrectly be classified as DIRECTOR because of the keyword.
+        explicit_relation_kind = tpl.get('outer_relation_type') or tpl.get('relation_kind')
+
+        if explicit_relation_kind:
+            relation_kind = explicit_relation_kind
+            if debug_rel:
+                print(f"[RELATION GATE] Using EXPLICIT relation_kind={relation_kind} from template")
+        else:
+            # Fallback: Detect relation kind from combined text (for non-compositional facets)
+            relation_kind = "DEFAULT"
+            if 'direct' in predicate_lower or 'director' in facet_text_lower:
+                relation_kind = "DIRECTOR"
+            elif 'born' in predicate_lower or 'birth' in predicate_lower:
+                relation_kind = "BORN"
+            elif any(kw in facet_text_lower for kw in {"won", "award", "prize", "win", "winner"}):
+                relation_kind = "AWARD"
+            elif any(kw in predicate_lower for kw in {"creat", "found", "writ", "author", "compose"}):
+                relation_kind = "CREATED"
+            elif any(kw in predicate_lower for kw in {"locat", "capital", "situat", "based"}):
+                relation_kind = "LOCATION"
+            elif any(kw in predicate_lower for kw in {"marr", "spouse", "wife", "husband"}):
+                relation_kind = "MARRIAGE"
 
         # Debug: show normalized tokens for diagnosis
         if debug_rel:
@@ -278,15 +292,68 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
             if debug_rel:
                 print(f"[RELATION GATE] MARRIAGE relation, predicate_match={predicate_match}")
 
+        # ================================================================
+        # EXPLICIT RELATION KINDS (from compositional hop-2 facets)
+        # ================================================================
+        # These are NOT inferred from keywords - they come from outer_relation_type
+        elif relation_kind == "MOTHER":
+            mother_anchors = {"mother", "son of", "daughter of", "child of", "parent", "mom"}
+            predicate_match = any(a in passage_lower for a in mother_anchors)
+            if debug_rel:
+                print(f"[RELATION GATE] MOTHER relation, predicate_match={predicate_match}")
+
+        elif relation_kind == "FATHER":
+            father_anchors = {"father", "son of", "daughter of", "child of", "parent", "dad"}
+            predicate_match = any(a in passage_lower for a in father_anchors)
+            if debug_rel:
+                print(f"[RELATION GATE] FATHER relation, predicate_match={predicate_match}")
+
+        elif relation_kind in ("PARENT", "CHILD"):
+            family_anchors = {"mother", "father", "son", "daughter", "child", "parent", "offspring"}
+            predicate_match = any(a in passage_lower for a in family_anchors)
+            if debug_rel:
+                print(f"[RELATION GATE] {relation_kind} relation, predicate_match={predicate_match}")
+
+        elif relation_kind == "SPOUSE":
+            spouse_anchors = {"spouse", "wife", "husband", "married", "wed", "partner"}
+            predicate_match = any(a in passage_lower for a in spouse_anchors)
+            if debug_rel:
+                print(f"[RELATION GATE] SPOUSE relation, predicate_match={predicate_match}")
+
+        elif relation_kind == "NATIONALITY":
+            nationality_anchors = {"nationality", "national", "citizen", "born in", "from", "native"}
+            predicate_match = any(a in passage_lower for a in nationality_anchors)
+            if debug_rel:
+                print(f"[RELATION GATE] NATIONALITY relation, predicate_match={predicate_match}")
+
+        elif relation_kind == "BIRTHPLACE":
+            birthplace_anchors = {"born", "birthplace", "native of", "birth", "raised in", "grew up"}
+            predicate_match = any(a in passage_lower for a in birthplace_anchors)
+            if debug_rel:
+                print(f"[RELATION GATE] BIRTHPLACE relation, predicate_match={predicate_match}")
+
         # FINAL GATE LOGIC
         # For WH-subject relations (like "Who directed X?"), don't require subject match
         # The subject is just a placeholder, not a real entity to find
-        if is_wh_subject and relation_kind in {"DIRECTOR", "BORN", "AWARD", "CREATED", "LOCATION", "MARRIAGE"}:
+        #
+        # CRITICAL: Include ALL relation kinds here, including explicit ones from compositional facets.
+        # For hop-2 facets AFTER instantiation, the subject is a concrete entity (not WH),
+        # so is_wh_subject=False and we check (s_match or o_match) && predicate_match.
+        all_known_relation_kinds = {
+            "DIRECTOR", "BORN", "AWARD", "CREATED", "LOCATION", "MARRIAGE",
+            # Explicit relation kinds from compositional facets
+            "MOTHER", "FATHER", "PARENT", "CHILD", "SPOUSE", "NATIONALITY", "BIRTHPLACE"
+        }
+
+        if is_wh_subject and relation_kind in all_known_relation_kinds:
             # WH-subject: only require object match + predicate match
             result = o_match and predicate_match
-        else:
-            # Normal: require at least one endpoint match + predicate match
+        elif relation_kind in all_known_relation_kinds:
+            # Concrete subject (e.g., after instantiation): require subject OR object match + predicate match
             result = (s_match or o_match) and predicate_match
+        else:
+            # Unknown relation kind: only require at least one endpoint match (no predicate gate)
+            result = s_match or o_match
 
         if debug_rel:
             print(f"[RELATION GATE] subj_raw='{s_raw}' subj_clean='{s}' obj_raw='{o_raw}' obj_clean='{o}' "

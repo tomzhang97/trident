@@ -14,7 +14,7 @@ import torch
 from transformers import AutoTokenizer, AutoModel
 
 from .config import TridentConfig, SafeCoverConfig, ParetoConfig
-from .facets import Facet, FacetMiner, FacetType
+from .facets import Facet, FacetMiner, FacetType, instantiate_facets
 from .candidates import Passage
 from .calibration import ReliabilityCalibrator, CalibrationMonitor
 from .safe_cover import SafeCoverAlgorithm, SafeCoverResult
@@ -1440,6 +1440,30 @@ class TridentPipeline:
                 print(f"  Failed to bind entity from hop-1 - using hop-1 result only")
             # Fall back to hop-1 result only
             return hop1_result
+
+        # ============================================================
+        # FACET INSTANTIATION: Replace placeholders in hop-2 facets
+        # ============================================================
+        # CRITICAL: This is the required step to make hop-2 certification work.
+        # Without this, hop-2 facets contain placeholders like "[DIRECTOR_RESULT]"
+        # which cannot be scored by NLI.
+        #
+        # Build bindings dict: {RELATION_TYPE}_RESULT -> bound_entity
+        bindings = {}
+        if inner_relation_type:
+            bindings[f"{inner_relation_type}_RESULT"] = bound_entity
+            if debug:
+                print(f"  Bindings: {bindings}")
+
+        # Instantiate hop-2 facets with bound entity
+        hop2_facets = instantiate_facets(hop2_facets, bindings)
+
+        if debug:
+            for f in hop2_facets:
+                tpl = f.template or {}
+                print(f"  Instantiated hop-2 facet: {f.facet_id}")
+                print(f"    subject: {tpl.get('subject', '')}")
+                print(f"    outer_relation_type: {tpl.get('outer_relation_type', '')}")
 
         # ============================================================
         # CONDITIONED CANDIDATE GENERATION: Filter/retrieve for hop-2
