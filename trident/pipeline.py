@@ -910,8 +910,8 @@ class TridentPipeline:
                 completion_tokens = css_result.completion_tokens if css_result else 0
             elif prompt:
                 total_tokens = llm_output.tokens_used
-                prompt_tokens = self.llm.compute_token_cost(prompt)
-                completion_tokens = max(total_tokens - prompt_tokens, 0)
+                prompt_tokens = getattr(llm_output, "prompt_tokens", 0) or self.llm.compute_token_cost(prompt)
+                completion_tokens = getattr(llm_output, "completion_tokens", 0) or max(total_tokens - prompt_tokens, 0)
             else:
                 total_tokens = 0
                 prompt_tokens = 0

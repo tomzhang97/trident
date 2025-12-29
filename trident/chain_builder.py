@@ -1316,22 +1316,37 @@ def _find_exact_substring(haystack: str, needle: str) -> Optional[Tuple[int, int
 
 
 def _extract_first_json_object(text: str) -> str:
-    """Extract the first balanced JSON object from a string."""
-    start = text.find("{")
-    if start == -1:
-        raise ValueError("No JSON object found")
+    """Extract the first balanced JSON object from a string with strict guards."""
 
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        raise ValueError("Output must start with JSON object")
+
+    # Reject code fences / markdown wrappers outright
+    if "```" in stripped.split("{", 1)[0]:
+        raise ValueError("Code fences found before JSON")
+
+    start = stripped.find("{")
     depth = 0
-    for idx in range(start, len(text)):
-        char = text[idx]
+    end_idx = -1
+    for idx in range(start, len(stripped)):
+        char = stripped[idx]
         if char == "{":
             depth += 1
         elif char == "}":
             depth -= 1
             if depth == 0:
-                return text[start : idx + 1]
+                end_idx = idx
+                break
 
-    raise ValueError("Unbalanced JSON braces in text")
+    if depth != 0 or end_idx == -1:
+        raise ValueError("Unbalanced JSON braces in text")
+
+    remainder = stripped[end_idx + 1 :].strip()
+    if remainder and remainder not in {"", "```"}:
+        raise ValueError("Extra text after JSON object")
+
+    return stripped[start : end_idx + 1]
 
 
 def _find_fuzzy_substring(haystack: str, needle: str, max_distance: int = 2) -> Optional[Tuple[int, int, str]]:
@@ -1416,15 +1431,16 @@ def certified_span_select(
     evidence_text = "\n\n".join(evidence_parts)
 
     prompt = f"""You must answer ONLY using the Evidence below.
-Return a JSON object with keys:
+Return exactly ONE JSON object with keys:
   "pid": string, the evidence passage id you copied from
   "answer": string, an EXACT substring copied verbatim from that passage
   "confidence": number between 0 and 1
 
-Rules:
-1) The answer MUST be copied exactly from the evidence text (verbatim).
-2) Copy the shortest complete answer span - usually a name, place, date, or short phrase.
-3) If you cannot find an exact answer substring, output: {{"pid": "", "answer": "", "confidence": 0}}
+Rules (hard constraints):
+1) Output must be JSON ONLY. Do NOT include code fences, commentary, or extra text.
+2) The answer MUST be copied exactly from the evidence text (verbatim).
+3) Copy the shortest complete answer span - usually a name, place, date, or short phrase.
+4) If you cannot find an exact answer substring, output: {{"pid": "", "answer": "", "confidence": 0}}
 
 Question: {question}
 
@@ -1444,19 +1460,16 @@ JSON:"""
     if debug:
         print(f"[CSS] Raw LLM output: {raw_text[:200]}...")
 
-    prompt_tokens = 0
-    completion_tokens = 0
-    tokens_used = 0
+    prompt_tokens = getattr(raw, "prompt_tokens", 0) or 0
+    completion_tokens = getattr(raw, "completion_tokens", 0) or 0
+    tokens_used = getattr(raw, "tokens_used", 0) or (prompt_tokens + completion_tokens)
 
-    if hasattr(llm, "compute_token_cost"):
+    if not prompt_tokens and hasattr(llm, "compute_token_cost"):
         try:
             prompt_tokens = llm.compute_token_cost(prompt)
+            tokens_used = tokens_used or prompt_tokens + completion_tokens
         except Exception:
-            prompt_tokens = 0
-
-    if hasattr(raw, "tokens_used"):
-        tokens_used = getattr(raw, "tokens_used", 0) or 0
-        completion_tokens = max(tokens_used - prompt_tokens, 0)
+            prompt_tokens = prompt_tokens
 
     # Parse JSON response
     try:
@@ -2062,19 +2075,16 @@ JSON:"""
     if debug:
         print(f"[CONSTRAINED] Raw output: {raw_text[:200]}...")
 
-    prompt_tokens = 0
-    completion_tokens = 0
-    tokens_used = 0
+    prompt_tokens = getattr(raw, "prompt_tokens", 0) or 0
+    completion_tokens = getattr(raw, "completion_tokens", 0) or 0
+    tokens_used = getattr(raw, "tokens_used", 0) or (prompt_tokens + completion_tokens)
 
-    if hasattr(llm, "compute_token_cost"):
+    if not prompt_tokens and hasattr(llm, "compute_token_cost"):
         try:
             prompt_tokens = llm.compute_token_cost(prompt)
+            tokens_used = tokens_used or prompt_tokens + completion_tokens
         except Exception:
-            prompt_tokens = 0
-
-    if hasattr(raw, "tokens_used"):
-        tokens_used = getattr(raw, "tokens_used", 0) or 0
-        completion_tokens = max(tokens_used - prompt_tokens, 0)
+            prompt_tokens = prompt_tokens
 
     # Parse JSON response
     try:
@@ -2407,6 +2417,9 @@ def constrained_span_select(
         if debug:
             print(f"[CONSTRAINED] Filtered to {len(winner_passages)} certified passages")
 
+    # Enforce provenance: drop passages without a pid
+    winner_passages = [p for p in winner_passages if p.get("pid")]
+
     if not winner_passages:
         return ConstrainedSelectionResult(
             answer="",
@@ -2645,9 +2658,10 @@ def bind_entity_via_css(
     prompt = f"""Pick the ONE person's name that answers the question.
 
 RULES:
-1. You MUST pick from the numbered candidates below BY INDEX
-2. Return ONLY a JSON object with "index" (integer) and "confidence" (0-1)
-3. If no candidate answers the question, return {{"index": -1, "confidence": 0}}
+1. You MUST pick from the numbered candidates below BY INDEX.
+2. Output MUST be a single JSON object with "index" (integer) and "confidence" (0-1).
+3. Do NOT include code fences, prose, or extra text outside the JSON.
+4. If no candidate answers the question, return {{"index": -1, "confidence": 0}}.
 
 Question: {inner_question}
 

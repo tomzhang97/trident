@@ -21,6 +21,8 @@ class LLMOutput:
     text: str
     tokens_used: int
     latency_ms: float
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
     logprobs: Optional[List[float]] = None
 
 
@@ -117,9 +119,11 @@ class LLMInterface:
         # Decode output
         generated_ids = outputs.sequences[0][input_length:]
         generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        
-        # Calculate tokens used
-        tokens_used = len(generated_ids) + input_length
+
+        # Calculate token usage
+        prompt_tokens = input_length
+        completion_tokens = len(generated_ids)
+        tokens_used = prompt_tokens + completion_tokens
         
         # Calculate latency
         latency_ms = (time.time() - start_time) * 1000
@@ -136,6 +140,8 @@ class LLMInterface:
             text=generated_text,
             tokens_used=tokens_used,
             latency_ms=latency_ms,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
             logprobs=logprobs
         )
     
