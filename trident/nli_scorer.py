@@ -363,15 +363,22 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         gate_policy = "STRICT"
 
         if is_hop2 and relation_kind in all_known_relation_kinds:
-            # HOP-2 COMPOSITIONAL: Predicate-first gate (relaxed)
-            # For hop-2, the passage often expresses the relation differently:
-            # - "X is the son of Y" instead of repeating "Xawery Żuławski's mother"
-            # - Gate should NOT block on subject match failure
-            # Only require predicate anchors - NLI will do the semantic work
-            result = predicate_match
-            gate_policy = "HOP2_RELAXED"
-            if debug_rel:
-                print(f"[RELATION GATE] HOP-2 predicate-first: predicate_match={predicate_match}")
+            # HOP-2 COMPOSITIONAL: Entity-anchored gate (not predicate-only)
+            # After instantiation, subject should be a real entity (e.g., "Andrzej Żuławski")
+            # Require subject match + predicate match to avoid false positives on
+            # passages that mention the relation but not the right person.
+            if is_placeholder_subject:
+                # Subject still has placeholder - not yet instantiated, allow predicate-only
+                result = predicate_match
+                gate_policy = "HOP2_UNINSTANTIATED"
+                if debug_rel:
+                    print(f"[RELATION GATE] HOP-2 uninstantiated: predicate_match={predicate_match}")
+            else:
+                # Subject is instantiated - require entity anchor
+                result = s_match and predicate_match
+                gate_policy = "HOP2_ANCHORED"
+                if debug_rel:
+                    print(f"[RELATION GATE] HOP-2 anchored: s_match={s_match} predicate_match={predicate_match}")
         elif is_placeholder_subject and relation_kind in all_known_relation_kinds:
             # PLACEHOLDER SUBJECT: Treat like WH-subject, predicate-first
             # The subject "[DIRECTOR_RESULT]" is not a real entity to find
