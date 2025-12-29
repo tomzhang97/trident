@@ -689,10 +689,18 @@ class TridentPipeline:
                 self.safe_cover_algo.apply_fallback()
 
         # Run RC-MCFC algorithm
+        uncoverable_facet_ids = set()
+        for facet in facets:
+            tpl = facet.template or {}
+            hop = tpl.get("hop")
+            if hop == 2 and (not tpl.get("subject") or "__" in str(tpl.get("subject"))):
+                uncoverable_facet_ids.add(facet.facet_id)
+
         result = self.safe_cover_algo.run(
             facets=facets,
             passages=passages,
-            p_values=scores.p_values
+            p_values=scores.p_values,
+            uncoverable_facet_ids=uncoverable_facet_ids
         )
 
         # Convert to output format

@@ -60,6 +60,25 @@ def _normalize_relation_predicate(pred: str) -> str:
         if k in pred: return v
     return pred or "is related to"
 
+
+def _normalize_relation_template(template: Dict[str, Any]) -> Dict[str, Any]:
+    tpl = dict(template or {})
+    subject = tpl.get("subject") or tpl.get("entity1") or tpl.get("head") or tpl.get("source") or ""
+    obj = tpl.get("object") or tpl.get("entity2") or tpl.get("bridge_entity") or tpl.get("target") or ""
+    predicate = tpl.get("predicate") or tpl.get("relation") or tpl.get("relation_kind") or ""
+    relation_kind = tpl.get("relation_kind") or tpl.get("predicate_type") or tpl.get("relation") or ""
+    hop = tpl.get("hop") if tpl.get("hop") is not None else tpl.get("distance")
+
+    tpl["subject"] = _safe_phrase(subject)
+    tpl["predicate"] = _normalize_relation_predicate(predicate)
+    tpl["object"] = _safe_phrase(obj)
+    tpl["relation_kind"] = _clean_text(str(relation_kind)) if relation_kind else ""
+    tpl["hop"] = hop if hop is not None else 1
+    tpl.setdefault("instantiated", bool(tpl["subject"] and tpl["object"]))
+    tpl.setdefault("subject_is_entity", bool(tpl["subject"]))
+    tpl.setdefault("has_two_entity_anchors", bool(tpl["subject"] and tpl["object"]))
+    return tpl
+
 def _looks_like_junk_entity(mention: str) -> bool:
     m = _safe_phrase(mention)
     if not m: return True
@@ -113,6 +132,16 @@ class Facet:
         ft = object.__getattribute__(self, "facet_type")
         if isinstance(ft, str):
             object.__setattr__(self, "facet_type", FacetType(ft))
+            ft = object.__getattribute__(self, "facet_type")
+
+        if ft in {FacetType.RELATION, FacetType.BRIDGE_HOP, FacetType.BRIDGE_HOP1, FacetType.BRIDGE_HOP2}:
+            normalized = _normalize_relation_template(self.template)
+            object.__setattr__(self, "template", normalized)
+            meta = dict(self.metadata)
+            meta.setdefault("instantiated", normalized.get("instantiated", False))
+            meta.setdefault("subject_is_entity", normalized.get("subject_is_entity", False))
+            meta.setdefault("has_two_entity_anchors", normalized.get("has_two_entity_anchors", False))
+            object.__setattr__(self, "metadata", meta)
 
     def to_hypothesis(self, passage_text: Optional[str] = None) -> str:
         ft = self.facet_type

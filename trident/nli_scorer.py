@@ -7,7 +7,7 @@ UPDATES:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Set
 from collections import OrderedDict
 import hashlib
 import re
@@ -40,78 +40,103 @@ def _normalize_label(s: str) -> str:
 
 _WS_RE = re.compile(r"\s+")
 
-def _norm(s: str) -> str:
-    s = unicodedata.normalize("NFKC", s or "")
-    # Robust normalization: standard quotes
-    s = (s.replace("’", "'").replace("‘", "'")
-          .replace("“", '"').replace("”", '"'))
-    s = s.replace(",", "") 
-    s = _WS_RE.sub(" ", s).strip().lower()
-    return s
 
-def _contains_exact_phrase(passage: str, phrase: str) -> bool:
-    return _norm(phrase) in _norm(passage) and _norm(phrase) != ""
+def _normalize_text_unicode(text: str) -> str:
+    """Normalized, lowercased text for deterministic gating."""
+    norm = unicodedata.normalize("NFKC", text or "")
+    norm = (norm.replace("’", "'").replace("‘", "'")
+                 .replace("“", '"').replace("”", '"'))
+    norm = _WS_RE.sub(" ", norm).strip().lower()
+    return norm
 
-def _token_in_text(tok: str, text: str) -> bool:
-    return bool(re.search(rf"(?<!\w){re.escape(tok)}(?!\w)", text))
 
-def _contains_tokens(passage: str, phrase: str) -> bool:
-    """
-    Looser check: Do significant tokens from phrase appear in passage?
-    Safe Fallback: If no significant tokens (e.g. "US"), require exact match.
-    """
-    p_norm = _norm(passage)
-    ph_norm = _norm(phrase)
-    tokens = [t for t in ph_norm.split() if len(t) > 2 and t not in {"the", "and", "of", "in"}]
-    
-    # FIX: Don't let short entities bypass the gate
-    if not tokens: 
-        return _contains_exact_phrase(passage, phrase)
-        
-    hits = sum(1 for t in tokens if _token_in_text(t, p_norm))
-    return hits >= (len(tokens) / 2)
+def _get_token_set(norm: str) -> Set[str]:
+    return {tok for tok in re.split(r"[^\w]+", norm) if tok}
+
+
+def _fuzzy_phrase_match(term: str, passage_norm: str, passage_tokens: Set[str]) -> bool:
+    term_norm = _normalize_text_unicode(term)
+    if not term_norm:
+        return False
+    term_tokens = _get_token_set(term_norm)
+    if not term_tokens:
+        return False
+    if term_norm in passage_norm:
+        return True
+    overlap = term_tokens & passage_tokens
+    return len(overlap) >= max(1, len(term_tokens) // 2)
+
+
+RELATION_KEYWORDS: Dict[str, Set[str]] = {
+    "directed": {"directed", "director", "filmmaker"},
+    "written": {"written", "writer", "author"},
+    "produced": {"produced", "producer"},
+    "created": {"created", "creator", "founded"},
+    "capital_of": {"capital", "capital city"},
+    "located_in": {"located", "situated", "in"},
+    "features": {"features", "featuring", "includes"},
+    "related_to": {"related", "relation", "connection"},
+}
+
+
+def _check_relation_keywords(kind: str, passage_norm: str, passage_tokens: Set[str]) -> bool:
+    keywords = RELATION_KEYWORDS.get(kind or "", set())
+    if not keywords:
+        return False
+    return any(_fuzzy_phrase_match(kw, passage_norm, passage_tokens) for kw in keywords)
+
 
 def _contains_value(passage: str, value: str) -> bool:
-    val_str = _norm(str(value))
-    if not val_str: return False
-    pas_str = _norm(passage)
-    esc_val = re.escape(val_str)
+    val_norm = _normalize_text_unicode(str(value))
+    if not val_norm:
+        return False
+    pas_norm = _normalize_text_unicode(passage)
+    esc_val = re.escape(val_norm)
     pattern = rf"(?<![\w.]){esc_val}(?![\w.])"
-    return bool(re.search(pattern, pas_str))
+    return bool(re.search(pattern, pas_norm))
+
 
 def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
     ft = facet.facet_type
     tpl = facet.template or {}
-    
+    passage_norm = _normalize_text_unicode(passage_text)
+    passage_tokens = _get_token_set(passage_norm)
+
     if ft == FacetType.ENTITY:
-        return _contains_exact_phrase(passage_text, str(tpl.get("mention", "")))
+        mention = str(tpl.get("mention", ""))
+        return _fuzzy_phrase_match(mention, passage_norm, passage_tokens)
+
     if ft == FacetType.NUMERIC:
         return _contains_value(passage_text, str(tpl.get("value", "")))
-    
-    # Generic BRIDGE_HOP
-    if "BRIDGE_HOP" in ft.value:
-        e1 = str(tpl.get("entity1", "") or tpl.get("entity", "") or "")
-        e2 = str(tpl.get("bridge_entity", "") or tpl.get("entity2", "") or "")
-        
-        if not e1 or not e2:
-            return None 
-            
-        # Exact match on start node, token match (or safe exact) on end node
-        return _contains_exact_phrase(passage_text, e1) and _contains_tokens(passage_text, e2)
 
-    if ft == FacetType.RELATION:
-        s = str(tpl.get("subject", ""))
-        o = str(tpl.get("object", ""))
-        return _contains_tokens(passage_text, s) and _contains_tokens(passage_text, o)
+    if ft == FacetType.TEMPORAL:
+        return _fuzzy_phrase_match(str(tpl.get("time", "")), passage_norm, passage_tokens)
 
     if ft == FacetType.COMPARISON:
         e1 = str(tpl.get("entity1", ""))
         e2 = str(tpl.get("entity2", ""))
-        return _contains_tokens(passage_text, e1) or _contains_tokens(passage_text, e2)
+        return _fuzzy_phrase_match(e1, passage_norm, passage_tokens) or _fuzzy_phrase_match(e2, passage_norm, passage_tokens)
 
-    if ft == FacetType.TEMPORAL:
-        return _contains_exact_phrase(passage_text, str(tpl.get("time", "")))
-        
+    # Relation-like facets must have anchors
+    if ft == FacetType.RELATION or "BRIDGE_HOP" in ft.value:
+        subj = str(tpl.get("subject", "") or tpl.get("entity1", ""))
+        obj = str(tpl.get("object", "") or tpl.get("bridge_entity", "") or tpl.get("entity2", ""))
+        pred = str(tpl.get("predicate", "") or tpl.get("relation", ""))
+        if not subj or not obj:
+            return False  # Reject global probes with missing anchors
+
+        subj_ok = _fuzzy_phrase_match(subj, passage_norm, passage_tokens)
+        obj_ok = _fuzzy_phrase_match(obj, passage_norm, passage_tokens)
+        if not (subj_ok and obj_ok):
+            return False
+
+        relation_kind = str(tpl.get("relation_kind", "") or tpl.get("predicate", ""))
+        if relation_kind and _check_relation_keywords(relation_kind, passage_norm, passage_tokens):
+            return True
+
+        # Deterministic predicate fallback
+        return _fuzzy_phrase_match(pred, passage_norm, passage_tokens)
+
     return None
 
 class NLIScorer:

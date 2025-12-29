@@ -262,7 +262,8 @@ class SafeCoverAlgorithm:
         passages: List[Passage],
         p_values: Dict[Tuple[str, str], float],
         scores: Optional[Dict[Tuple[str, str], float]] = None,
-        bins: Optional[Dict[Tuple[str, str], str]] = None
+        bins: Optional[Dict[Tuple[str, str], str]] = None,
+        uncoverable_facet_ids: Optional[Set[str]] = None
     ) -> SafeCoverResult:
         """
         Run RC-MCFC algorithm with certificates.
@@ -278,21 +279,15 @@ class SafeCoverAlgorithm:
         knobs = self._freeze_episode_knobs(facets)
 
         # Step 2: Build fixed coverage sets (Section 4.2)
-        coverage_sets, coverage_info = self._build_coverage_sets(
+        coverage_sets, coverage_info, best_info_by_facet = self._build_coverage_sets(
             facets, passages, p_values, knobs, scores, bins
         )
-
-        # Check for uncoverable facets before greedy
-        uncoverable = self._find_uncoverable_facets(facets, coverage_sets)
-        if uncoverable:
-            return self._create_abstain_result(
-                facets=facets,
-                passages=[],
-                reason=AbstentionReason.NO_COVERING_PASSAGES,
-                uncovered=uncoverable,
-                knobs=knobs,
-                coverage_map={}
-            )
+        forced_uncoverable = set(uncoverable_facet_ids or [])
+        forced_uncoverable.update(self._find_uncoverable_facets(facets, coverage_sets))
+        if forced_uncoverable:
+            for fid in forced_uncoverable:
+                for pid in coverage_sets:
+                    coverage_sets[pid].discard(fid)
 
         # Step 3: Compute initial dual lower bound (Section 4.6)
         initial_dual_lb = self._compute_dual_lower_bound(
@@ -314,7 +309,15 @@ class SafeCoverAlgorithm:
 
         # Step 4: Run greedy set cover (Section 4.5)
         selected, certificates, coverage_map, final_uncovered = self._greedy_cover(
-            facets, passages, coverage_sets, p_values, knobs, coverage_info, budget_cap
+            facets,
+            passages,
+            coverage_sets,
+            p_values,
+            knobs,
+            coverage_info,
+            best_info_by_facet,
+            budget_cap,
+            forced_uncoverable,
         )
 
         # Step 5: Compute final dual lower bound
@@ -356,7 +359,7 @@ class SafeCoverAlgorithm:
         knobs: EpisodeKnobs,
         scores: Optional[Dict[Tuple[str, str], float]] = None,
         bins: Optional[Dict[Tuple[str, str], str]] = None
-    ) -> Tuple[Dict[str, Set[str]], Dict[Tuple[str, str], Dict[str, Any]]]:
+    ) -> Tuple[Dict[str, Set[str]], Dict[Tuple[str, str], Dict[str, Any]], Dict[str, Dict[str, Any]]]:
         """
         Build fixed coverage sets using Bonferroni thresholds.
 
@@ -364,7 +367,8 @@ class SafeCoverAlgorithm:
         C(p) = { f ∈ F(q) : π(p,f) ≤ ᾱ_f }
         """
         coverage_sets = {p.pid: set() for p in passages}
-        coverage_info = {}  # (pid, fid) -> {p_value, alpha_bar, bin, ...}
+        coverage_info: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        best_info_by_facet: Dict[str, Dict[str, Any]] = {}
 
         for facet in facets:
             alpha_bar = knobs.get_alpha_bar(facet.facet_id)
@@ -391,16 +395,30 @@ class SafeCoverAlgorithm:
                         coverage_sets[entry.passage.pid].add(facet.facet_id)
 
                     # Store coverage info for certificate generation
-                    coverage_info[key] = {
+                    info = {
                         'p_value': pv,
                         'alpha_bar': alpha_bar,
                         'alpha_facet': knobs.alpha_f.get(facet.facet_id, knobs.alpha_query),
                         'bin': bins.get(key, 'default') if bins else entry.bin_key,
                         'score': scores.get(key, 0.0) if scores else entry.score,
                         'facet_type': facet.facet_type.value if isinstance(facet.facet_type, FacetType) else str(facet.facet_type),
+                        'passage_id': entry.passage.pid,
                     }
+                    coverage_info[key] = info
+                    existing = best_info_by_facet.get(facet.facet_id)
+                    if existing is None or info['p_value'] < existing['p_value']:
+                        best_info_by_facet[facet.facet_id] = info
 
-        return coverage_sets, coverage_info
+        # Restrict coverage sets to winning (lowest p-value) passages per facet
+        for pid, covered in coverage_sets.items():
+            filtered = set()
+            for fid in covered:
+                best_info = best_info_by_facet.get(fid)
+                if best_info and best_info.get('passage_id') == pid:
+                    filtered.add(fid)
+            coverage_sets[pid] = filtered
+
+        return coverage_sets, coverage_info, best_info_by_facet
 
     def _shortlist_for_facet(
         self,
@@ -466,7 +484,9 @@ class SafeCoverAlgorithm:
         p_values: Dict[Tuple[str, str], float],
         knobs: EpisodeKnobs,
         coverage_info: Dict[Tuple[str, str], Dict[str, Any]],
-        budget_cap: Optional[int]
+        best_info_by_facet: Dict[str, Dict[str, Any]],
+        budget_cap: Optional[int],
+        forced_uncoverable: Set[str]
     ) -> Tuple[List[Passage], List[CoverageCertificate], Dict[str, List[str]], List[str]]:
         """
         Greedy set cover with cost-effectiveness.
@@ -482,6 +502,7 @@ class SafeCoverAlgorithm:
         coverage_map = {}
 
         uncovered = {f.facet_id for f in facets}
+        uncovered.update(forced_uncoverable)
         remaining_passages = {p.pid: p for p in passages}
         max_units = self.config.max_units or len(passages)
         total_cost = 0
@@ -531,7 +552,7 @@ class SafeCoverAlgorithm:
             # Generate certificates for newly covered facets (Section 4.7)
             for facet_id in newly_covered:
                 key = (best_passage.pid, facet_id)
-                info = coverage_info.get(key, {})
+                info = best_info_by_facet.get(facet_id, coverage_info.get(key, {}))
 
                 # Get bin size from calibrator if available
                 bin_key = info.get('bin', 'default')
