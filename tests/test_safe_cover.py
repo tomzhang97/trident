@@ -31,6 +31,29 @@ def test_safe_cover_selects_passage_when_threshold_met():
     assert not result.abstained
 
 
+def test_safe_cover_carries_calibrator_version_into_certificates():
+    """Certificates should record the calibrator version used for the run."""
+    facets = [Facet(
+        facet_id="f1",
+        facet_type=FacetType.ENTITY,
+        template={"mention": "Einstein"}
+    )]
+    passages = [Passage(pid="p1", text="Albert Einstein wrote many papers.", cost=50)]
+
+    calibrator = ReliabilityCalibrator(version="cal_v123")
+    calibrator.tables["ENTITY"] = [(0.0, 1.0), (0.9, 0.01), (1.0, 0.0)]
+
+    config = SafeCoverConfig(per_facet_alpha=0.1)
+    algo = SafeCoverAlgorithm(config=config, calibrator=calibrator)
+
+    p_values = {("p1", "f1"): 0.05}
+
+    result = algo.run(facets, passages, p_values)
+
+    assert result.certificates, "Expected a certificate for the covered facet"
+    assert result.certificates[0].calibrator_version == "cal_v123"
+
+
 def test_safe_cover_abstains_on_no_facets():
     """Test that Safe-Cover abstains when no facets are provided."""
     facets = []  # No facets

@@ -34,9 +34,10 @@ def _nested_dd_factory():
     return defaultdict(list)
 
 class ReliabilityCalibrator:
-    def __init__(self, use_mondrian: bool = True):
+    def __init__(self, use_mondrian: bool = True, version: str = "v1.0"):
         self.use_mondrian = use_mondrian
-        self.conformal_calibrator = None 
+        self.version = version
+        self.conformal_calibrator = None
 
     def set_conformal_calibrator(self, calibrator):
         self.conformal_calibrator = calibrator
@@ -79,7 +80,7 @@ class ReliabilityCalibrator:
 
     def save(self, path: str):
         data = {
-            "version": "v2.2",
+            "version": self.version,
             "use_mondrian": self.use_mondrian,
             "conformal": self.conformal_calibrator.to_dict() if self.conformal_calibrator else None
         }
@@ -91,7 +92,10 @@ class ReliabilityCalibrator:
         with open(path, "r") as f:
             data = json.load(f)
         
-        cal = cls(use_mondrian=data.get("use_mondrian", True))
+        cal = cls(
+            use_mondrian=data.get("use_mondrian", True),
+            version=data.get("version", "v1.0")
+        )
         if data.get("conformal"):
             cal.conformal_calibrator = SelectionConditionalCalibrator.from_dict(data["conformal"])
         return cal

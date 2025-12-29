@@ -269,15 +269,23 @@ class TridentPipeline:
             if cal_path.exists():
                 print(f"📊 Loading calibration from: {calibration_path}")
                 self.calibrator = ReliabilityCalibrator.load(str(cal_path))
+                # Keep config metadata aligned with the loaded calibrator version
+                config.calibration.version = getattr(self.calibrator, 'version', config.calibration.version)
                 print(f"✅ Calibrator loaded successfully")
             else:
                 print(f"⚠️  Warning: Calibration file not found: {calibration_path}")
                 print(f"    Creating empty calibrator (Safe-Cover will not work!)")
-                self.calibrator = ReliabilityCalibrator(use_mondrian=config.calibration.use_mondrian)
+                self.calibrator = ReliabilityCalibrator(
+                    use_mondrian=config.calibration.use_mondrian,
+                    version=config.calibration.version
+                )
         else:
             # No calibration file provided - create empty calibrator
             # Note: Safe-Cover requires calibration data to work!
-            self.calibrator = ReliabilityCalibrator(use_mondrian=config.calibration.use_mondrian)
+            self.calibrator = ReliabilityCalibrator(
+                use_mondrian=config.calibration.use_mondrian,
+                version=config.calibration.version
+            )
 
         self.telemetry = TelemetryTracker(config.telemetry)
         
@@ -731,7 +739,7 @@ class TridentPipeline:
                 'alpha_query': cert.alpha_query,
                 'bin': cert.bin,
                 'timestamp': cert.timestamp,
-                'calibrator_version': self.config.calibration.version
+                'calibrator_version': cert.calibrator_version
             })
 
         # Use infeasible and abstained flags from result
