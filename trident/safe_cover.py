@@ -196,6 +196,42 @@ class SafeCoverAlgorithm:
         if hasattr(self.pvalue_mode, 'value'):
             self.pvalue_mode = self.pvalue_mode.value
 
+    def _infer_bin_size(self, bin_key: str) -> int:
+        """Infer the calibration bin size from flexible bin formats.
+
+        The calibrator may store bin metadata in different shapes:
+        - objects with an ``n_negatives`` attribute (current calibrators)
+        - bare iterables of negative scores (legacy JSON tables)
+        - dicts keyed by split (e.g., ``{"short": [...], "long": [...]}``)
+
+        This helper normalises these variants so certificates always include a
+        meaningful bin_size when the information is available.
+        """
+
+        bins = getattr(self.calibrator, "bins", {}) or {}
+        if bin_key not in bins:
+            return 0
+
+        bin_record = bins[bin_key]
+
+        # Modern calibrators expose an attribute
+        if hasattr(bin_record, "n_negatives"):
+            return int(getattr(bin_record, "n_negatives", 0) or 0)
+
+        # Lists/tuples/sets of negatives
+        if isinstance(bin_record, (list, tuple, set)):
+            return len(bin_record)
+
+        # Dict of split lists
+        if isinstance(bin_record, dict):
+            total = 0
+            for value in bin_record.values():
+                if isinstance(value, (list, tuple, set)):
+                    total += len(value)
+            return total
+
+        return 0
+
     def _get_budget_cap(self) -> Optional[int]:
         """Get the effective budget cap, preferring max_evidence_tokens over token_cap."""
         return (
@@ -560,9 +596,7 @@ class SafeCoverAlgorithm:
 
                 # Get bin size from calibrator if available
                 bin_key = info.get('bin', 'default')
-                bin_size = 0
-                if hasattr(self.calibrator, 'bins') and bin_key in self.calibrator.bins:
-                    bin_size = self.calibrator.bins[bin_key].n_negatives
+                bin_size = self._infer_bin_size(bin_key)
 
                 certificate = CoverageCertificate(
                     facet_id=facet_id,

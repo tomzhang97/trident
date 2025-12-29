@@ -54,6 +54,30 @@ def test_safe_cover_carries_calibrator_version_into_certificates():
     assert result.certificates[0].calibrator_version == "cal_v123"
 
 
+def test_safe_cover_records_bin_size_from_legacy_bins():
+    """Certificates should capture bin size even when bins are simple lists."""
+    facets = [Facet(
+        facet_id="f1",
+        facet_type=FacetType.ENTITY,
+        template={"mention": "Einstein"}
+    )]
+    passages = [Passage(pid="p1", text="Albert Einstein wrote many papers.", cost=50)]
+
+    calibrator = ReliabilityCalibrator(version="cal_v123")
+    calibrator.tables["ENTITY"] = [(0.0, 1.0), (0.9, 0.01), (1.0, 0.0)]
+    calibrator.bins["default"] = [0.2, 0.3, 0.4]
+
+    config = SafeCoverConfig(per_facet_alpha=0.1)
+    algo = SafeCoverAlgorithm(config=config, calibrator=calibrator)
+
+    p_values = {("p1", "f1"): 0.05}
+
+    result = algo.run(facets, passages, p_values)
+
+    assert result.certificates, "Expected a certificate for the covered facet"
+    assert result.certificates[0].bin_size == 3
+
+
 def test_safe_cover_abstains_on_no_facets():
     """Test that Safe-Cover abstains when no facets are provided."""
     facets = []  # No facets
