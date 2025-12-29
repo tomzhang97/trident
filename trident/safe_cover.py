@@ -48,6 +48,7 @@ class AbstentionReason(Enum):
     INFEASIBILITY_PROVEN = "infeasibility_proven"  # LB_dual > B_ctx - cost_ctx
     BUDGET_EXHAUSTED = "budget_exhausted"  # No candidates fit within remaining budget
     PVALUE_INFEASIBLE_SMALL_BIN = "pvalue_infeasible_small_bin"  # α_bar_f < 1/(n_b+1) and cannot resolve
+    INFEASIBLE_MISSING_FACETS = "infeasible_missing_facets"  # U monotonic: required facets not coverable
 
 
 @dataclass
@@ -310,7 +311,8 @@ class SafeCoverAlgorithm:
         passages: List[Passage],
         p_values: Dict[Tuple[str, str], float],
         scores: Optional[Dict[Tuple[str, str], float]] = None,
-        bins: Optional[Dict[Tuple[str, str], str]] = None
+        bins: Optional[Dict[Tuple[str, str], str]] = None,
+        uncoverable_facet_ids: Optional[Set[str]] = None,
     ) -> SafeCoverResult:
         """
         Run RC-MCFC algorithm with certificates.
@@ -327,20 +329,8 @@ class SafeCoverAlgorithm:
 
         # Step 2: Build fixed coverage sets (Section 4.2)
         coverage_sets, coverage_info = self._build_coverage_sets(
-            facets, passages, p_values, knobs, scores, bins
+            facets, passages, p_values, knobs, scores, bins, uncoverable_facet_ids
         )
-
-        # Check for uncoverable facets before greedy
-        uncoverable = self._find_uncoverable_facets(facets, coverage_sets)
-        if uncoverable:
-            return self._create_abstain_result(
-                facets=facets,
-                passages=[],
-                reason=AbstentionReason.NO_COVERING_PASSAGES,
-                uncovered=uncoverable,
-                knobs=knobs,
-                coverage_map={}
-            )
 
         # Step 3: Compute initial dual lower bound (Section 4.6)
         initial_dual_lb = self._compute_dual_lower_bound(
@@ -403,7 +393,8 @@ class SafeCoverAlgorithm:
         p_values: Dict[Tuple[str, str], float],
         knobs: EpisodeKnobs,
         scores: Optional[Dict[Tuple[str, str], float]] = None,
-        bins: Optional[Dict[Tuple[str, str], str]] = None
+        bins: Optional[Dict[Tuple[str, str], str]] = None,
+        uncoverable_facet_ids: Optional[Set[str]] = None,
     ) -> Tuple[Dict[str, Set[str]], Dict[Tuple[str, str], Dict[str, Any]]]:
         """
         Build fixed coverage sets using Bonferroni thresholds.
@@ -413,6 +404,7 @@ class SafeCoverAlgorithm:
         """
         coverage_sets = {p.pid: set() for p in passages}
         coverage_info = {}  # (pid, fid) -> {p_value, alpha_bar, bin, ...}
+        blocked_facets = set(uncoverable_facet_ids or [])
 
         import os
         debug = os.environ.get("TRIDENT_DEBUG_PVALUE", "0") == "1"
@@ -427,6 +419,9 @@ class SafeCoverAlgorithm:
         for facet in facets:
             ft = facet.facet_type
             alpha_bar = knobs.get_alpha_bar(facet.facet_id)
+
+            if facet.facet_id in blocked_facets:
+                continue
 
             # Get per-facet test limit
             if facet.facet_id in self.config.per_facet_configs:
@@ -553,7 +548,6 @@ class SafeCoverAlgorithm:
         Per Section 4.7: Emit certificates for facets as they enter Cov.
         """
         selected_passages = []
-        certificates = []
         coverage_map = {}
 
         uncovered = {f.facet_id for f in facets}
@@ -562,7 +556,6 @@ class SafeCoverAlgorithm:
         total_cost = 0
 
         while uncovered and remaining_passages and len(selected_passages) < max_units:
-            # Find most cost-effective passage
             best_passage = None
             best_score = (-float('inf'), float('inf'), float('inf'), "")
 
@@ -572,72 +565,78 @@ class SafeCoverAlgorithm:
                 if not newly_covered:
                     continue
 
-                # Check budget constraint
                 if budget_cap is not None and self.config.stop_on_budget:
                     if total_cost + passage.cost > budget_cap:
                         continue
 
-                # Cost-effectiveness ratio (Section 4.5)
                 effectiveness = len(newly_covered) / max(passage.cost, 1)
-
-                # Mean p-value for tie-breaking
                 mean_p = np.mean([
                     p_values.get((pid, fid), 1.0)
                     for fid in newly_covered
                 ])
-
-                # Score tuple: (effectiveness↑, cost↓, mean_p↓, pid for determinism)
                 score = (effectiveness, -passage.cost, -mean_p, pid)
 
                 if score > best_score:
                     best_score = score
                     best_passage = passage
 
-            # No more passages can cover uncovered facets
             if best_passage is None:
                 break
 
-            # Add best passage to selection
             selected_passages.append(best_passage)
             total_cost += best_passage.cost
-            newly_covered = coverage_sets[best_passage.pid] & uncovered
-            coverage_map[best_passage.pid] = list(newly_covered)
-
-            # Generate certificates for newly covered facets (Section 4.7)
-            for facet_id in newly_covered:
-                key = (best_passage.pid, facet_id)
-                info = coverage_info.get(key, {})
-
-                # Get bin size from calibrator if available
-                bin_key = info.get('bin', 'default')
-                bin_size = 0
-                if hasattr(self.calibrator, 'bins') and bin_key in self.calibrator.bins:
-                    bin_size = self.calibrator.bins[bin_key].n_negatives
-
-                certificate = CoverageCertificate(
-                    facet_id=facet_id,
-                    facet_type=info.get('facet_type', 'unknown'),
-                    passage_id=best_passage.pid,
-                    p_value=info.get('p_value', p_values.get(key, 0.0)),
-                    threshold=info.get('alpha_bar', knobs.get_alpha_bar(facet_id)),
-                    alpha_facet=info.get('alpha_facet', knobs.alpha_f.get(facet_id, knobs.alpha_query)),
-                    alpha_query=knobs.alpha_query,
-                    t_f=knobs.t_f,
-                    bin=bin_key,
-                    bin_size=bin_size,
-                    pvalue_mode=knobs.pvalue_mode,
-                    calibrator_version=knobs.calibrator_version,
-                    verifier_version=knobs.verifier_version,
-                    shortlister_version=knobs.shortlister_version,
-                    retriever_version=knobs.retriever_version,
-                )
-                certificates.append(certificate)
-
-            # Update uncovered set
-            uncovered -= newly_covered
-
-            # Remove selected passage from remaining
+            uncovered -= coverage_sets[best_passage.pid] & uncovered
             del remaining_passages[best_passage.pid]
+
+        certificates = []
+        winner_by_facet: Dict[str, str] = {}
+        winner_info: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+        for facet in facets:
+            best_pid = None
+            best_info = None
+
+            for passage in selected_passages:
+                if facet.facet_id not in coverage_sets.get(passage.pid, set()):
+                    continue
+                key = (passage.pid, facet.facet_id)
+                info = coverage_info.get(key, {})
+                if best_info is None or info.get('p_value', 1.0) < best_info.get('p_value', 1.0):
+                    best_pid = passage.pid
+                    best_info = info
+
+            if best_pid and best_info is not None:
+                winner_by_facet[facet.facet_id] = best_pid
+                winner_info[(best_pid, facet.facet_id)] = best_info
+
+        for (pid, fid), info in winner_info.items():
+            coverage_map.setdefault(pid, []).append(fid)
+
+            bin_key = info.get('bin', 'default')
+            bin_size = 0
+            if hasattr(self.calibrator, 'bins') and bin_key in self.calibrator.bins:
+                bin_size = self.calibrator.bins[bin_key].n_negatives
+
+            certificate = CoverageCertificate(
+                facet_id=fid,
+                facet_type=info.get('facet_type', 'unknown'),
+                passage_id=pid,
+                p_value=info.get('p_value', p_values.get((pid, fid), 0.0)),
+                threshold=info.get('alpha_bar', knobs.get_alpha_bar(fid)),
+                alpha_facet=info.get('alpha_facet', knobs.alpha_f.get(fid, knobs.alpha_query)),
+                alpha_query=knobs.alpha_query,
+                t_f=knobs.t_f,
+                bin=bin_key,
+                bin_size=bin_size,
+                pvalue_mode=knobs.pvalue_mode,
+                calibrator_version=knobs.calibrator_version,
+                verifier_version=knobs.verifier_version,
+                shortlister_version=knobs.shortlister_version,
+                retriever_version=knobs.retriever_version,
+            )
+            certificates.append(certificate)
+
+        uncovered = {f.facet_id for f in facets if f.facet_id not in winner_by_facet}
 
         return selected_passages, certificates, coverage_map, list(uncovered)
 
@@ -744,7 +743,7 @@ class SafeCoverAlgorithm:
         """
         # Check for uncovered facets
         if uncovered_facets and not selected:
-            return True, AbstentionReason.NO_COVERING_PASSAGES
+            return True, AbstentionReason.INFEASIBLE_MISSING_FACETS
 
         # Check dual lower bound
         if budget_cap is not None:
@@ -758,7 +757,7 @@ class SafeCoverAlgorithm:
             if self.config.abstain_on_infeasible:
                 # Determine the specific reason
                 if dual_lb == float('inf'):
-                    return True, AbstentionReason.NO_COVERING_PASSAGES
+                    return True, AbstentionReason.INFEASIBLE_MISSING_FACETS
                 else:
                     return True, AbstentionReason.BUDGET_EXHAUSTED
 

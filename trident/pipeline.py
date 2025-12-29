@@ -1609,6 +1609,7 @@ class TridentPipeline:
 
         # Instantiate hop-2 facets with bound entity
         hop2_facets = instantiate_facets(hop2_facets, bindings)
+        uncoverable_facet_ids: Set[str] = set()
 
         if debug:
             for f in hop2_facets:
@@ -1736,15 +1737,13 @@ class TridentPipeline:
             o = (f.template or {}).get("object", "")
             if ("[" in s and "_RESULT]" in s) or ("[" in o and "_RESULT]" in o):
                 placeholder_count += 1
+                uncoverable_facet_ids.add(f.facet_id)
                 # This is a fatal bug - instantiation was not applied
                 if debug:
                     print(f"  ERROR: Hop-2 facet not instantiated: {f.facet_id} subject={s}")
 
-        if placeholder_count > 0:
-            if debug:
-                print(f"  [HOP2-INST] FATAL: {placeholder_count} facets still have placeholders")
-            # Don't raise in production - just log and return hop-1 result
-            return hop1_result
+        if placeholder_count > 0 and debug:
+            print(f"  [HOP2-INST] Marking {placeholder_count} hop-2 facets as uncoverable")
 
         if debug:
             print(f"  [HOP2-INST] All {len(hop2_facets)} facets instantiated, no placeholders")
@@ -1759,7 +1758,12 @@ class TridentPipeline:
         if debug:
             print(f"  [HOP2-SCORE] Re-scored {len(hop2_facets)} instantiated facets on {len(hop2_passages)} passages")
 
-        hop2_result = self._run_safe_cover(hop2_facets, hop2_passages, hop2_scores)
+        hop2_result = self._run_safe_cover(
+            hop2_facets,
+            hop2_passages,
+            hop2_scores,
+            uncoverable_facet_ids=uncoverable_facet_ids or None,
+        )
 
         if debug:
             hop2_coverage = hop2_result.get('metrics', {}).get('coverage', 0)
@@ -1833,7 +1837,8 @@ class TridentPipeline:
         self,
         facets: List[Facet],
         passages: List[Passage],
-        scores: TwoStageScores
+        scores: TwoStageScores,
+        uncoverable_facet_ids: Optional[Set[str]] = None,
     ) -> Dict[str, Any]:
         """
         Run Safe-Cover mode with certificates.
@@ -1852,7 +1857,8 @@ class TridentPipeline:
         result = self.safe_cover_algo.run(
             facets=facets,
             passages=passages,
-            p_values=scores.p_values
+            p_values=scores.p_values,
+            uncoverable_facet_ids=uncoverable_facet_ids,
         )
 
         # Convert to output format
