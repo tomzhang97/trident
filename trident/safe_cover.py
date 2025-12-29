@@ -226,13 +226,17 @@ class SafeCoverAlgorithm:
             # Dict of split lists
             total = 0
             for value in bin_record.values():
-                if isinstance(value, (list, tuple, set)):
+                if isinstance(value, (list, tuple, set, np.ndarray)):
                     total += len(value)
             return total
 
         # Lists/tuples/sets of negatives
         if isinstance(bin_record, (list, tuple, set)):
             return len(bin_record)
+
+        # Numpy arrays can store negative examples as well
+        if isinstance(bin_record, np.ndarray):
+            return int(bin_record.size)
 
         return 0
 
