@@ -60,6 +60,35 @@ def _normalize_relation_predicate(pred: str) -> str:
         if k in pred: return v
     return pred or "is related to"
 
+
+def _normalize_relation_schema(template: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize relation facet schema to a consistent contract.
+
+    The gate/solver rely on deterministic fields, so we materialize
+    unified keys while preserving the original template values.
+    """
+    tpl = dict(template or {})
+
+    subject = tpl.get("subject") or tpl.get("entity1") or tpl.get("entity") or ""
+    obj = tpl.get("object") or tpl.get("entity2") or tpl.get("bridge_entity") or ""
+    predicate = tpl.get("predicate") or tpl.get("relation") or tpl.get("rel") or ""
+    relation_kind = tpl.get("relation_kind") or tpl.get("outer_relation_type") or tpl.get("scoring_relation_kind") or ""
+    hop = tpl.get("hop")
+
+    # Preserve legacy hop detection while defaulting to provided value when available
+    if hop is None and tpl.get("compositional") and tpl.get("bridge_entity"):
+        hop = 2
+
+    tpl.update({
+        "subject": subject,
+        "object": obj,
+        "predicate": predicate,
+        "relation_kind": relation_kind,
+        "hop": hop,
+    })
+
+    return tpl
+
 def _looks_like_junk_entity(mention: str) -> bool:
     m = _safe_phrase(mention)
     if not m: return True
@@ -345,6 +374,22 @@ class Facet:
         ft = object.__getattribute__(self, "facet_type")
         if isinstance(ft, str):
             object.__setattr__(self, "facet_type", FacetType(ft))
+
+        # Normalize relation-like facets to avoid schema drift in gating/solver
+        tpl = object.__getattribute__(self, "template")
+        if self.facet_type in {FacetType.RELATION, FacetType.BRIDGE_HOP, FacetType.BRIDGE_HOP1, FacetType.BRIDGE_HOP2}:
+            tpl = _normalize_relation_schema(tpl)
+            object.__setattr__(self, "template", tpl)
+
+            meta = dict(object.__getattribute__(self, "metadata") or {})
+            subject_raw = str(tpl.get("subject", ""))
+            object_raw = str(tpl.get("object", ""))
+            placeholder_re = re.compile(r"\[[A-Z0-9_]+_RESULT\]")
+
+            meta.setdefault("instantiated", not (placeholder_re.search(subject_raw) or placeholder_re.search(object_raw)))
+            meta.setdefault("subject_is_entity", bool(subject_raw.strip()) and not placeholder_re.search(subject_raw))
+            meta.setdefault("has_two_entity_anchors", bool(subject_raw.strip()) and bool(object_raw.strip()))
+            object.__setattr__(self, "metadata", meta)
 
     def to_hypothesis(self, passage_text: Optional[str] = None) -> str:
         ft = self.facet_type

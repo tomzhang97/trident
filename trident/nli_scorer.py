@@ -42,6 +42,64 @@ def _normalize_label(s: str) -> str:
 _WS_RE = re.compile(r"\s+")
 _NON_ALNUM_RE = re.compile(r"[^0-9a-z]+")
 
+
+def _normalize_text_unicode(text: str) -> str:
+    """Unicode-stable normalization used for gating/anchoring.
+
+    This removes differences between unicode variants and lowercases while
+    keeping spacing deterministic so token-set comparisons are stable.
+    """
+    norm = unicodedata.normalize("NFKC", text or "")
+    norm = _WS_RE.sub(" ", norm).strip().lower()
+    return norm
+
+
+def _get_token_set(norm_text: str) -> set[str]:
+    return {t for t in re.split(r"[^0-9a-z]+", norm_text) if t}
+
+
+def _fuzzy_phrase_match(term: str, passage_norm: str, passage_tokens: set[str]) -> bool:
+    """Deterministic token/phrase match that avoids brittle substrings."""
+    norm = _normalize_text_unicode(term)
+    if not norm:
+        return False
+    tokens = _get_token_set(norm)
+    if not tokens:
+        return False
+    if len(tokens) == 1:
+        return next(iter(tokens)) in passage_tokens
+    return tokens.issubset(passage_tokens) or norm in passage_norm
+
+
+RELATION_KEYWORDS: Dict[str, set[str]] = {
+    "DIRECTOR": {"director", "directed", "filmmaker", "helmed"},
+    "BORN": {"born", "birth", "birthplace", "native"},
+    "AWARD": {"award", "won", "prize", "winner", "nominated"},
+    "CREATED": {"created", "founded", "wrote", "written", "author", "composed"},
+    "LOCATION": {"located", "capital", "situated", "based", "headquarters"},
+    "MARRIAGE": {"married", "spouse", "wife", "husband", "wedding"},
+    "MOTHER": {"mother", "daughter", "son", "child"},
+    "FATHER": {"father", "daughter", "son", "child"},
+    "PARENT": {"parent", "daughter", "son", "child"},
+    "CHILD": {"parent", "daughter", "son", "child"},
+    "SPOUSE": {"spouse", "married", "wife", "husband", "partner"},
+    "NATIONALITY": {"nationality", "citizen", "from"},
+    "BIRTHPLACE": {"birthplace", "born", "raised", "grew"},
+}
+
+
+def _check_relation_keywords(kind: str, passage_norm: str, passage_tokens: set[str]) -> bool:
+    keywords = RELATION_KEYWORDS.get((kind or "").upper())
+    if not keywords:
+        return False
+    for kw in keywords:
+        if " " in kw:
+            if _fuzzy_phrase_match(kw, passage_norm, passage_tokens):
+                return True
+        elif kw in passage_tokens:
+            return True
+    return False
+
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKC", s or "")
     # Robust normalization: standard quotes
@@ -185,230 +243,46 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         return _entity_in_passage(e1, passage_text) and _entity_in_passage(e2, passage_text)
 
     if ft == FacetType.RELATION:
+        passage_norm = _normalize_text_unicode(passage_text)
+        passage_tokens = _get_token_set(passage_norm)
+
         s_raw = str(tpl.get("subject", ""))
         o_raw = str(tpl.get("object", ""))
         predicate = str(tpl.get("predicate", ""))
-        predicate_lower = predicate.lower()
-        # Clean endpoints - remove WH-words and generic terms
-        s = _clean_relation_endpoint(s_raw)
-        o = _clean_relation_endpoint(o_raw)
-        debug_rel = os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1"
 
-        # ================================================================
-        # CRITICAL: Detect PLACEHOLDER subjects like "[DIRECTOR_RESULT]"
-        # ================================================================
-        # Placeholder subjects are variable references from compositional facets
-        # They should be treated like WH-subjects (no subject match required)
-        is_placeholder_subject = "[" in s_raw and "_RESULT]" in s_raw
-
-        # Detect if subject is a WH-word (meaningless for matching)
-        # For queries like "Who directed X?", subject="Who" is not a real entity
-        is_wh_subject = (not s) or (s_raw.strip().lower() in _WH_WORDS) or is_placeholder_subject
-
-        # If both endpoints are empty after cleaning, can't gate reliably - let NLI decide
-        if not s and not o:
-            if debug_rel:
-                print(f"[RELATION GATE] subj_raw='{s_raw}' obj_raw='{o_raw}' -> BOTH EMPTY after cleaning, gate=True (let NLI decide)")
-            return True  # Don't gate, let NLI score it
-
-        # Use robust entity matching with hyphen/Unicode normalization
-        # "polish russian war" will match "Polish-Russian War" in passage
-        s_match = _entity_in_passage(s, passage_text) if s else False
-        o_match = _entity_in_passage(o, passage_text) if o else False
-
-        passage_lower = passage_text.lower()
-        facet_text_lower = f"{s_raw} {o_raw} {predicate}".lower()
-
-        # ================================================================
-        # CRITICAL: Check for EXPLICIT relation_kind from template FIRST
-        # ================================================================
-        # For compositional hop-2 facets, the template contains outer_relation_type
-        # (e.g., "MOTHER") which must take precedence over keyword inference.
-        # Without this, a hop-2 MOTHER facet with subject "[DIRECTOR_RESULT]"
-        # would incorrectly be classified as DIRECTOR because of the keyword.
-        #
-        # PARENT NORMALIZATION: Prefer scoring_relation_kind over outer_relation_type.
-        # This allows MOTHER/FATHER to be scored as PARENT for better NLI matching.
-        explicit_relation_kind = (
-            tpl.get('scoring_relation_kind') or
-            tpl.get('outer_relation_type') or
-            tpl.get('relation_kind')
+        relation_kind = (
+            tpl.get("scoring_relation_kind")
+            or tpl.get("outer_relation_type")
+            or tpl.get("relation_kind")
         )
 
-        if explicit_relation_kind:
-            relation_kind = explicit_relation_kind
-            if debug_rel:
-                print(f"[RELATION GATE] Using EXPLICIT relation_kind={relation_kind} from template")
-        else:
-            # Fallback: Detect relation kind from combined text (for non-compositional facets)
-            relation_kind = "DEFAULT"
-            if 'direct' in predicate_lower or 'director' in facet_text_lower:
-                relation_kind = "DIRECTOR"
-            elif 'born' in predicate_lower or 'birth' in predicate_lower:
-                relation_kind = "BORN"
-            elif any(kw in facet_text_lower for kw in {"won", "award", "prize", "win", "winner"}):
-                relation_kind = "AWARD"
-            elif any(kw in predicate_lower for kw in {"creat", "found", "writ", "author", "compose"}):
-                relation_kind = "CREATED"
-            elif any(kw in predicate_lower for kw in {"locat", "capital", "situat", "based"}):
-                relation_kind = "LOCATION"
-            elif any(kw in predicate_lower for kw in {"marr", "spouse", "wife", "husband"}):
-                relation_kind = "MARRIAGE"
+        # Anchor constraint: require at least one grounded endpoint
+        s_clean = _clean_relation_endpoint(s_raw)
+        o_clean = _clean_relation_endpoint(o_raw)
+        has_anchor = bool(s_clean or o_clean)
 
-        # Debug: show normalized tokens for diagnosis
-        if debug_rel:
-            s_tokens = _token_set(s) if s else set()
-            o_tokens = _token_set(o) if o else set()
-            print(f"[RELATION GATE] relation_kind={relation_kind} is_wh_subject={is_wh_subject} is_placeholder={is_placeholder_subject}")
-            print(f"[RELATION GATE] s_tokens={s_tokens} o_tokens={o_tokens} s_match={s_match} o_match={o_match}")
+        # Reject global probes or placeholder-only facets
+        if not has_anchor:
+            return False
 
-        # PREDICATE-SPECIFIC ANCHOR GATES
-        # For each relation type, require predicate-related tokens in passage
-        predicate_match = True  # Default: no specific predicate gate
+        placeholder_re = re.compile(r"\[[A-Z0-9_]+_RESULT\]")
+        if (s_clean and placeholder_re.search(s_raw)) or (o_clean and placeholder_re.search(o_raw)):
+            return False
 
-        if relation_kind == "DIRECTOR":
-            director_anchors = {"director", "directed", "filmmaker", "helmed", "helm", "direct"}
-            predicate_match = any(a in passage_lower for a in director_anchors)
-            if debug_rel:
-                print(f"[RELATION GATE] DIRECTOR relation, predicate_match={predicate_match}")
+        s_match = _fuzzy_phrase_match(s_clean, passage_norm, passage_tokens) if s_clean else False
+        o_match = _fuzzy_phrase_match(o_clean, passage_norm, passage_tokens) if o_clean else False
 
-        elif relation_kind == "BORN":
-            birth_anchors = {"born", "birth", "birthplace", "native", "raised"}
-            predicate_match = any(a in passage_lower for a in birth_anchors)
-            if debug_rel:
-                print(f"[RELATION GATE] BORN relation, predicate_match={predicate_match}")
+        if not (s_match or o_match):
+            return False
 
-        elif relation_kind == "AWARD":
-            award_anchors = {"award", "won", "prize", "received", "honor", "honoured", "honored",
-                           "oscar", "grammy", "emmy", "bafta", "golden globe", "winner", "winning",
-                           "accolade", "recognition", "nominated", "nomination", "laureate"}
-            predicate_match = any(a in passage_lower for a in award_anchors)
-            if debug_rel:
-                print(f"[RELATION GATE] AWARD relation, predicate_match={predicate_match}")
+        # Predicate constraint
+        predicate_ok = False
+        if relation_kind:
+            predicate_ok = _check_relation_keywords(relation_kind, passage_norm, passage_tokens)
+        if not predicate_ok and predicate:
+            predicate_ok = _fuzzy_phrase_match(predicate, passage_norm, passage_tokens)
 
-        elif relation_kind == "CREATED":
-            create_anchors = {"created", "founded", "wrote", "written", "author", "composed",
-                            "established", "started", "built", "invented", "designed"}
-            predicate_match = any(a in passage_lower for a in create_anchors)
-            if debug_rel:
-                print(f"[RELATION GATE] CREATED relation, predicate_match={predicate_match}")
-
-        elif relation_kind == "LOCATION":
-            location_anchors = {"located", "capital", "situated", "based", "headquarters",
-                              "city", "country", "region", "province", "state"}
-            predicate_match = any(a in passage_lower for a in location_anchors)
-            if debug_rel:
-                print(f"[RELATION GATE] LOCATION relation, predicate_match={predicate_match}")
-
-        elif relation_kind == "MARRIAGE":
-            marriage_anchors = {"married", "spouse", "wife", "husband", "wed", "wedding", "partner"}
-            predicate_match = any(a in passage_lower for a in marriage_anchors)
-            if debug_rel:
-                print(f"[RELATION GATE] MARRIAGE relation, predicate_match={predicate_match}")
-
-        # ================================================================
-        # EXPLICIT RELATION KINDS (from compositional hop-2 facets)
-        # ================================================================
-        # These are NOT inferred from keywords - they come from outer_relation_type
-        elif relation_kind == "MOTHER":
-            mother_anchors = {"mother", "son of", "daughter of", "child of", "parent", "mom"}
-            predicate_match = any(a in passage_lower for a in mother_anchors)
-            if debug_rel:
-                print(f"[RELATION GATE] MOTHER relation, predicate_match={predicate_match}")
-
-        elif relation_kind == "FATHER":
-            father_anchors = {"father", "son of", "daughter of", "child of", "parent", "dad"}
-            predicate_match = any(a in passage_lower for a in father_anchors)
-            if debug_rel:
-                print(f"[RELATION GATE] FATHER relation, predicate_match={predicate_match}")
-
-        elif relation_kind in ("PARENT", "CHILD"):
-            family_anchors = {"mother", "father", "son", "daughter", "child", "parent", "offspring"}
-            predicate_match = any(a in passage_lower for a in family_anchors)
-            if debug_rel:
-                print(f"[RELATION GATE] {relation_kind} relation, predicate_match={predicate_match}")
-
-        elif relation_kind == "SPOUSE":
-            spouse_anchors = {"spouse", "wife", "husband", "married", "wed", "partner"}
-            predicate_match = any(a in passage_lower for a in spouse_anchors)
-            if debug_rel:
-                print(f"[RELATION GATE] SPOUSE relation, predicate_match={predicate_match}")
-
-        elif relation_kind == "NATIONALITY":
-            nationality_anchors = {"nationality", "national", "citizen", "born in", "from", "native"}
-            predicate_match = any(a in passage_lower for a in nationality_anchors)
-            if debug_rel:
-                print(f"[RELATION GATE] NATIONALITY relation, predicate_match={predicate_match}")
-
-        elif relation_kind == "BIRTHPLACE":
-            birthplace_anchors = {"born", "birthplace", "native of", "birth", "raised in", "grew up"}
-            predicate_match = any(a in passage_lower for a in birthplace_anchors)
-            if debug_rel:
-                print(f"[RELATION GATE] BIRTHPLACE relation, predicate_match={predicate_match}")
-
-        # ================================================================
-        # FINAL GATE LOGIC
-        # ================================================================
-        # CRITICAL: Include ALL relation kinds here, including explicit ones from compositional facets.
-        all_known_relation_kinds = {
-            "DIRECTOR", "BORN", "AWARD", "CREATED", "LOCATION", "MARRIAGE",
-            # Explicit relation kinds from compositional facets
-            "MOTHER", "FATHER", "PARENT", "CHILD", "SPOUSE", "NATIONALITY", "BIRTHPLACE"
-        }
-
-        # ================================================================
-        # STRUCTURAL hop2 detection (C1 fix)
-        # ================================================================
-        # CRITICAL: Only check "hop" == 2 from the template, NOT "compositional".
-        # "compositional" is True for BOTH hop-1 and hop-2, but only hop-2 facets
-        # should use the stricter entity-anchored gate.
-        # Hop-1 compositional facets like "Who is the director of X?" have
-        # subject="Who" and should be handled by the WH-subject branch.
-        is_hop2 = tpl.get("hop") == 2
-
-        # Determine gate policy for logging
-        gate_policy = "STRICT"
-
-        if is_hop2 and relation_kind in all_known_relation_kinds:
-            # HOP-2 COMPOSITIONAL: Entity-anchored gate (not predicate-only)
-            # After instantiation, subject should be a real entity (e.g., "Andrzej Żuławski")
-            # Require subject match + predicate match to avoid false positives on
-            # passages that mention the relation but not the right person.
-            if is_placeholder_subject:
-                # Subject still has placeholder - not yet instantiated, allow predicate-only
-                result = predicate_match
-                gate_policy = "HOP2_UNINSTANTIATED"
-                if debug_rel:
-                    print(f"[RELATION GATE] HOP-2 uninstantiated: predicate_match={predicate_match}")
-            else:
-                # Subject is instantiated - require entity anchor
-                result = s_match and predicate_match
-                gate_policy = "HOP2_ANCHORED"
-                if debug_rel:
-                    print(f"[RELATION GATE] HOP-2 anchored: s_match={s_match} predicate_match={predicate_match}")
-        elif is_placeholder_subject and relation_kind in all_known_relation_kinds:
-            # PLACEHOLDER SUBJECT: Treat like WH-subject, predicate-first
-            # The subject "[DIRECTOR_RESULT]" is not a real entity to find
-            result = predicate_match
-            gate_policy = "PLACEHOLDER_RELAXED"
-            if debug_rel:
-                print(f"[RELATION GATE] PLACEHOLDER predicate-first: predicate_match={predicate_match}")
-        elif is_wh_subject and relation_kind in all_known_relation_kinds:
-            # WH-subject: only require object match + predicate match
-            result = o_match and predicate_match
-            gate_policy = "WH_RELAXED"
-        elif relation_kind in all_known_relation_kinds:
-            # Concrete subject: require subject OR object match + predicate match
-            result = (s_match or o_match) and predicate_match
-        else:
-            # Unknown relation kind: only require at least one endpoint match (no predicate gate)
-            result = s_match or o_match
-
-        if debug_rel:
-            print(f"[RELATION GATE] subj_raw='{s_raw}' subj_clean='{s}' obj_raw='{o_raw}' obj_clean='{o}' "
-                  f"s_match={s_match} o_match={o_match} predicate_match={predicate_match} "
-                  f"is_hop2={is_hop2} gate_policy={gate_policy} -> gate={result}")
-        return result
+        return predicate_ok
 
     if ft == FacetType.COMPARISON:
         e1 = str(tpl.get("entity1", ""))
