@@ -14,6 +14,85 @@ from typing import Dict, List, Optional, Set, Tuple, Any
 # Entity extraction regex - Title Case spans
 ENTITY_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,4})\b")
 
+# =============================================================================
+# CERTIFIED-ONLY CONSTANTS
+# =============================================================================
+# Deny-listed document titles that should never be used for answer extraction
+DENY_TITLES = frozenset([
+    "disambiguation", "list of", "index of", "outline of", "portal:",
+    "category:", "template:", "wikipedia:", "help:", "file:", "mediawiki:"
+])
+
+# Month names for date extraction
+MONTHS = frozenset([
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec"
+])
+
+
+# =============================================================================
+# CERTIFIED-ONLY HELPER FUNCTIONS
+# =============================================================================
+
+def _cert_pid(certificates: List[Dict[str, Any]]) -> Set[str]:
+    """
+    Extract certified passage IDs from certificates.
+
+    Returns:
+        Set of passage IDs that have at least one valid certificate.
+    """
+    return {c.get("passage_id", "") for c in certificates if c.get("passage_id")}
+
+
+def _norm_ws(s: str) -> str:
+    """
+    Normalize whitespace in a string.
+
+    Collapses multiple spaces/tabs/newlines into single spaces and strips.
+    """
+    return " ".join(s.split())
+
+
+def _normalize_text_unicode(text: str) -> str:
+    """
+    Normalize text for substring matching across Unicode variants.
+
+    Handles:
+    - Unicode normalization (NFKC)
+    - Curly quotes -> straight quotes
+    - En/em dashes -> hyphens
+    - Whitespace normalization
+    """
+    import unicodedata
+
+    if not text:
+        return ""
+
+    # Unicode normalization
+    text = unicodedata.normalize("NFKC", text)
+
+    # Curly quotes -> straight
+    text = text.replace("'", "'").replace("'", "'")
+    text = text.replace(""", '"').replace(""", '"')
+
+    # Dashes -> hyphen
+    text = text.replace("–", "-").replace("—", "-")
+
+    # Whitespace normalization
+    text = _norm_ws(text)
+
+    return text
+
+
+def _is_deny_title(title: str) -> bool:
+    """Check if a title should be denied for answer extraction."""
+    if not title:
+        return False
+    t_lower = title.lower()
+    return any(deny in t_lower for deny in DENY_TITLES)
+
+
 # Relation triggers for different relation kinds (used as fallback when LLM router unavailable)
 REL_TRIGGERS = {
     "DIRECTOR": ["directed by", "director", "film directed by", "directed", "filmmaker"],
@@ -1966,6 +2045,11 @@ def get_answer_facet_passages(
     """
     Get passages that won the answer-determining facet(s).
 
+    CERTIFIED-ONLY INVARIANT:
+    - Only returns passages that have certificates (in _cert_pid set)
+    - Filters out passages with deny-listed titles
+    - Orders by p-value (best first)
+
     For WH-questions, the answer facet is typically RELATION/TEMPORAL/NUMERIC.
     ENTITY facets just confirm the question subject exists, not the answer.
 
@@ -1984,8 +2068,21 @@ def get_answer_facet_passages(
     if not certificates:
         return [], [], "NO_CERTIFICATES"
 
-    # Build passage lookup
-    pid_to_passage = {p.get("pid"): p for p in all_passages if p.get("pid")}
+    # CERTIFIED-ONLY: Get the set of certified passage IDs
+    certified_pids = _cert_pid(certificates)
+
+    # Build passage lookup (only certified passages)
+    pid_to_passage = {}
+    for p in all_passages:
+        pid = p.get("pid")
+        if pid and pid in certified_pids:
+            # Filter out deny-listed titles
+            title = p.get("title", "")
+            if not _is_deny_title(title):
+                pid_to_passage[pid] = p
+
+    if debug:
+        print(f"[ANSWER-FACET] certified_pids={len(certified_pids)}, valid_passages={len(pid_to_passage)}")
 
     # Build facet_id -> certificates mapping
     facet_to_certs: Dict[str, List[Dict[str, Any]]] = {}
@@ -2050,19 +2147,11 @@ def get_answer_facet_passages(
         print(f"[ANSWER-FACET] priority_types={priority_facet_types}")
         print(f"[ANSWER-FACET] answer_facet_ids={answer_facet_ids}")
 
-    # Get passages that won answer facets
-    answer_pids = set()
-    for fid in answer_facet_ids:
-        for cert in facet_to_certs.get(fid, []):
-            pid = cert.get("passage_id")
-            if pid:
-                answer_pids.add(pid)
-
-    # Order passages: answer-facet winners first, by p-value
+    # Get passages that won answer facets (CERTIFIED-ONLY: must be in pid_to_passage)
     answer_passages = []
     seen_pids = set()
 
-    # Get all certs for answer facets, sorted by p-value
+    # Get all certs for answer facets, sorted by p-value (best first)
     answer_certs = []
     for fid in answer_facet_ids:
         answer_certs.extend(facet_to_certs.get(fid, []))
@@ -2071,6 +2160,7 @@ def get_answer_facet_passages(
 
     for cert in answer_certs:
         pid = cert.get("passage_id")
+        # CERTIFIED-ONLY: Only include if in pid_to_passage (certified and not deny-listed)
         if pid and pid not in seen_pids and pid in pid_to_passage:
             seen_pids.add(pid)
             answer_passages.append(pid_to_passage[pid])
@@ -2090,12 +2180,17 @@ def constrained_span_select(
     question: str,
     winner_passages: List[Dict[str, Any]],
     max_candidates: int = 10,
-    max_chars_per_passage: int = 600
+    max_chars_per_passage: int = 600,
+    certificates: Optional[List[Dict[str, Any]]] = None
 ) -> ConstrainedSelectionResult:
     """
     Full constrained selection pipeline: detect type -> extract candidates -> LLM pick.
 
-    This is the main entry point for constrained candidate selection.
+    CERTIFIED-ONLY INVARIANT:
+    - If certificates provided, only use passages in _cert_pid(certificates)
+    - Candidates are FROZEN at extraction time (immutable list)
+    - LLM can only select by index from frozen candidates
+    - Final answer is verified to be verbatim substring before return
 
     Args:
         llm: LLM interface
@@ -2103,12 +2198,34 @@ def constrained_span_select(
         winner_passages: Certificate-winning passages
         max_candidates: Max candidates to extract
         max_chars_per_passage: Max chars per passage in prompt
+        certificates: Optional certificates for certified-only enforcement
 
     Returns:
         ConstrainedSelectionResult with answer and metadata
     """
     import os
     debug = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
+
+    # CERTIFIED-ONLY: Filter passages if certificates provided
+    if certificates:
+        certified_pids = _cert_pid(certificates)
+        winner_passages = [
+            p for p in winner_passages
+            if p.get("pid") in certified_pids and not _is_deny_title(p.get("title", ""))
+        ]
+        if debug:
+            print(f"[CONSTRAINED] Filtered to {len(winner_passages)} certified passages")
+
+    if not winner_passages:
+        return ConstrainedSelectionResult(
+            answer="",
+            candidate_index=-1,
+            confidence=0.0,
+            passage_id="",
+            candidates=[],
+            support_scores=[],
+            reason="NO_CERTIFIED_PASSAGES"
+        )
 
     # Step 1: Detect question type
     qtype = detect_question_type(question)
@@ -2117,14 +2234,19 @@ def constrained_span_select(
         if qtype.options:
             print(f"[CONSTRAINED] Options: {qtype.options}")
 
-    # Step 2: Extract candidates
+    # Step 2: Extract candidates (FROZEN at this point - immutable)
     candidates = extract_candidates(winner_passages, qtype, max_candidates)
-    if debug:
-        print(f"[CONSTRAINED] Extracted {len(candidates)} candidates")
-        for i, (text, score, pid) in enumerate(candidates[:5]):
-            print(f"  {i}: '{text}' (support={score}, pid={pid[:12]}...)")
 
-    if not candidates:
+    # FREEZE: Convert to tuple to ensure immutability
+    frozen_candidates = tuple(candidates)
+
+    if debug:
+        print(f"[CONSTRAINED] Extracted {len(frozen_candidates)} candidates (frozen)")
+        for i, (text, score, pid) in enumerate(frozen_candidates[:5]):
+            pid_str = pid[:12] if pid else "?"
+            print(f"  {i}: '{text}' (support={score}, pid={pid_str}...)")
+
+    if not frozen_candidates:
         return ConstrainedSelectionResult(
             answer="",
             candidate_index=-1,
@@ -2135,14 +2257,37 @@ def constrained_span_select(
             reason="NO_CANDIDATES"
         )
 
-    # Step 3: LLM picks from candidates
+    # Step 3: LLM picks from frozen candidates
     result = llm_pick_candidate(
         llm=llm,
         question=question,
         passages=winner_passages,
-        candidates=candidates,
+        candidates=list(frozen_candidates),  # Pass as list but from frozen source
         max_chars_per_passage=max_chars_per_passage
     )
+
+    # Step 4: VERIFY the answer is verbatim in source passage
+    if result.answer and result.passage_id:
+        pid_to_passage = {p.get("pid", ""): p for p in winner_passages}
+        source_passage = pid_to_passage.get(result.passage_id)
+        if source_passage:
+            source_text = source_passage.get("text", "")
+            # Normalize for matching
+            source_norm = _normalize_text_unicode(source_text)
+            answer_norm = _normalize_text_unicode(result.answer)
+            if answer_norm and answer_norm not in source_norm:
+                if debug:
+                    print(f"[CONSTRAINED] VERIFY FAILED: '{result.answer}' not in passage")
+                # Return with VERIFY_FAILED reason but keep answer for debugging
+                return ConstrainedSelectionResult(
+                    answer=result.answer,
+                    candidate_index=result.candidate_index,
+                    confidence=0.0,  # Zero confidence on verify failure
+                    passage_id=result.passage_id,
+                    candidates=result.candidates,
+                    support_scores=result.support_scores,
+                    reason="VERIFY_FAILED"
+                )
 
     return result
 
@@ -2151,16 +2296,21 @@ def bind_entity_via_css(
     llm,
     inner_question: str,
     hop1_passages: List[Dict[str, Any]],
-    max_chars: int = 600
+    max_chars: int = 600,
+    certificates: Optional[List[Dict[str, Any]]] = None
 ) -> Optional[str]:
     """
-    Generic entity binding using Certified Span Selection.
+    CHOICE-ONLY entity binding using Certified Span Selection.
 
-    This replaces relation-specific binding (bind_entity_from_hop1_winner).
-    The inner_question is built from the hop1 facet template.
+    CERTIFIED-ONLY INVARIANT:
+    - First extracts PERSON candidates from passages
+    - LLM picks by index from frozen candidates (not free-form)
+    - Final answer is verified to be verbatim substring
 
     Example:
         inner_question: "Who is the director of Polish-Russian War (film)?"
+        Candidates: ["Xawery Żuławski", "John Smith", ...]
+        LLM picks: index 0
         Returns: "Xawery Żuławski" (verbatim from passage)
 
     Args:
@@ -2168,6 +2318,7 @@ def bind_entity_via_css(
         inner_question: The hop-1 question asking for the bridge entity
         hop1_passages: Certificate-winning passages from hop-1
         max_chars: Max chars per passage
+        certificates: Optional certificates for certified-only enforcement
 
     Returns:
         The bound entity string, or None if binding failed
@@ -2180,9 +2331,90 @@ def bind_entity_via_css(
     if not hop1_passages:
         return None
 
+    # CERTIFIED-ONLY: Filter passages if certificates provided
+    if certificates:
+        certified_pids = _cert_pid(certificates)
+        hop1_passages = [
+            p for p in hop1_passages
+            if p.get("pid") in certified_pids and not _is_deny_title(p.get("title", ""))
+        ]
+        if debug:
+            print(f"[CSS-BIND] Filtered to {len(hop1_passages)} certified passages")
+
+    if not hop1_passages:
+        return None
+
+    # Step 1: Extract PERSON candidates from passages (FROZEN)
+    # Use the PERSON pattern from extract_candidates
+    person_pattern = re.compile(
+        r"\b([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+(?:de|van|von|la|el|al|bin|ibn)?[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,5})\b"
+    )
+
+    candidates: Dict[str, Tuple[float, str]] = {}  # text -> (score, pid)
+
+    for p in hop1_passages:
+        text = p.get("text") or ""
+        pid = p.get("pid", "")
+
+        for match in person_pattern.finditer(text):
+            name = match.group(1).strip()
+
+            # Validate: looks like a person name
+            if not _looks_like_person(name):
+                continue
+
+            # Compute support score
+            support = sum(
+                1 for pp in hop1_passages
+                if name.lower() in (pp.get("text") or "").lower()
+            )
+
+            # Multi-token bonus
+            token_count = len(name.split())
+            length_bonus = 0.5 * (token_count - 1)
+            adjusted_support = support + length_bonus
+
+            if name not in candidates or adjusted_support > candidates[name][0]:
+                candidates[name] = (adjusted_support, pid)
+
+    # Deduplicate: remove single-token candidates that are substrings of multi-token
+    if len(candidates) > 1:
+        to_remove = set()
+        sorted_cands = sorted(candidates.items(), key=lambda x: x[1][0], reverse=True)
+        for i, (name1, _) in enumerate(sorted_cands):
+            name1_norm = _normalize_for_dedup(name1)
+            for name2, _ in sorted_cands[i+1:]:
+                name2_norm = _normalize_for_dedup(name2)
+                if len(name2_norm) < len(name1_norm) and name2_norm in name1_norm:
+                    to_remove.add(name2)
+        for name in to_remove:
+            if name in candidates:
+                del candidates[name]
+
+    # Sort by support score
+    sorted_candidates = sorted(
+        [(text, score, pid) for text, (score, pid) in candidates.items()],
+        key=lambda x: x[1],
+        reverse=True
+    )[:10]  # Max 10 candidates
+
+    # FREEZE candidates
+    frozen_candidates = tuple(sorted_candidates)
+
+    if debug:
+        print(f"[CSS-BIND] Extracted {len(frozen_candidates)} PERSON candidates (frozen)")
+        for i, (text, score, pid) in enumerate(frozen_candidates[:5]):
+            print(f"  {i}: '{text}' (support={score})")
+
+    if not frozen_candidates:
+        if debug:
+            print(f"[CSS-BIND] No PERSON candidates found")
+        return None
+
+    # Step 2: LLM picks by index from frozen candidates
     # Build compact evidence
     evidence_parts = []
-    for p in hop1_passages:
+    for p in hop1_passages[:3]:  # Limit to 3 passages
         pid = p.get("pid", "")
         title = p.get("title", "")
         text = (p.get("text") or "")[:max_chars]
@@ -2190,19 +2422,24 @@ def bind_entity_via_css(
 
     evidence_text = "\n\n".join(evidence_parts)
 
-    # Specialized prompt for ENTITY BINDING (not general QA)
-    # Emphasizes extracting a PERSON'S NAME as verbatim substring
-    prompt = f"""Extract the PERSON'S NAME that answers the question below.
+    # Build numbered candidate list
+    candidate_list = []
+    for i, (text, score, pid) in enumerate(frozen_candidates):
+        candidate_list.append(f"{i}: {text}")
+    candidates_text = "\n".join(candidate_list)
 
-CRITICAL RULES:
-1) The answer MUST be a person's name (first name + last name)
-2) Copy the name EXACTLY as it appears in the evidence (verbatim)
-3) Do NOT output film names, places, or descriptions - ONLY a person's name
-4) If no person's name answers the question, output empty answer
+    # CHOICE-ONLY prompt: LLM must pick by index
+    prompt = f"""Pick the ONE person's name that answers the question.
 
-Return JSON: {{"pid": "passage_id", "answer": "Person Name", "confidence": 0.9}}
+RULES:
+1. You MUST pick from the numbered candidates below BY INDEX
+2. Return ONLY a JSON object with "index" (integer) and "confidence" (0-1)
+3. If no candidate answers the question, return {{"index": -1, "confidence": 0}}
 
 Question: {inner_question}
+
+Candidates:
+{candidates_text}
 
 Evidence:
 {evidence_text}
@@ -2229,49 +2466,58 @@ JSON:"""
             out = json_module.loads(raw_text.strip())
     except Exception as e:
         if debug:
-            print(f"[CSS-BIND] JSON parse failed: {e}")
+            print(f"[CSS-BIND] JSON parse error: {e}")
+        # Try to extract just the index
+        index_match = re.search(r'\b(\d+)\b', raw_text)
+        if index_match:
+            out = {"index": int(index_match.group(1)), "confidence": 0.5}
+        else:
+            return None
+
+    index = out.get("index", -1)
+
+    # Validate index
+    if not isinstance(index, int) or index < 0 or index >= len(frozen_candidates):
+        if debug:
+            print(f"[CSS-BIND] Invalid index: {index}")
+        # Fallback: pick highest-scoring candidate
+        if frozen_candidates:
+            answer = frozen_candidates[0][0]
+            if debug:
+                print(f"[CSS-BIND] Fallback to highest-scoring: '{answer}'")
+            return answer
         return None
 
-    answer = (out.get("answer") or "").strip()
-    pid = (out.get("pid") or "").strip()
+    # Get selected candidate
+    selected_text, selected_score, selected_pid = frozen_candidates[index]
 
     if debug:
-        print(f"[CSS-BIND] Parsed: answer='{answer}', pid='{pid}'")
+        print(f"[CSS-BIND] Selected index {index}: '{selected_text}'")
 
-    if not answer:
-        return None
-
-    # Validate: must look like a person's name
-    # This is a general PERSON-ish validator, not relation-specific
-    if not _looks_like_person(answer):
-        if debug:
-            print(f"[CSS-BIND] Rejected: '{answer}' doesn't look like a person name")
-        return None
-
-    # Verify it's a verbatim substring of a passage
+    # Step 3: Verify it's verbatim in passage
     passage_map = {p.get("pid", ""): p for p in hop1_passages}
     verified = False
 
-    if pid and pid in passage_map:
-        passage_text = passage_map[pid].get("text", "")
-        if _find_exact_substring(passage_text, answer) is not None:
+    if selected_pid and selected_pid in passage_map:
+        passage_text = passage_map[selected_pid].get("text", "")
+        if _find_exact_substring(passage_text, selected_text) is not None:
             verified = True
     else:
         # Try all passages
         for p in hop1_passages:
-            if _find_exact_substring(p.get("text", ""), answer) is not None:
+            if _find_exact_substring(p.get("text", ""), selected_text) is not None:
                 verified = True
                 break
 
     if not verified:
         if debug:
-            print(f"[CSS-BIND] Rejected: '{answer}' not found verbatim in passages")
+            print(f"[CSS-BIND] VERIFY FAILED: '{selected_text}' not found verbatim")
         return None
 
     if debug:
-        print(f"[CSS-BIND] Accepted: '{answer}'")
+        print(f"[CSS-BIND] Accepted: '{selected_text}'")
 
-    return answer
+    return selected_text
 
 
 def build_inner_question_from_facet(facet: Dict[str, Any]) -> str:
@@ -2306,7 +2552,10 @@ def get_winner_passages_only(
     """
     Extract only the certificate-winning passages (deduplicated).
 
-    This is the minimal set needed for CSS - no extra passages.
+    CERTIFIED-ONLY INVARIANT:
+    - Only includes passages that have valid certificates
+    - Filters out passages with deny-listed titles
+    - Orders by certificate p-value (best first)
 
     Args:
         certificates: List of certificates with passage_id
@@ -2318,8 +2567,17 @@ def get_winner_passages_only(
     if not certificates:
         return []
 
-    # Build passage lookup
-    pid_to_passage = {p.get("pid", ""): p for p in passages}
+    # CERTIFIED-ONLY: Get set of certified passage IDs
+    certified_pids = _cert_pid(certificates)
+
+    # Build passage lookup (only certified passages, excluding deny-listed)
+    pid_to_passage = {}
+    for p in passages:
+        pid = p.get("pid", "")
+        if pid and pid in certified_pids:
+            title = p.get("title", "")
+            if not _is_deny_title(title):
+                pid_to_passage[pid] = p
 
     # Sort certificates by p-value (best first)
     sorted_certs = sorted(certificates, key=lambda c: c.get("p_value", 1.0))
@@ -2330,6 +2588,7 @@ def get_winner_passages_only(
 
     for cert in sorted_certs:
         pid = cert.get("passage_id", "")
+        # CERTIFIED-ONLY: Must be in pid_to_passage (certified and not deny-listed)
         if pid and pid not in seen_pids and pid in pid_to_passage:
             seen_pids.add(pid)
             winners.append(pid_to_passage[pid])
