@@ -1349,6 +1349,23 @@ def _extract_first_json_object(text: str) -> str:
     return stripped[start : end_idx + 1]
 
 
+def strict_json_call(llm, prompt: str, max_new_tokens: int = 160, temperature: float = 0.0):
+    """Run an LLM call that must return exactly one JSON object.
+
+    This helper centralizes the JSON-only contract so downstream callers do not
+    attempt their own permissive parsing. Any deviation (extra text, code
+    fences, multiple objects) raises a ValueError to keep behavior fail-closed.
+
+    Returns:
+        tuple(parsed_json, raw_output)
+    """
+
+    raw = llm.generate(prompt, temperature=temperature, max_new_tokens=max_new_tokens)
+    raw_text = raw.text if hasattr(raw, "text") else str(raw)
+    parsed = json.loads(_extract_first_json_object(raw_text))
+    return parsed, raw
+
+
 def _find_fuzzy_substring(haystack: str, needle: str, max_distance: int = 2) -> Optional[Tuple[int, int, str]]:
     """
     Find fuzzy substring match allowing for minor differences.
@@ -1451,12 +1468,12 @@ Evidence:
 JSON:"""
 
     try:
-        raw = llm.generate(prompt, temperature=0.0, max_new_tokens=160)
+        out, raw = strict_json_call(llm, prompt, max_new_tokens=160, temperature=0.0)
         raw_text = raw.text if hasattr(raw, 'text') else str(raw)
     except Exception as e:
         if debug:
-            print(f"[CSS] LLM generation failed: {e}")
-        return CSSResult(abstain=True, answer="", passage_id="", reason="LLM_ERROR")
+            print(f"[CSS] JSON parse failed: {e}")
+        return CSSResult(abstain=True, answer="", passage_id="", reason="PARSE_ERROR")
 
     if debug:
         print(f"[CSS] Raw LLM output: {raw_text[:200]}...")
@@ -1471,22 +1488,6 @@ JSON:"""
             tokens_used = tokens_used or prompt_tokens + completion_tokens
         except Exception:
             prompt_tokens = prompt_tokens
-
-    # Parse JSON response
-    try:
-        out = json_module.loads(_extract_first_json_object(raw_text))
-    except Exception as e:
-        if debug:
-            print(f"[CSS] JSON parse failed: {e}")
-        return CSSResult(
-            abstain=True,
-            answer="",
-            passage_id="",
-            reason="PARSE_ERROR",
-            tokens_used=tokens_used,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-        )
 
     pid = (out.get("pid") or "").strip()
     answer = (out.get("answer") or "").strip()
@@ -2058,11 +2059,11 @@ JSON:"""
         print(f"[CONSTRAINED] {len(candidates)} candidates")
 
     try:
-        raw = llm.generate(prompt, temperature=0.0, max_new_tokens=160)
+        out, raw = strict_json_call(llm, prompt, max_new_tokens=160, temperature=0.0)
         raw_text = raw.text if hasattr(raw, 'text') else str(raw)
     except Exception as e:
         if debug:
-            print(f"[CONSTRAINED] LLM error: {e}")
+            print(f"[CONSTRAINED] JSON parse error: {e}")
         return ConstrainedSelectionResult(
             answer="",
             candidate_index=-1,
@@ -2070,7 +2071,7 @@ JSON:"""
             passage_id="",
             candidates=candidate_texts,
             support_scores=support_scores,
-            reason="LLM_ERROR"
+            reason="PARSE_ERROR"
         )
 
     if debug:
@@ -2087,29 +2088,7 @@ JSON:"""
         except Exception:
             prompt_tokens = prompt_tokens
 
-    # Parse JSON response
-    try:
-        out = json_module.loads(_extract_first_json_object(raw_text))
-    except Exception as e:
-        if debug:
-            print(f"[CONSTRAINED] JSON parse error: {e}")
-        # Try to extract just the index
-        index_match = re.search(r'\b(\d+)\b', raw_text)
-        if index_match:
-            out = {"index": int(index_match.group(1)), "confidence": 0.5}
-        else:
-            return ConstrainedSelectionResult(
-                answer="",
-                candidate_index=-1,
-                confidence=0.0,
-                passage_id="",
-                candidates=candidate_texts,
-                support_scores=support_scores,
-                reason="PARSE_ERROR",
-                tokens_used=tokens_used,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-            )
+    # JSON already parsed via strict_json_call
 
     index = out.get("index", -1)
     confidence = float(out.get("confidence", 0.5))
@@ -2206,9 +2185,8 @@ def _llm_rank_answer_facets(
         metrics["llm_ranker_calls"] = metrics.get("llm_ranker_calls", 0) + 1
 
     try:
-        raw = llm.generate(prompt, temperature=0.0, max_new_tokens=128)
+        out, raw = strict_json_call(llm, prompt, max_new_tokens=128, temperature=0.0)
         raw_text = raw.text if hasattr(raw, "text") else str(raw)
-        out = json.loads(_extract_first_json_object(raw_text))
         chosen = out.get("facet_ids") or []
         if not isinstance(chosen, list):
             return []
@@ -2682,28 +2660,15 @@ Evidence:
 JSON:"""
 
     try:
-        raw = llm.generate(prompt, temperature=0.0, max_new_tokens=96)
+        out, raw = strict_json_call(llm, prompt, max_new_tokens=96, temperature=0.0)
         raw_text = raw.text if hasattr(raw, 'text') else str(raw)
     except Exception as e:
         if debug:
-            print(f"[CSS-BIND] LLM generation failed: {e}")
+            print(f"[CSS-BIND] JSON parse error: {e}")
         return None
 
     if debug:
         print(f"[CSS-BIND] Raw output: {raw_text[:200]}...")
-
-    # Parse JSON response
-    try:
-        out = json_module.loads(_extract_first_json_object(raw_text))
-    except Exception as e:
-        if debug:
-            print(f"[CSS-BIND] JSON parse error: {e}")
-        # Try to extract just the index
-        index_match = re.search(r'\b(\d+)\b', raw_text)
-        if index_match:
-            out = {"index": int(index_match.group(1)), "confidence": 0.5}
-        else:
-            return None
 
     index = out.get("index", -1)
 

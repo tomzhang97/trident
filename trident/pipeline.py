@@ -64,6 +64,7 @@ from .chain_builder import (
     route_relation,
     KNOWN_RELATION_TYPES,
     _extract_first_json_object,
+    strict_json_call,
 )
 from .relation_schema import get_default_registry
 
@@ -460,9 +461,7 @@ class TridentPipeline:
             metrics["relation_router_calls"] = metrics.get("relation_router_calls", 0) + 1
 
         try:
-            raw = self.llm.generate(prompt, temperature=0.0, max_new_tokens=160)
-            raw_text = raw.text if hasattr(raw, "text") else str(raw)
-            parsed = json.loads(_extract_first_json_object(raw_text))
+            parsed, _ = strict_json_call(self.llm, prompt, max_new_tokens=160, temperature=0.0)
         except Exception:
             return None
 
@@ -552,9 +551,8 @@ class TridentPipeline:
         )
 
         try:
-            raw = self.llm.generate(prompt, temperature=0.0, max_new_tokens=120)
+            parsed, raw = strict_json_call(self.llm, prompt, max_new_tokens=120, temperature=0.0)
             raw_text = raw.text if hasattr(raw, "text") else str(raw)
-            parsed = json.loads(_extract_first_json_object(raw_text))
         except Exception:
             return None
 
@@ -650,9 +648,7 @@ class TridentPipeline:
         )
 
         try:
-            raw = self.llm.generate(prompt, temperature=0.0, max_new_tokens=256)
-            raw_text = raw.text if hasattr(raw, "text") else str(raw)
-            parsed = json.loads(_extract_first_json_object(raw_text))
+            parsed, _ = strict_json_call(self.llm, prompt, max_new_tokens=256, temperature=0.0)
         except Exception:
             return facets
 
