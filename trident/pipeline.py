@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import string
@@ -21,13 +20,7 @@ from .calibration import ReliabilityCalibrator, CalibrationMonitor
 from .safe_cover import SafeCoverAlgorithm, SafeCoverResult
 from .pareto import ParetoKnapsackOptimizer, ParetoResult
 from .retrieval import RetrievalResult
-from .nli_scorer import (
-    NLIScorer,
-    _clean_relation_endpoint,
-    _fuzzy_phrase_match,
-    _get_token_set,
-    _normalize_text_unicode,
-)
+from .nli_scorer import NLIScorer
 from .llm_interface import LLMInterface
 from .monitoring import DriftMonitor
 from .logging_utils import TelemetryTracker
@@ -63,10 +56,29 @@ from .chain_builder import (
     keyword_route_relation,
     route_relation,
     KNOWN_RELATION_TYPES,
-    _extract_first_json_object,
-    strict_json_call,
 )
-from .relation_schema import get_default_registry
+
+# ---------------------------
+# LLM / Extraction Rigor Helpers
+# ---------------------------
+def _reason_ok(reason: str) -> bool:
+    """Treat any reason starting with 'OK' as success (supports OK_FROZEN_SPAN, OK_CANDIDATE, etc.)."""
+    return bool(reason) and str(reason).upper().startswith("OK")
+
+def _first_json_object(text: str):
+    """Best-effort extraction of the first JSON object in a string. Returns dict or None."""
+    import json
+    if not text:
+        return None
+    s = text.find("{")
+    e = text.rfind("}")
+    if s == -1 or e == -1 or e <= s:
+        return None
+    try:
+        return json.loads(text[s:e+1])
+    except Exception:
+        return None
+
 
 
 @dataclass
@@ -356,6 +368,11 @@ class TridentPipeline:
 
         # Initialize components
         self.facet_miner = FacetMiner(config)
+        # Provide LLM handle to FacetMiner for optional LLM-driven facet planning
+        try:
+            self.facet_miner.llm = self.llm
+        except Exception:
+            pass
         self.nli_scorer = NLIScorer(config.nli, device)
 
         # Load calibrator from file if provided, otherwise create empty one
@@ -417,300 +434,6 @@ class TridentPipeline:
         self.score_cache: Dict[Tuple[str, str, str], float] = {}
         self.retrieval_cache: Dict[str, RetrievalResult] = {}
 
-        self._relation_registry = get_default_registry()
-
-    def _route_relation_kind(
-        self,
-        question: str,
-        facet: Facet,
-        registry,
-        metrics: Optional[Dict[str, int]] = None,
-    ) -> Optional[Dict[str, str]]:
-        """Use an LLM to classify a relation facet into the schema allowlist.
-
-        This is a schema-only operation (no retrieval/scoring) that keeps
-        relation predicates from collapsing to generic "is related to" strings.
-        """
-
-        if self.llm is None:
-            return None
-
-        allowed = registry.all_names()
-        if not allowed:
-            return None
-
-        tpl = facet.template or {}
-        subject = tpl.get("subject") or tpl.get("entity1") or tpl.get("entity") or ""
-        obj = tpl.get("object") or tpl.get("entity2") or tpl.get("bridge_entity") or ""
-        predicate = tpl.get("predicate") or tpl.get("relation") or ""
-
-        desc = f"subject={subject}; predicate={predicate}; object={obj}"
-        prompt_lines = [
-            "You classify a QA facet into a normalized relation schema.",
-            "Output JSON ONLY with keys relation_kind (one of the allowed names)",
-            "and anchor_policy (ANY or ALL). No code fences, no commentary.",
-            f"Question: {question}",
-            f"Facet: {desc}",
-            "Allowed relation_kind values:",
-            ", ".join(sorted(allowed)),
-            "JSON:",
-        ]
-        prompt = "\n".join(prompt_lines)
-
-        if metrics is not None:
-            metrics["relation_router_calls"] = metrics.get("relation_router_calls", 0) + 1
-
-        try:
-            parsed, _ = strict_json_call(self.llm, prompt, max_new_tokens=160, temperature=0.0)
-        except Exception:
-            return None
-
-        rk = str(parsed.get("relation_kind") or "").upper()
-        anchor_policy = str(parsed.get("anchor_policy") or "ANY").upper()
-        if rk not in allowed:
-            return None
-        if anchor_policy not in {"ANY", "ALL"}:
-            anchor_policy = "ANY"
-
-        if metrics is not None:
-            metrics["relation_router_success"] = metrics.get("relation_router_success", 0) + 1
-
-        return {"relation_kind": rk, "anchor_policy": anchor_policy}
-
-    def _relation_anchor_gate(self, facet: Facet, passage_text: str) -> bool:
-        """Deterministic anchor-only gate to prevent global probes.
-
-        Predicate checks are left to downstream relation matching (LLM or NLI).
-        This keeps Safe-Cover grounded while allowing semantic relation scoring
-        to proceed when schema predicates are vague.
-        """
-
-        tpl = facet.template or {}
-        passage_norm = _normalize_text_unicode(passage_text)
-        passage_tokens = _get_token_set(passage_norm)
-
-        s_raw = str(tpl.get("subject", ""))
-        o_raw = str(tpl.get("object", ""))
-        anchor_policy = str(tpl.get("anchor_policy") or "ANY").upper()
-
-        s_clean = _clean_relation_endpoint(s_raw)
-        o_clean = _clean_relation_endpoint(o_raw)
-
-        if not s_clean and not o_clean:
-            return False
-
-        s_match = _fuzzy_phrase_match(s_clean, passage_norm, passage_tokens) if s_clean else False
-        o_match = _fuzzy_phrase_match(o_clean, passage_norm, passage_tokens) if o_clean else False
-
-        if anchor_policy == "ALL":
-            return bool(s_match and o_match)
-        return bool(s_match or o_match)
-
-    def _llm_relation_match_score(
-        self,
-        question: str,
-        facet: Facet,
-        passage: Passage,
-        metrics: Optional[Dict[str, int]] = None,
-    ) -> Optional[float]:
-        """Use the LLM as a semantic judge for relation facets with span verification.
-
-        The LLM never expands evidence; it only decides whether the certified
-        passage expresses the schema-bound relation required by the facet. The
-        output must be a single JSON object {"match": bool, "confidence": float,
-        "support_span": str}. The support_span must be a substring of the passage
-        (after Unicode normalization); otherwise the match is rejected.
-        """
-
-        if self.llm is None or not question:
-            return None
-
-        # Enforce anchor grounding; if anchors are absent, fall back to NLI
-        if not self._relation_anchor_gate(facet, passage.text):
-            return None
-
-        if metrics is not None:
-            metrics["relation_match_calls"] = metrics.get("relation_match_calls", 0) + 1
-
-        tpl = facet.template or {}
-        relation_label = tpl.get("relation_kind") or tpl.get("relation_pid") or tpl.get("predicate") or "relation"
-        subject = tpl.get("subject") or tpl.get("entity1") or tpl.get("entity") or ""
-        obj = tpl.get("object") or tpl.get("entity2") or tpl.get("bridge_entity") or ""
-
-        prompt = "\n".join(
-            [
-                "You judge whether a passage expresses a required relation for a question.",
-                "Return ONE JSON object only with keys match (true/false), confidence (0-1), and support_span (string).",
-                "support_span must be copied verbatim from the passage. No code fences, no commentary.",
-                f"Question: {question}",
-                f"Required relation: {relation_label}",
-                f"Subject anchor: {subject}",
-                f"Object anchor: {obj}",
-                "Passage:",
-                passage.text,
-                "JSON:",
-            ]
-        )
-
-        try:
-            parsed, raw = strict_json_call(self.llm, prompt, max_new_tokens=120, temperature=0.0)
-            raw_text = raw.text if hasattr(raw, "text") else str(raw)
-        except Exception:
-            return None
-
-        match = bool(parsed.get("match", False))
-        try:
-            confidence = float(parsed.get("confidence", 0.0))
-        except Exception:
-            confidence = 0.0
-
-        confidence = max(0.0, min(1.0, confidence))
-        support_span = (parsed.get("support_span") or "").strip()
-
-        # Verify span is contained in the passage under stable normalization
-        if support_span:
-            passage_norm = _normalize_text_unicode(passage.text)
-            span_norm = _normalize_text_unicode(support_span)
-            if span_norm not in passage_norm:
-                match = False
-                confidence = 0.0
-        else:
-            match = False
-            confidence = 0.0
-
-        if metrics is not None and match:
-            metrics["relation_match_success"] = metrics.get("relation_match_success", 0) + 1
-
-        return confidence if match else 0.0
-
-    def _apply_relation_planner(
-        self,
-        question: str,
-        facets: List[Facet],
-        metrics: Optional[Dict[str, int]] = None,
-    ) -> List[Facet]:
-        """Inject schema-bound relation facets using an LLM planner when needed.
-
-        The planner is query-only: it chooses normalized relations from the
-        allowlisted schema and never scores evidence. Existing relation facets
-        are canonicalized to the registry (pid + keywords) so gating remains
-        deterministic and reproducible.
-        """
-
-        registry = self._relation_registry
-        updated: List[Facet] = []
-        existing_relations: Set[Tuple[str, str]] = set()
-
-        # First, canonicalize existing relation facets to the registry
-        for facet in facets:
-            if facet.facet_type == FacetType.RELATION:
-                tpl = dict(facet.template or {})
-                spec = registry.lookup(
-                    tpl.get("relation_pid")
-                    or tpl.get("relation_kind")
-                    or tpl.get("predicate")
-                )
-                # If no schema match, attempt LLM routing into the allowlist
-                if spec is None:
-                    routed = self._route_relation_kind(question, facet, registry, metrics=metrics)
-                    if routed:
-                        tpl["relation_kind"] = routed["relation_kind"]
-                        tpl["anchor_policy"] = routed.get("anchor_policy")
-                        spec = registry.lookup(routed["relation_kind"])
-                if spec:
-                    tpl.setdefault("relation_pid", spec.pid)
-                    tpl["relation_kind"] = spec.name
-                    weak_predicates = {"is related to", "related to", "relation", "relate", ""}
-                    pred_clean = str(tpl.get("predicate") or "").strip().lower()
-                    if pred_clean in weak_predicates:
-                        tpl["predicate"] = spec.default_predicate()
-                    tpl.setdefault("predicate", tpl.get("predicate") or spec.default_predicate())
-                    tpl.setdefault("relation_schema_source", spec.schema_source)
-                    tpl.setdefault("relation_schema_version", registry.version)
-                    tpl.setdefault("subject_type", tpl.get("subject_type") or spec.subject_type)
-                    tpl.setdefault("object_type", tpl.get("object_type") or spec.object_type)
-                    tpl.setdefault("anchor_policy", tpl.get("anchor_policy") or "ANY")
-                    updated.append(
-                        Facet(
-                            facet_id=facet.facet_id,
-                            facet_type=facet.facet_type,
-                            template=tpl,
-                            weight=facet.weight,
-                            metadata=facet.metadata,
-                            required=facet.required,
-                        )
-                    )
-                    subj_key = (tpl.get("subject") or "").strip().lower()
-                    rel_key = (tpl.get("relation_kind") or tpl.get("relation_pid") or "").upper()
-                    existing_relations.add((rel_key, subj_key))
-                    continue
-            updated.append(facet)
-
-        facets = updated
-        if self.llm is None:
-            return facets
-
-        # LLM semantic planner: map question -> normalized relation facets
-        allowed_relations = registry.all_names()
-        if not allowed_relations:
-            return facets
-        prompt = (
-            "You are a semantic planner."
-            " Parse the question and emit required facets using only the"
-            " allowed relations. JSON ONLY. No code fences, no explanations.\n"
-            "Question: " + question + "\n"
-            "Allowed relations: " + ", ".join(allowed_relations) + "\n"
-            "Return JSON with fields: answer_type (string) and required_facets"
-            " (list of objects with facet_type, relation, subject, object_type,"
-            " required)."
-        )
-
-        try:
-            parsed, _ = strict_json_call(self.llm, prompt, max_new_tokens=256, temperature=0.0)
-        except Exception:
-            return facets
-
-        required = parsed.get("required_facets") or []
-        next_idx = sum(1 for f in facets if f.facet_type == FacetType.RELATION)
-        for idx, fac in enumerate(required):
-            if str(fac.get("facet_type", "")).upper() != "RELATION":
-                continue
-            rel_name = str(fac.get("relation") or "").upper()
-            spec = registry.lookup(rel_name)
-            if not spec:
-                continue
-            subject = fac.get("subject") or ""
-            subj_key = str(subject).strip().lower()
-            rel_key = spec.name.upper()
-            if (rel_key, subj_key) in existing_relations:
-                continue
-            tpl = {
-                "subject": subject,
-                "predicate": spec.default_predicate(),
-                "relation_kind": spec.name,
-                "relation_pid": spec.pid,
-                "relation_schema_source": spec.schema_source,
-                "relation_schema_version": registry.version,
-                "subject_type": fac.get("subject_type") or spec.subject_type,
-                "object_type": fac.get("object_type") or spec.object_type,
-            }
-            facets.append(
-                Facet(
-                    facet_id=f"relation_planned_{next_idx + idx}",
-                    facet_type=FacetType.RELATION,
-                    template=tpl,
-                    weight=1.0,
-                    metadata={"planned": True},
-                    required=bool(fac.get("required", True)),
-                )
-            )
-            existing_relations.add((rel_key, subj_key))
-
-        if metrics is not None and required:
-            metrics["relation_router_success"] = metrics.get("relation_router_success", 0) + len(required)
-
-        return facets
-
     def process_query(
         self,
         query: str,
@@ -725,17 +448,14 @@ class TridentPipeline:
         # Track telemetry
         self.telemetry.start_query(query)
 
-        llm_call_metrics: Dict[str, int] = {}
-
         # Step 1: Facet mining
         facets = self.facet_miner.extract_facets(query, supporting_facts)
 
-        # Canonicalize or infer relation facets using the schema-bound planner
-        facets = self._apply_relation_planner(query, facets, metrics=llm_call_metrics)
-
         # Mark RELATION facets as required for WH-questions
         # This ensures that the key relation must be certified for valid answers
-        facets = mark_required_facets(facets, query)
+        use_llm_plan = bool(getattr(self.config.facet_miner, 'use_llm_facet_plan', False) or os.environ.get('TRIDENT_LLM_FACET_PLAN','0')=='1')
+        if not use_llm_plan or not any(getattr(f, 'required', False) for f in facets):
+            facets = mark_required_facets(facets, query)
 
         self.telemetry.log("facet_mining", {
             "num_facets": len(facets),
@@ -791,7 +511,7 @@ class TridentPipeline:
             )
         
         # Step 3: Two-stage scoring
-        scores = self._two_stage_scoring(passages, facets, question=query, llm_metrics=llm_call_metrics)
+        scores = self._two_stage_scoring(passages, facets)
         self.telemetry.log("scoring", {"num_scores": len(scores.stage2_scores)})
         
         # Step 4: Mode-specific selection
@@ -814,8 +534,7 @@ class TridentPipeline:
                     hop2_facets=hop2_facets,
                     passages=passages,
                     scores=scores,
-                    context=context,
-                    llm_metrics=llm_call_metrics,
+                    context=context
                 )
             else:
                 # Standard single-pass Safe-Cover
@@ -909,9 +628,7 @@ class TridentPipeline:
                     question=query,
                     certificates=certificates,
                     all_passages=result['selected_passages'],
-                    facets=facet_dicts,
-                    llm=self.llm,
-                    metrics=llm_call_metrics,
+                    facets=facet_dicts
                 )
 
                 # Also get all winner passages for CSS fallback
@@ -923,34 +640,26 @@ class TridentPipeline:
                 # Build facet type lookup for metrics
                 facet_type_by_id = {f.get("facet_id"): f.get("facet_type") for f in facet_dicts}
 
-                # Track which facets have certificates using normalized ids
-                certified_facet_ids = {
-                    c.get("facet_id") for c in certificates if c.get("facet_id")
-                }
-
                 # Check if any answer facets were actually certified
                 # Answer facets are non-ENTITY types that can determine the final answer
                 answer_facet_types = {"RELATION", "TEMPORAL", "NUMERIC", "COMPARISON", "BRIDGE_HOP"}
                 has_answer_facet_certified = any(
-                    fid in certified_facet_ids and facet_type_by_id.get(fid) in answer_facet_types
-                    for fid in answer_facet_ids
+                    facet_type_by_id.get(c.get("facet_id")) in answer_facet_types
+                    for c in certificates
                 )
-
-                coverage_passed = result.get("metrics", {}).get("coverage", 0) >= 1.0
 
                 if debug_chain or debug_constrained:
                     print(f"\n[CONSTRAINED] Attempting FACET-TARGETED Candidate Selection")
                     print(f"  Answer facets: {answer_facet_ids}")
                     print(f"  Has answer facet certified: {has_answer_facet_certified}")
-                    print(f"  Certified facet ids: {sorted(certified_facet_ids)}")
-                    print(f"  Coverage passed: {coverage_passed}")
                     print(f"  Answer passages: {len(answer_passages)} (from answer facets)")
                     print(f"  All winner passages: {len(winner_passages)}")
                     for wp in answer_passages[:3]:
                         print(f"    - {wp.get('pid', '')[:12]}... ({len(wp.get('text', ''))} chars)")
 
-                # CRITICAL FIX: Run constrained selection when certified answer facets exist or full coverage achieved
-                if answer_passages and (has_answer_facet_certified or coverage_passed):
+                # CRITICAL FIX: Only run constrained selection if answer facets are certified
+                # Do NOT fall back to ENTITY-only winner passages - that produces wrong answers
+                if has_answer_facet_certified and answer_passages:
                     constrained_result = constrained_span_select(
                         llm=self.llm,
                         question=query,
@@ -959,7 +668,7 @@ class TridentPipeline:
                         max_chars_per_passage=600
                     )
 
-                    if constrained_result.reason in {"OK", "OK_FROZEN_SPAN"}:
+                    if constrained_result.reason == "OK":
                         answer = constrained_result.answer
                         is_grounded = True
                         used_constrained = True
@@ -985,13 +694,11 @@ class TridentPipeline:
                             if constrained_result.candidates:
                                 print(f"[CONSTRAINED] Had {len(constrained_result.candidates)} candidates")
                 else:
-                    # No suitable certified answer facets or no passages available
-                    skipped_constrained_reason = (
-                        "no_answer_passages" if not answer_passages else "no_answer_facets_certified"
-                    )
+                    # No answer facets certified - skip constrained selection entirely
+                    skipped_constrained_reason = "no_answer_facets_certified"
                     if debug_chain or debug_constrained:
                         certified_types = [facet_type_by_id.get(c.get("facet_id")) for c in certificates]
-                        print(f"[CONSTRAINED] Skipped: only {certified_types} certified, coverage_passed={coverage_passed}")
+                        print(f"[CONSTRAINED] Skipped: only {certified_types} certified, no answer facets")
 
             # ================================================================
             # PRIORITY 1: Certified Span Selection (CSS) - fallback
@@ -1212,17 +919,19 @@ class TridentPipeline:
 
             # Compute token usage
             if used_constrained:
-                total_tokens = constrained_result.tokens_used if constrained_result else 0
-                prompt_tokens = constrained_result.prompt_tokens if constrained_result else 0
-                completion_tokens = constrained_result.completion_tokens if constrained_result else 0
+                # Constrained selection uses a single LLM call with structured output
+                total_tokens = 0  # Token usage is internal to the call
+                prompt_tokens = 0
+                completion_tokens = 0
             elif used_css:
-                total_tokens = css_result.tokens_used if css_result else 0
-                prompt_tokens = css_result.prompt_tokens if css_result else 0
-                completion_tokens = css_result.completion_tokens if css_result else 0
+                # CSS uses a single LLM call with structured output
+                total_tokens = 0  # CSS token usage is internal to the call
+                prompt_tokens = 0
+                completion_tokens = 0
             elif prompt:
                 total_tokens = llm_output.tokens_used
-                prompt_tokens = getattr(llm_output, "prompt_tokens", 0) or self.llm.compute_token_cost(prompt)
-                completion_tokens = getattr(llm_output, "completion_tokens", 0) or max(total_tokens - prompt_tokens, 0)
+                prompt_tokens = self.llm.compute_token_cost(prompt)
+                completion_tokens = max(total_tokens - prompt_tokens, 0)
             else:
                 total_tokens = 0
                 prompt_tokens = 0
@@ -1278,13 +987,6 @@ class TridentPipeline:
             'num_certificates': len(certificates),
             'num_certified_facets': len(certified_facet_ids),
             'certified_facet_ids': list(certified_facet_ids),
-            # LLM call instrumentation
-            'llm_relation_router_calls': llm_call_metrics.get('relation_router_calls', 0),
-            'llm_relation_router_success': llm_call_metrics.get('relation_router_success', 0),
-            'llm_answer_ranker_calls': llm_call_metrics.get('llm_ranker_calls', 0),
-            'llm_answer_ranker_success': llm_call_metrics.get('llm_ranker_success', 0),
-            'llm_relation_match_calls': llm_call_metrics.get('relation_match_calls', 0),
-            'llm_relation_match_success': llm_call_metrics.get('relation_match_success', 0),
             # Certificate-aware reasoning metrics (fallback)
             'relation_winning_passage': relation_info['passage_id'] if relation_info else None,
             'relation_winning_pvalue': relation_info['p_value'] if relation_info else None,
@@ -1400,9 +1102,7 @@ class TridentPipeline:
     def _two_stage_scoring(
         self,
         passages: List[Passage],
-        facets: List[Facet],
-        question: Optional[str] = None,
-        llm_metrics: Optional[Dict[str, int]] = None,
+        facets: List[Facet]
     ) -> TwoStageScores:
         """
         Perform two-stage scoring with shortlisting and CE/NLI.
@@ -1488,22 +1188,10 @@ class TridentPipeline:
             for passage in shortlist:
                 cache_key = (passage.pid, facet.facet_id, self.config.calibration.version)
 
-                score = None
-                if facet.facet_type == FacetType.RELATION:
-                    score = self._llm_relation_match_score(
-                        question=question or "",
-                        facet=facet,
-                        passage=passage,
-                        metrics=llm_metrics,
-                    )
-
-                if cache_key in self.score_cache and score is None:
+                if cache_key in self.score_cache:
                     score = self.score_cache[cache_key]
-                elif score is None:
-                    score = self.nli_scorer.score(passage, facet)
-                    self.score_cache[cache_key] = score
                 else:
-                    # Cache LLM-based scores to keep calibration consistent
+                    score = self.nli_scorer.score(passage, facet)
                     self.score_cache[cache_key] = score
 
                 # F1 FIX: Assert score range / distribution consistency
@@ -1813,8 +1501,7 @@ class TridentPipeline:
         hop2_facets: List[Facet],
         passages: List[Passage],
         scores: TwoStageScores,
-        context: Optional[List[List[str]]] = None,
-        llm_metrics: Optional[Dict[str, int]] = None,
+        context: Optional[List[List[str]]] = None
     ) -> Dict[str, Any]:
         """
         Certified Adaptive Safe-Cover for compositional (2-hop) questions.
@@ -1951,7 +1638,6 @@ class TridentPipeline:
 
         # Instantiate hop-2 facets with bound entity
         hop2_facets = instantiate_facets(hop2_facets, bindings)
-        uncoverable_facet_ids: Set[str] = set()
 
         if debug:
             for f in hop2_facets:
@@ -2053,7 +1739,25 @@ class TridentPipeline:
                 keyword_match = any(kw.lower() in combined_text for kw in outer_relation_keywords)
 
                 if entity_match and keyword_match:
-                    filtered_candidates.append(p)
+                    # Extra rigor: require the grounded lexical gate to pass for at least one hop-2 facet.
+                    # This prevents 'relation-only' passages (e.g., generic "son of"/"mother") from leaking in
+                    # when the conditioned retriever returns empty.
+                    gate_ok = False
+                    try:
+                        for hf in hop2_facets:
+                            if hasattr(self.nli_scorer, "check_gate"):
+                                if self.nli_scorer.check_gate(hf, p.get("text", "")):
+                                    gate_ok = True
+                                    break
+                            elif hasattr(self.nli_scorer, "_check_lexical_gate"):
+                                if self.nli_scorer._check_lexical_gate(hf, p.get("text", "")):
+                                    gate_ok = True
+                                    break
+                    except Exception:
+                        gate_ok = False
+
+                    if gate_ok:
+                        filtered_candidates.append(p)
 
             if debug:
                 print(f"  Found {len(filtered_candidates)} context-pool candidates for hop-2")
@@ -2079,13 +1783,15 @@ class TridentPipeline:
             o = (f.template or {}).get("object", "")
             if ("[" in s and "_RESULT]" in s) or ("[" in o and "_RESULT]" in o):
                 placeholder_count += 1
-                uncoverable_facet_ids.add(f.facet_id)
                 # This is a fatal bug - instantiation was not applied
                 if debug:
                     print(f"  ERROR: Hop-2 facet not instantiated: {f.facet_id} subject={s}")
 
-        if placeholder_count > 0 and debug:
-            print(f"  [HOP2-INST] Marking {placeholder_count} hop-2 facets as uncoverable")
+        if placeholder_count > 0:
+            if debug:
+                print(f"  [HOP2-INST] FATAL: {placeholder_count} facets still have placeholders")
+            # Don't raise in production - just log and return hop-1 result
+            return hop1_result
 
         if debug:
             print(f"  [HOP2-INST] All {len(hop2_facets)} facets instantiated, no placeholders")
@@ -2095,22 +1801,12 @@ class TridentPipeline:
         # (with placeholders like [DIRECTOR_RESULT]) which produced meaningless scores.
         # Those old scores are cached and MUST NOT be reused.
         # We must always re-score with the instantiated facets.
-        hop2_scores = self._two_stage_scoring(
-            hop2_passages,
-            hop2_facets,
-            question=query,
-            llm_metrics=llm_metrics,
-        )
+        hop2_scores = self._two_stage_scoring(hop2_passages, hop2_facets)
 
         if debug:
             print(f"  [HOP2-SCORE] Re-scored {len(hop2_facets)} instantiated facets on {len(hop2_passages)} passages")
 
-        hop2_result = self._run_safe_cover(
-            hop2_facets,
-            hop2_passages,
-            hop2_scores,
-            uncoverable_facet_ids=uncoverable_facet_ids or None,
-        )
+        hop2_result = self._run_safe_cover(hop2_facets, hop2_passages, hop2_scores)
 
         if debug:
             hop2_coverage = hop2_result.get('metrics', {}).get('coverage', 0)
@@ -2184,8 +1880,7 @@ class TridentPipeline:
         self,
         facets: List[Facet],
         passages: List[Passage],
-        scores: TwoStageScores,
-        uncoverable_facet_ids: Optional[Set[str]] = None,
+        scores: TwoStageScores
     ) -> Dict[str, Any]:
         """
         Run Safe-Cover mode with certificates.
@@ -2204,8 +1899,7 @@ class TridentPipeline:
         result = self.safe_cover_algo.run(
             facets=facets,
             passages=passages,
-            p_values=scores.p_values,
-            uncoverable_facet_ids=uncoverable_facet_ids,
+            p_values=scores.p_values
         )
 
         # Convert to output format
@@ -2255,14 +1949,9 @@ class TridentPipeline:
             max(total_cost - budget_cap, 0) if budget_cap is not None else 0
         )
 
-        episode_contract = None
-        if getattr(result, "episode_knobs", None):
-            episode_contract = result.episode_knobs.__dict__
-
         return {
             'selected_passages': selected,
             'certificates': certificates,
-            'episode_contract': episode_contract,
             'abstained': is_abstained,
             'infeasible': is_infeasible,
             'dual_lower_bound': getattr(result, 'dual_lower_bound', None),
@@ -2369,11 +2058,7 @@ class TridentPipeline:
                 
                 # Update passages and re-score
                 current_passages.extend(new_passages)
-                new_scores = self._two_stage_scoring(
-                    new_passages,
-                    current_facets,
-                    question=query,
-                )
+                new_scores = self._two_stage_scoring(new_passages, current_facets)
                 scores.stage2_scores.update(new_scores.stage2_scores)
                 scores.p_values.update(new_scores.p_values)
                 
