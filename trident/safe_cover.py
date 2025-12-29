@@ -218,17 +218,21 @@ class SafeCoverAlgorithm:
         if hasattr(bin_record, "n_negatives"):
             return int(getattr(bin_record, "n_negatives", 0) or 0)
 
-        # Lists/tuples/sets of negatives
-        if isinstance(bin_record, (list, tuple, set)):
-            return len(bin_record)
-
-        # Dict of split lists
+        # Dictionaries may store summary stats directly
         if isinstance(bin_record, dict):
+            if "n_negatives" in bin_record:
+                return int(bin_record.get("n_negatives") or 0)
+
+            # Dict of split lists
             total = 0
             for value in bin_record.values():
                 if isinstance(value, (list, tuple, set)):
                     total += len(value)
             return total
+
+        # Lists/tuples/sets of negatives
+        if isinstance(bin_record, (list, tuple, set)):
+            return len(bin_record)
 
         return 0
 
