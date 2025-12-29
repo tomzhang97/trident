@@ -23,6 +23,7 @@ import numpy as np
 from .candidates import Passage
 from .facets import Facet, FacetType
 from .config import SafeCoverConfig
+from . import nli_scorer
 
 
 def tf_for(ft_enum: FacetType, ft_str: str) -> int:
@@ -138,6 +139,9 @@ class EpisodeKnobs:
     retriever_version: str
     shortlister_version: str = ""  # Hash of shortlister for selection-conditional calibration
     pvalue_mode: str = "deterministic"  # "deterministic" or "randomized"
+    gate_version: str = ""  # Tested-Set gate definition version
+    normalize_version: str = ""  # Text normalization version used in gating
+    relation_keywords_hash: str = ""  # Hash of RELATION_KEYWORDS used in gating
     frozen_at: float = field(default_factory=time.time)
 
     def get_alpha_bar(self, facet_id: str) -> float:
@@ -172,6 +176,7 @@ class SafeCoverResult:
             'abstention_reason': self.abstention_reason.value,
             'total_cost': self.total_cost,
             'infeasible': self.infeasible,
+            'episode_knobs': self.episode_knobs.__dict__ if self.episode_knobs else None,
         }
 
 
@@ -212,6 +217,11 @@ class SafeCoverAlgorithm:
         self.pvalue_mode = getattr(calibrator, 'pvalue_mode', 'deterministic')
         if hasattr(self.pvalue_mode, 'value'):
             self.pvalue_mode = self.pvalue_mode.value
+
+        # Tested-Set definition metadata
+        self.gate_version = nli_scorer.GATE_VERSION
+        self.normalize_version = nli_scorer.NORMALIZE_VERSION
+        self.relation_keyword_hash = nli_scorer.RELATION_KEYWORDS_HASH
 
     def _get_budget_cap(self) -> Optional[int]:
         """Get the effective budget cap, preferring max_evidence_tokens over token_cap."""
@@ -303,6 +313,9 @@ class SafeCoverAlgorithm:
             retriever_version=self.retriever_version,
             shortlister_version=self.shortlister_version,
             pvalue_mode=self.pvalue_mode,
+            gate_version=self.gate_version,
+            normalize_version=self.normalize_version,
+            relation_keywords_hash=self.relation_keyword_hash,
         )
 
     def run(

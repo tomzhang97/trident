@@ -71,6 +71,8 @@ def _fuzzy_phrase_match(term: str, passage_norm: str, passage_tokens: set[str]) 
     return tokens.issubset(passage_tokens) or norm in passage_norm
 
 
+# Deterministic, frozen relation keyword map used for predicate gating.
+# Changing this map changes the Tested-Set definition and must be versioned.
 RELATION_KEYWORDS: Dict[str, set[str]] = {
     "DIRECTOR": {"director", "directed", "filmmaker", "helmed"},
     "BORN": {"born", "birth", "birthplace", "native"},
@@ -86,6 +88,17 @@ RELATION_KEYWORDS: Dict[str, set[str]] = {
     "NATIONALITY": {"nationality", "citizen", "from"},
     "BIRTHPLACE": {"birthplace", "born", "raised", "grew"},
 }
+
+# Versioned hashes for Tested-Set definition (normalizer + gate + keyword map)
+NORMALIZE_VERSION = "unicode_nfkc_nfkc_ws_v1"
+GATE_VERSION = "relation_gate_v1"
+
+def _hash_relation_keywords() -> str:
+    items = sorted((k, sorted(v)) for k, v in RELATION_KEYWORDS.items())
+    flat = "|".join([f"{k}:{','.join(vals)}" for k, vals in items])
+    return _sha1(flat)
+
+RELATION_KEYWORDS_HASH = _hash_relation_keywords()
 
 
 def _check_relation_keywords(kind: str, passage_norm: str, passage_tokens: set[str]) -> bool:

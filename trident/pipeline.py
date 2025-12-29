@@ -1908,9 +1908,14 @@ class TridentPipeline:
             max(total_cost - budget_cap, 0) if budget_cap is not None else 0
         )
 
+        episode_contract = None
+        if getattr(result, "episode_knobs", None):
+            episode_contract = result.episode_knobs.__dict__
+
         return {
             'selected_passages': selected,
             'certificates': certificates,
+            'episode_contract': episode_contract,
             'abstained': is_abstained,
             'infeasible': is_infeasible,
             'dual_lower_bound': getattr(result, 'dual_lower_bound', None),
