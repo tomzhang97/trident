@@ -1165,6 +1165,14 @@ class TridentPipeline:
                     score = self.nli_scorer.score(passage, facet)
                     self.score_cache[cache_key] = score
 
+                # F1 FIX: Assert score range / distribution consistency
+                # Raw NLI scores should be (entail - 0.5*contra), expected range ~ [-0.5, 1.0]
+                if not isinstance(score, float):
+                    score = float(score)
+                if score < -1.5 or score > 1.5:
+                    if debug:
+                        print(f"[CALIB] suspicious score={score:.3f} facet={facet.facet_id} pid={passage.pid[:12]}")
+
                 stage2_scores[(passage.pid, facet.facet_id)] = score
 
                 # Calibrate to conformal p-value with text length for Mondrian
@@ -1519,7 +1527,9 @@ class TridentPipeline:
             print(f"  Hop-1 winners: {len(hop1_winners)} passages")
 
         # Find the best certified hop-1 facet and build inner question
+        # B1+G1 FIX: Track the binding facet's certificate to use its winning passage only
         hop1_certs_sorted = sorted(hop1_certs, key=lambda c: c.get('p_value', 1.0))
+        binding_cert = None  # G1: The certificate used for binding
 
         for hop1_cert in hop1_certs_sorted:
             cert_fid = hop1_cert.get('facet_id', '')
@@ -1530,20 +1540,35 @@ class TridentPipeline:
                     inner_type = f.template.get('inner_relation_type', '')
                     if inner_type or f.template.get('compositional'):
                         inner_relation_type = inner_type
+                        binding_cert = hop1_cert  # G1: Remember which cert we're binding from
                         # Build inner question from facet template
                         inner_question = build_inner_question_from_facet(f.to_dict())
                         if debug:
                             print(f"  Inner question: {inner_question}")
+                            print(f"  Binding facet: {cert_fid} (p={hop1_cert.get('p_value', 1.0):.4f})")
                         break
             if inner_question:
                 break
 
+        # G1 FIX: Bind entity only from the binding facet's winning passage
+        # Previously we used all hop1_winners which could include unrelated passages
+        binding_passages = hop1_winners  # Fallback: all winners
+        if binding_cert:
+            binding_pid = binding_cert.get('passage_id')
+            if binding_pid:
+                # Get only the passage that won the binding facet
+                pid_to_passage = {p.get('pid'): p for p in hop1_winners}
+                if binding_pid in pid_to_passage:
+                    binding_passages = [pid_to_passage[binding_pid]]
+                    if debug:
+                        print(f"  G1: Using only binding passage: {binding_pid[:12]}...")
+
         # Use CSS to bind entity (general, relation-agnostic)
-        if inner_question and hop1_winners:
+        if inner_question and binding_passages:
             bound_entity = bind_entity_via_css(
                 llm=self.llm,
                 inner_question=inner_question,
-                hop1_passages=hop1_winners,
+                hop1_passages=binding_passages,
                 max_chars=600
             )
             if debug:

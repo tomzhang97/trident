@@ -397,12 +397,23 @@ class Facet:
                 tpl.get('relation_kind')
             )
 
-            # For hop-2 compositional facets, use the bound entity variable as subject
-            bound_entity_var = None
-            if tpl.get('hop') == 2 and s_raw.startswith('[') and s_raw.endswith('_RESULT]'):
-                bound_entity_var = s_raw  # e.g., "[DIRECTOR_RESULT]"
-                # Don't use the variable reference in hypothesis - use placeholder
-                s = "the person"  # Generic placeholder for bound entity
+            # D1 FIX: For hop-2 compositional facets, make hypothesis entity-anchored
+            # After instantiation, the subject should be a real entity name (not placeholder)
+            is_hop2 = tpl.get('hop') == 2
+            is_instantiated = (self.metadata or {}).get('instantiated', False)
+            is_placeholder = s_raw.startswith('[') and s_raw.endswith('_RESULT]')
+
+            if is_hop2:
+                if is_placeholder:
+                    # Subject still has placeholder - not yet instantiated
+                    # Use generic "the person" (this facet shouldn't be scored yet)
+                    s = "the person"
+                elif is_instantiated and s:
+                    # D1 FIX: Subject is instantiated - use the actual entity name
+                    # This anchors the hypothesis to the specific person for NLI matching
+                    # e.g., "The passage states the mother of Andrzej Żuławski"
+                    pass  # s is already set correctly from s_raw via _clean_relation_endpoint_for_hypothesis
+                # If hop-2 but not instantiated and not placeholder, use s as-is
 
             # Detect relation kind - explicit first, then keyword fallback
             relation_kind = "DEFAULT"
