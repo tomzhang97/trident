@@ -21,7 +21,13 @@ from .calibration import ReliabilityCalibrator, CalibrationMonitor
 from .safe_cover import SafeCoverAlgorithm, SafeCoverResult
 from .pareto import ParetoKnapsackOptimizer, ParetoResult
 from .retrieval import RetrievalResult
-from .nli_scorer import NLIScorer
+from .nli_scorer import (
+    NLIScorer,
+    _clean_relation_endpoint,
+    _fuzzy_phrase_match,
+    _get_token_set,
+    _normalize_text_unicode,
+)
 from .llm_interface import LLMInterface
 from .monitoring import DriftMonitor
 from .logging_utils import TelemetryTracker
@@ -472,6 +478,99 @@ class TridentPipeline:
 
         return {"relation_kind": rk, "anchor_policy": anchor_policy}
 
+    def _relation_anchor_gate(self, facet: Facet, passage_text: str) -> bool:
+        """Deterministic anchor-only gate to prevent global probes.
+
+        Predicate checks are left to downstream relation matching (LLM or NLI).
+        This keeps Safe-Cover grounded while allowing semantic relation scoring
+        to proceed when schema predicates are vague.
+        """
+
+        tpl = facet.template or {}
+        passage_norm = _normalize_text_unicode(passage_text)
+        passage_tokens = _get_token_set(passage_norm)
+
+        s_raw = str(tpl.get("subject", ""))
+        o_raw = str(tpl.get("object", ""))
+        anchor_policy = str(tpl.get("anchor_policy") or "ANY").upper()
+
+        s_clean = _clean_relation_endpoint(s_raw)
+        o_clean = _clean_relation_endpoint(o_raw)
+
+        if not s_clean and not o_clean:
+            return False
+
+        s_match = _fuzzy_phrase_match(s_clean, passage_norm, passage_tokens) if s_clean else False
+        o_match = _fuzzy_phrase_match(o_clean, passage_norm, passage_tokens) if o_clean else False
+
+        if anchor_policy == "ALL":
+            return bool(s_match and o_match)
+        return bool(s_match or o_match)
+
+    def _llm_relation_match_score(
+        self,
+        question: str,
+        facet: Facet,
+        passage: Passage,
+        metrics: Optional[Dict[str, int]] = None,
+    ) -> Optional[float]:
+        """Use the LLM as a semantic judge for relation facets.
+
+        The LLM never expands evidence; it only decides whether the certified
+        passage expresses the schema-bound relation required by the facet. The
+        output is a single JSON object {"match": bool, "confidence": float}.
+        """
+
+        if self.llm is None or not question:
+            return None
+
+        # Enforce anchor grounding; if anchors are absent, fall back to NLI
+        if not self._relation_anchor_gate(facet, passage.text):
+            return None
+
+        if metrics is not None:
+            metrics["relation_match_calls"] = metrics.get("relation_match_calls", 0) + 1
+
+        tpl = facet.template or {}
+        relation_label = tpl.get("relation_kind") or tpl.get("relation_pid") or tpl.get("predicate") or "relation"
+        subject = tpl.get("subject") or tpl.get("entity1") or tpl.get("entity") or ""
+        obj = tpl.get("object") or tpl.get("entity2") or tpl.get("bridge_entity") or ""
+
+        prompt = "\n".join(
+            [
+                "You judge whether a passage expresses a required relation for a question.",
+                "Output ONE JSON object only: {\"match\": true/false, \"confidence\": number between 0 and 1}.",
+                "No code fences, no extra text.",
+                f"Question: {question}",
+                f"Required relation: {relation_label}",
+                f"Subject anchor: {subject}",
+                f"Object anchor: {obj}",
+                "Passage:",
+                passage.text,
+                "JSON:",
+            ]
+        )
+
+        try:
+            raw = self.llm.generate(prompt, temperature=0.0, max_new_tokens=120)
+            raw_text = raw.text if hasattr(raw, "text") else str(raw)
+            parsed = json.loads(_extract_first_json_object(raw_text))
+        except Exception:
+            return None
+
+        match = bool(parsed.get("match", False))
+        try:
+            confidence = float(parsed.get("confidence", 0.0))
+        except Exception:
+            confidence = 0.0
+
+        confidence = max(0.0, min(1.0, confidence))
+
+        if metrics is not None:
+            metrics["relation_match_success"] = metrics.get("relation_match_success", 0) + 1
+
+        return confidence if match else 0.0
+
     def _apply_relation_planner(
         self,
         question: str,
@@ -673,7 +772,7 @@ class TridentPipeline:
             )
         
         # Step 3: Two-stage scoring
-        scores = self._two_stage_scoring(passages, facets)
+        scores = self._two_stage_scoring(passages, facets, question=query, llm_metrics=llm_call_metrics)
         self.telemetry.log("scoring", {"num_scores": len(scores.stage2_scores)})
         
         # Step 4: Mode-specific selection
@@ -696,7 +795,8 @@ class TridentPipeline:
                     hop2_facets=hop2_facets,
                     passages=passages,
                     scores=scores,
-                    context=context
+                    context=context,
+                    llm_metrics=llm_call_metrics,
                 )
             else:
                 # Standard single-pass Safe-Cover
@@ -1164,6 +1264,8 @@ class TridentPipeline:
             'llm_relation_router_success': llm_call_metrics.get('relation_router_success', 0),
             'llm_answer_ranker_calls': llm_call_metrics.get('llm_ranker_calls', 0),
             'llm_answer_ranker_success': llm_call_metrics.get('llm_ranker_success', 0),
+            'llm_relation_match_calls': llm_call_metrics.get('relation_match_calls', 0),
+            'llm_relation_match_success': llm_call_metrics.get('relation_match_success', 0),
             # Certificate-aware reasoning metrics (fallback)
             'relation_winning_passage': relation_info['passage_id'] if relation_info else None,
             'relation_winning_pvalue': relation_info['p_value'] if relation_info else None,
@@ -1279,7 +1381,9 @@ class TridentPipeline:
     def _two_stage_scoring(
         self,
         passages: List[Passage],
-        facets: List[Facet]
+        facets: List[Facet],
+        question: Optional[str] = None,
+        llm_metrics: Optional[Dict[str, int]] = None,
     ) -> TwoStageScores:
         """
         Perform two-stage scoring with shortlisting and CE/NLI.
@@ -1365,10 +1469,22 @@ class TridentPipeline:
             for passage in shortlist:
                 cache_key = (passage.pid, facet.facet_id, self.config.calibration.version)
 
-                if cache_key in self.score_cache:
+                score = None
+                if facet.facet_type == FacetType.RELATION:
+                    score = self._llm_relation_match_score(
+                        question=question or "",
+                        facet=facet,
+                        passage=passage,
+                        metrics=llm_metrics,
+                    )
+
+                if cache_key in self.score_cache and score is None:
                     score = self.score_cache[cache_key]
-                else:
+                elif score is None:
                     score = self.nli_scorer.score(passage, facet)
+                    self.score_cache[cache_key] = score
+                else:
+                    # Cache LLM-based scores to keep calibration consistent
                     self.score_cache[cache_key] = score
 
                 # F1 FIX: Assert score range / distribution consistency
@@ -1678,7 +1794,8 @@ class TridentPipeline:
         hop2_facets: List[Facet],
         passages: List[Passage],
         scores: TwoStageScores,
-        context: Optional[List[List[str]]] = None
+        context: Optional[List[List[str]]] = None,
+        llm_metrics: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         """
         Certified Adaptive Safe-Cover for compositional (2-hop) questions.
@@ -1959,7 +2076,12 @@ class TridentPipeline:
         # (with placeholders like [DIRECTOR_RESULT]) which produced meaningless scores.
         # Those old scores are cached and MUST NOT be reused.
         # We must always re-score with the instantiated facets.
-        hop2_scores = self._two_stage_scoring(hop2_passages, hop2_facets)
+        hop2_scores = self._two_stage_scoring(
+            hop2_passages,
+            hop2_facets,
+            question=query,
+            llm_metrics=llm_metrics,
+        )
 
         if debug:
             print(f"  [HOP2-SCORE] Re-scored {len(hop2_facets)} instantiated facets on {len(hop2_passages)} passages")
@@ -2228,7 +2350,11 @@ class TridentPipeline:
                 
                 # Update passages and re-score
                 current_passages.extend(new_passages)
-                new_scores = self._two_stage_scoring(new_passages, current_facets)
+                new_scores = self._two_stage_scoring(
+                    new_passages,
+                    current_facets,
+                    question=query,
+                )
                 scores.stage2_scores.update(new_scores.stage2_scores)
                 scores.p_values.update(new_scores.p_values)
                 
