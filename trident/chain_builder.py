@@ -5,6 +5,7 @@ ensuring that the answer is grounded in the actual passages selected.
 
 from __future__ import annotations
 
+import json
 import re
 import string
 from collections import defaultdict
@@ -1283,6 +1284,9 @@ class CSSResult:
     passage_id: str
     reason: str  # OK, NO_SPAN, SPAN_NOT_VERBATIM, PID_NOT_IN_WINNERS, PARSE_ERROR
     confidence: float = 0.0
+    tokens_used: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 def _find_exact_substring(haystack: str, needle: str) -> Optional[Tuple[int, int]]:
@@ -1440,13 +1444,35 @@ JSON:"""
     if debug:
         print(f"[CSS] Raw LLM output: {raw_text[:200]}...")
 
+    prompt_tokens = 0
+    completion_tokens = 0
+    tokens_used = 0
+
+    if hasattr(llm, "compute_token_cost"):
+        try:
+            prompt_tokens = llm.compute_token_cost(prompt)
+        except Exception:
+            prompt_tokens = 0
+
+    if hasattr(raw, "tokens_used"):
+        tokens_used = getattr(raw, "tokens_used", 0) or 0
+        completion_tokens = max(tokens_used - prompt_tokens, 0)
+
     # Parse JSON response
     try:
         out = json_module.loads(_extract_first_json_object(raw_text))
     except Exception as e:
         if debug:
             print(f"[CSS] JSON parse failed: {e}")
-        return CSSResult(abstain=True, answer="", passage_id="", reason="PARSE_ERROR")
+        return CSSResult(
+            abstain=True,
+            answer="",
+            passage_id="",
+            reason="PARSE_ERROR",
+            tokens_used=tokens_used,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
 
     pid = (out.get("pid") or "").strip()
     answer = (out.get("answer") or "").strip()
@@ -1457,14 +1483,32 @@ JSON:"""
 
     # Check for empty response (LLM abstention)
     if not pid or not answer:
-        return CSSResult(abstain=True, answer="", passage_id=pid, reason="NO_SPAN", confidence=confidence)
+        return CSSResult(
+            abstain=True,
+            answer="",
+            passage_id=pid,
+            reason="NO_SPAN",
+            confidence=confidence,
+            tokens_used=tokens_used,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
 
     # Verify passage ID is in winners
     passage_map = {p.get("pid", ""): p for p in winner_passages}
     if pid not in passage_map:
         if debug:
             print(f"[CSS] PID {pid} not in winners: {list(passage_map.keys())}")
-        return CSSResult(abstain=True, answer=answer, passage_id=pid, reason="PID_NOT_IN_WINNERS", confidence=confidence)
+        return CSSResult(
+            abstain=True,
+            answer=answer,
+            passage_id=pid,
+            reason="PID_NOT_IN_WINNERS",
+            confidence=confidence,
+            tokens_used=tokens_used,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
 
     # Verify exact grounding
     passage_text = passage_map[pid].get("text", "")
@@ -1474,7 +1518,16 @@ JSON:"""
     if match is not None:
         if debug:
             print(f"[CSS] Exact match found at {match}")
-        return CSSResult(abstain=False, answer=answer, passage_id=pid, reason="OK", confidence=confidence)
+        return CSSResult(
+            abstain=False,
+            answer=answer,
+            passage_id=pid,
+            reason="OK",
+            confidence=confidence,
+            tokens_used=tokens_used,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
 
     # Try fuzzy match as fallback
     fuzzy = _find_fuzzy_substring(passage_text, answer)
@@ -1483,11 +1536,29 @@ JSON:"""
         if debug:
             print(f"[CSS] Fuzzy match: '{answer}' -> '{matched_text}'")
         # Return the actual text from passage (properly grounded)
-        return CSSResult(abstain=False, answer=matched_text, passage_id=pid, reason="OK_FUZZY", confidence=confidence)
+        return CSSResult(
+            abstain=False,
+            answer=matched_text,
+            passage_id=pid,
+            reason="OK_FUZZY",
+            confidence=confidence,
+            tokens_used=tokens_used,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
 
     if debug:
         print(f"[CSS] No match found for '{answer}' in passage")
-    return CSSResult(abstain=True, answer=answer, passage_id=pid, reason="SPAN_NOT_VERBATIM", confidence=confidence)
+    return CSSResult(
+        abstain=True,
+        answer=answer,
+        passage_id=pid,
+        reason="SPAN_NOT_VERBATIM",
+        confidence=confidence,
+        tokens_used=tokens_used,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
 
 
 # ==============================================================================
@@ -1622,11 +1693,11 @@ def extract_candidates(
                     support += 1.0
                     if not source_pid:
                         source_pid = p.get("pid", "")
-            if support > 0 or True:  # Always include options for either/or
+            if source_pid:
                 candidates[opt] = (support, source_pid)
         # Return sorted by support
         return sorted(
-            [(text, score, pid) for text, (score, pid) in candidates.items()],
+            [(text, score, pid) for text, (score, pid) in candidates.items() if pid],
             key=lambda x: x[1],
             reverse=True
         )[:max_candidates]
@@ -1651,6 +1722,11 @@ def extract_candidates(
                 no_support += 0.5
                 if not no_pid:
                     no_pid = pid
+
+        if not yes_pid and winner_passages:
+            yes_pid = winner_passages[0].get("pid", "")
+        if not no_pid and winner_passages:
+            no_pid = winner_passages[0].get("pid", "")
 
         return [
             ("yes", yes_support, yes_pid),
@@ -1817,7 +1893,11 @@ def extract_candidates(
 
     # Sort by support score and return top candidates
     sorted_candidates = sorted(
-        [(text, score, pid) for text, (score, pid) in candidates.items()],
+        [
+            (text, score, pid)
+            for text, (score, pid) in candidates.items()
+            if pid
+        ],
         key=lambda x: x[1],
         reverse=True
     )
@@ -1878,6 +1958,9 @@ class ConstrainedSelectionResult:
     candidates: List[str]
     support_scores: List[float]
     reason: str  # OK, NO_CANDIDATES, LLM_ERROR, INVALID_INDEX
+    tokens_used: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 def llm_pick_candidate(
@@ -1979,6 +2062,20 @@ JSON:"""
     if debug:
         print(f"[CONSTRAINED] Raw output: {raw_text[:200]}...")
 
+    prompt_tokens = 0
+    completion_tokens = 0
+    tokens_used = 0
+
+    if hasattr(llm, "compute_token_cost"):
+        try:
+            prompt_tokens = llm.compute_token_cost(prompt)
+        except Exception:
+            prompt_tokens = 0
+
+    if hasattr(raw, "tokens_used"):
+        tokens_used = getattr(raw, "tokens_used", 0) or 0
+        completion_tokens = max(tokens_used - prompt_tokens, 0)
+
     # Parse JSON response
     try:
         out = json_module.loads(_extract_first_json_object(raw_text))
@@ -1997,7 +2094,10 @@ JSON:"""
                 passage_id="",
                 candidates=candidate_texts,
                 support_scores=support_scores,
-                reason="PARSE_ERROR"
+                reason="PARSE_ERROR",
+                tokens_used=tokens_used,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
             )
 
     index = out.get("index", -1)
@@ -2022,7 +2122,10 @@ JSON:"""
                 passage_id=candidates[best_idx][2],
                 candidates=candidate_texts,
                 support_scores=support_scores,
-                reason="FALLBACK_SUPPORT"
+                reason="FALLBACK_SUPPORT",
+                tokens_used=tokens_used,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
             )
         return ConstrainedSelectionResult(
             answer="",
@@ -2031,7 +2134,10 @@ JSON:"""
             passage_id="",
             candidates=candidate_texts,
             support_scores=support_scores,
-            reason="INVALID_INDEX"
+            reason="INVALID_INDEX",
+            tokens_used=tokens_used,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
         )
 
     # Valid selection
@@ -2046,15 +2152,69 @@ JSON:"""
         passage_id=selected[2],
         candidates=candidate_texts,
         support_scores=support_scores,
-        reason="OK"
+        reason="OK",
+        tokens_used=tokens_used,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
     )
+
+
+def _llm_rank_answer_facets(
+    llm,
+    question: str,
+    facet_descriptions: List[Dict[str, str]],
+    debug: bool = False
+) -> List[str]:
+    """Use LLM to rank answer facets without expanding the certified set."""
+
+    if not llm or not facet_descriptions:
+        return []
+
+    allow_ids = [f.get("facet_id", "") for f in facet_descriptions if f.get("facet_id")]
+    if not allow_ids:
+        return []
+
+    prompt_lines = [
+        "You are selecting which certified facets determine the answer.",
+        "Pick up to 3 facet_ids from the list. Return JSON: {\"facet_ids\":[...]} only.",
+        f"Question: {question}",
+        "Facets:",
+    ]
+
+    for f in facet_descriptions:
+        fid = f.get("facet_id", "")
+        ftype = f.get("facet_type", "")
+        ftext = f.get("facet_text", "") or f.get("text", "")
+        prompt_lines.append(f"- {fid} ({ftype}): {ftext}")
+
+    prompt_lines.append("JSON:")
+    prompt = "\n".join(prompt_lines)
+
+    try:
+        raw = llm.generate(prompt, temperature=0.0, max_new_tokens=128)
+        raw_text = raw.text if hasattr(raw, "text") else str(raw)
+        out = json.loads(_extract_first_json_object(raw_text))
+        chosen = out.get("facet_ids") or []
+        if not isinstance(chosen, list):
+            return []
+        # Validate subset
+        allow_set = set(allow_ids)
+        ranked = [fid for fid in chosen if fid in allow_set]
+        if debug:
+            print(f"[LLM_RANKER] chosen={ranked}")
+        return ranked
+    except Exception as e:
+        if debug:
+            print(f"[LLM_RANKER] failed: {e}")
+        return []
 
 
 def get_answer_facet_passages(
     question: str,
     certificates: List[Dict[str, Any]],
     all_passages: List[Dict[str, Any]],
-    facets: Optional[List[Dict[str, Any]]] = None
+    facets: Optional[List[Dict[str, Any]]] = None,
+    llm=None,
 ) -> Tuple[List[Dict[str, Any]], List[str], str]:
     """
     Get passages that won the answer-determining facet(s).
@@ -2161,6 +2321,25 @@ def get_answer_facet_passages(
         print(f"[ANSWER-FACET] priority_types={priority_facet_types}")
         print(f"[ANSWER-FACET] answer_facet_ids={answer_facet_ids}")
 
+    # Optional LLM ranking over certified facets (no expansion)
+    selection_reason = f"FACET_TARGETED:{','.join(answer_facet_ids[:3])}"
+    if llm and len(answer_facet_ids) > 1:
+        facet_descriptions = []
+        for fid in answer_facet_ids:
+            desc = {"facet_id": fid, "facet_type": facet_types.get(fid, "")}
+            if facets:
+                for f in facets:
+                    if f.get("facet_id") == fid:
+                        desc["facet_text"] = f.get("facet_text") or f.get("text") or ""
+                        break
+            facet_descriptions.append(desc)
+
+        ranked = _llm_rank_answer_facets(llm, question, facet_descriptions, debug)
+        if ranked:
+            remaining = [fid for fid in answer_facet_ids if fid not in ranked]
+            answer_facet_ids = ranked + remaining
+            selection_reason = f"LLM_RANKER:{','.join(ranked[:3])}"
+
     # Get passages that won answer facets (CERTIFIED-ONLY: must be in pid_to_passage)
     answer_passages = []
     seen_pids = set()
@@ -2178,8 +2357,6 @@ def get_answer_facet_passages(
         if pid and pid not in seen_pids and pid in pid_to_passage:
             seen_pids.add(pid)
             answer_passages.append(pid_to_passage[pid])
-
-    selection_reason = f"FACET_TARGETED:{','.join(answer_facet_ids[:3])}"
 
     if debug:
         print(f"[ANSWER-FACET] answer_passages: {len(answer_passages)}")
@@ -2239,6 +2416,28 @@ def constrained_span_select(
             candidates=[],
             support_scores=[],
             reason="NO_CERTIFIED_PASSAGES"
+        )
+
+    # Step 0: Frozen span extraction (preferred)
+    css_first = certified_span_select(
+        llm=llm,
+        question=question,
+        winner_passages=winner_passages,
+        max_chars_per_passage=max_chars_per_passage,
+    )
+
+    if not css_first.abstain:
+        return ConstrainedSelectionResult(
+            answer=css_first.answer,
+            candidate_index=-1,
+            confidence=css_first.confidence,
+            passage_id=css_first.passage_id,
+            candidates=[],
+            support_scores=[],
+            reason="OK_FROZEN_SPAN",
+            tokens_used=css_first.tokens_used,
+            prompt_tokens=css_first.prompt_tokens,
+            completion_tokens=css_first.completion_tokens,
         )
 
     # Step 1: Detect question type

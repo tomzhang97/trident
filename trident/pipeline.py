@@ -599,7 +599,8 @@ class TridentPipeline:
                     question=query,
                     certificates=certificates,
                     all_passages=result['selected_passages'],
-                    facets=facet_dicts
+                    facets=facet_dicts,
+                    llm=self.llm
                 )
 
                 # Also get all winner passages for CSS fallback
@@ -647,7 +648,7 @@ class TridentPipeline:
                         max_chars_per_passage=600
                     )
 
-                    if constrained_result.reason == "OK":
+                    if constrained_result.reason in {"OK", "OK_FROZEN_SPAN"}:
                         answer = constrained_result.answer
                         is_grounded = True
                         used_constrained = True
@@ -900,15 +901,13 @@ class TridentPipeline:
 
             # Compute token usage
             if used_constrained:
-                # Constrained selection uses a single LLM call with structured output
-                total_tokens = 0  # Token usage is internal to the call
-                prompt_tokens = 0
-                completion_tokens = 0
+                total_tokens = constrained_result.tokens_used if constrained_result else 0
+                prompt_tokens = constrained_result.prompt_tokens if constrained_result else 0
+                completion_tokens = constrained_result.completion_tokens if constrained_result else 0
             elif used_css:
-                # CSS uses a single LLM call with structured output
-                total_tokens = 0  # CSS token usage is internal to the call
-                prompt_tokens = 0
-                completion_tokens = 0
+                total_tokens = css_result.tokens_used if css_result else 0
+                prompt_tokens = css_result.prompt_tokens if css_result else 0
+                completion_tokens = css_result.completion_tokens if css_result else 0
             elif prompt:
                 total_tokens = llm_output.tokens_used
                 prompt_tokens = self.llm.compute_token_cost(prompt)
