@@ -238,6 +238,11 @@ def _clean_relation_endpoint(x: str) -> str:
 def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
     ft = facet.facet_type
     tpl = facet.template or {}
+    meta = facet.metadata or {}
+
+    def _record_failure(reason: str):
+        # Mutable metadata dict even on frozen Facet
+        meta["gate_failure_reason"] = reason
 
     if ft == FacetType.ENTITY:
         return _contains_exact_phrase(passage_text, str(tpl.get("mention", "")))
@@ -276,16 +281,19 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
 
         # Reject global probes or placeholder-only facets
         if not has_anchor:
+            _record_failure("no_anchor")
             return False
 
         placeholder_re = re.compile(r"\[[A-Z0-9_]+_RESULT\]")
         if (s_clean and placeholder_re.search(s_raw)) or (o_clean and placeholder_re.search(o_raw)):
+            _record_failure("placeholder_anchor")
             return False
 
         s_match = _fuzzy_phrase_match(s_clean, passage_norm, passage_tokens) if s_clean else False
         o_match = _fuzzy_phrase_match(o_clean, passage_norm, passage_tokens) if o_clean else False
 
         if not (s_match or o_match):
+            _record_failure("anchor_not_found")
             return False
 
         # Predicate constraint
@@ -294,6 +302,9 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
             predicate_ok = _check_relation_keywords(relation_kind, passage_norm, passage_tokens)
         if not predicate_ok and predicate:
             predicate_ok = _fuzzy_phrase_match(predicate, passage_norm, passage_tokens)
+
+        if not predicate_ok:
+            _record_failure("predicate_mismatch")
 
         return predicate_ok
 

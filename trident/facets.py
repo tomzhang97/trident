@@ -87,6 +87,29 @@ def _normalize_relation_schema(template: Dict[str, Any]) -> Dict[str, Any]:
         "hop": hop,
     })
 
+    # Upgrade generic predicates to canonical phrases when a relation kind is known.
+    # This avoids weak "is related to" predicates that degrade gating and hypotheses.
+    canonical_predicate = {
+        "DIRECTOR": "directed",
+        "BORN": "was born",
+        "BIRTHPLACE": "was born",
+        "AWARD": "won",
+        "CREATED": "created",
+        "LOCATION": "is located",
+        "MARRIAGE": "married",
+        "MOTHER": "is the mother of",
+        "FATHER": "is the father of",
+        "PARENT": "is the parent of",
+        "CHILD": "is the child of",
+        "SPOUSE": "is the spouse of",
+        "NATIONALITY": "is a citizen of",
+    }
+    weak_predicates = {"is related to", "related to", "relation", "relate"}
+    if relation_kind:
+        pred_clean = predicate.lower().strip()
+        if not pred_clean or pred_clean in weak_predicates:
+            tpl["predicate"] = canonical_predicate.get(str(relation_kind).upper(), predicate)
+
     return tpl
 
 def _looks_like_junk_entity(mention: str) -> bool:
