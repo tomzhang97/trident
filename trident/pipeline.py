@@ -412,6 +412,56 @@ class TridentPipeline:
 
         self._relation_registry = get_default_registry()
 
+    def _route_relation_kind(
+        self, question: str, facet: Facet, registry
+    ) -> Optional[Dict[str, str]]:
+        """Use an LLM to classify a relation facet into the schema allowlist.
+
+        This is a schema-only operation (no retrieval/scoring) that keeps
+        relation predicates from collapsing to generic "is related to" strings.
+        """
+
+        if self.llm is None:
+            return None
+
+        allowed = registry.all_names()
+        if not allowed:
+            return None
+
+        tpl = facet.template or {}
+        subject = tpl.get("subject") or tpl.get("entity1") or tpl.get("entity") or ""
+        obj = tpl.get("object") or tpl.get("entity2") or tpl.get("bridge_entity") or ""
+        predicate = tpl.get("predicate") or tpl.get("relation") or ""
+
+        desc = f"subject={subject}; predicate={predicate}; object={obj}"
+        prompt_lines = [
+            "You classify a QA facet into a normalized relation schema.",
+            "Output JSON ONLY with keys relation_kind (one of the allowed names)",
+            "and anchor_policy (ANY or ALL). No code fences, no commentary.",
+            f"Question: {question}",
+            f"Facet: {desc}",
+            "Allowed relation_kind values:",
+            ", ".join(sorted(allowed)),
+            "JSON:",
+        ]
+        prompt = "\n".join(prompt_lines)
+
+        try:
+            raw = self.llm.generate(prompt, temperature=0.0, max_new_tokens=160)
+            raw_text = raw.text if hasattr(raw, "text") else str(raw)
+            parsed = json.loads(_extract_first_json_object(raw_text))
+        except Exception:
+            return None
+
+        rk = str(parsed.get("relation_kind") or "").upper()
+        anchor_policy = str(parsed.get("anchor_policy") or "ANY").upper()
+        if rk not in allowed:
+            return None
+        if anchor_policy not in {"ANY", "ALL"}:
+            anchor_policy = "ANY"
+
+        return {"relation_kind": rk, "anchor_policy": anchor_policy}
+
     def _apply_relation_planner(self, question: str, facets: List[Facet]) -> List[Facet]:
         """Inject schema-bound relation facets using an LLM planner when needed.
 
@@ -423,19 +473,26 @@ class TridentPipeline:
 
         registry = self._relation_registry
         updated: List[Facet] = []
-        has_relation = False
+        has_schema_relation = False
 
         # First, canonicalize existing relation facets to the registry
         for facet in facets:
             if facet.facet_type == FacetType.RELATION:
-                has_relation = True
                 tpl = dict(facet.template or {})
                 spec = registry.lookup(
                     tpl.get("relation_pid")
                     or tpl.get("relation_kind")
                     or tpl.get("predicate")
                 )
+                # If no schema match, attempt LLM routing into the allowlist
+                if spec is None:
+                    routed = self._route_relation_kind(question, facet, registry)
+                    if routed:
+                        tpl["relation_kind"] = routed["relation_kind"]
+                        tpl["anchor_policy"] = routed.get("anchor_policy")
+                        spec = registry.lookup(routed["relation_kind"])
                 if spec:
+                    has_schema_relation = True
                     tpl.setdefault("relation_pid", spec.pid)
                     tpl["relation_kind"] = spec.name
                     tpl.setdefault("predicate", tpl.get("predicate") or spec.default_predicate())
@@ -457,7 +514,7 @@ class TridentPipeline:
             updated.append(facet)
 
         facets = updated
-        if has_relation or self.llm is None:
+        if has_schema_relation or self.llm is None:
             return facets
 
         # LLM semantic planner: map question -> normalized relation facets

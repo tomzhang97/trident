@@ -307,7 +307,17 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         s_match = _fuzzy_phrase_match(s_clean, passage_norm, passage_tokens) if s_clean else False
         o_match = _fuzzy_phrase_match(o_clean, passage_norm, passage_tokens) if o_clean else False
 
-        if not (s_match or o_match):
+        anchor_policy = str(tpl.get("anchor_policy") or "ANY").upper()
+        if anchor_policy not in {"ANY", "ALL"}:
+            anchor_policy = "ANY"
+
+        anchor_ok = False
+        if anchor_policy == "ALL":
+            anchor_ok = bool(s_match and o_match)
+        else:
+            anchor_ok = bool(s_match or o_match)
+
+        if not anchor_ok:
             _record_failure("anchor_not_found")
             return False
 

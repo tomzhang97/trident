@@ -90,6 +90,7 @@ def _normalize_relation_schema(template: Dict[str, Any]) -> Dict[str, Any]:
     spec = _RELATION_REGISTRY.lookup(relation_kind) or _RELATION_REGISTRY.lookup(predicate)
 
     if spec:
+        relation_kind = spec.name  # Prefer canonical schema name for downstream gating
         tpl.setdefault("relation_pid", spec.pid)
         tpl["relation_kind"] = spec.name  # Canonicalized name
         tpl.setdefault("relation_label", spec.label)
