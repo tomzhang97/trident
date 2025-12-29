@@ -219,7 +219,11 @@ class SafeCoverAlgorithm:
         n_facets = len(facets)
 
         # Per-facet configs
-        t_f = 10  # Default max tests per facet
+        # Use a conservative default of one test per facet. This keeps the
+        # per-facet threshold at α_query / |F| for simple single-test flows
+        # (e.g., unit tests that supply a single p-value per facet) instead of
+        # shrinking it by an additional Bonferroni factor of 10.
+        t_f = 1  # Default max tests per facet
         alpha_f = {}
         alpha_bar_f = {}
 
