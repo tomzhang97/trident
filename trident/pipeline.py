@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModel
 
-from .config import TridentConfig, SafeCoverConfig, ParetoConfig, FacetMinerConfig
+from .config import TridentConfig, SafeCoverConfig, ParetoConfig
 from .facets import Facet, FacetMiner, FacetType, instantiate_facets, mark_required_facets, is_wh_question
 from .candidates import Passage
 from .calibration import ReliabilityCalibrator, CalibrationMonitor
@@ -57,28 +57,6 @@ from .chain_builder import (
     route_relation,
     KNOWN_RELATION_TYPES,
 )
-
-# ---------------------------
-# LLM / Extraction Rigor Helpers
-# ---------------------------
-def _reason_ok(reason: str) -> bool:
-    """Treat any reason starting with 'OK' as success (supports OK_FROZEN_SPAN, OK_CANDIDATE, etc.)."""
-    return bool(reason) and str(reason).upper().startswith("OK")
-
-def _first_json_object(text: str):
-    """Best-effort extraction of the first JSON object in a string. Returns dict or None."""
-    import json
-    if not text:
-        return None
-    s = text.find("{")
-    e = text.rfind("}")
-    if s == -1 or e == -1 or e <= s:
-        return None
-    try:
-        return json.loads(text[s:e+1])
-    except Exception:
-        return None
-
 
 
 @dataclass
@@ -367,12 +345,7 @@ class TridentPipeline:
         self.device = device
 
         # Initialize components
-        self.facet_miner = FacetMiner(config)
-        # Provide LLM handle to FacetMiner for optional LLM-driven facet planning
-        try:
-            self.facet_miner.llm = self.llm
-        except Exception:
-            pass
+        self.facet_miner = FacetMiner(config, llm_interface=self.llm)
         self.nli_scorer = NLIScorer(config.nli, device)
 
         # Load calibrator from file if provided, otherwise create empty one
@@ -453,17 +426,7 @@ class TridentPipeline:
 
         # Mark RELATION facets as required for WH-questions
         # This ensures that the key relation must be certified for valid answers
-        facet_miner_cfg = getattr(self.config, "facet_miner", None) or FacetMinerConfig()
-        # Persist the fallback on the config object when older configs are missing the field
-        if not getattr(self.config, "facet_miner", None):
-            try:
-                self.config.facet_miner = facet_miner_cfg
-            except Exception:
-                pass
-
-        use_llm_plan = bool(getattr(facet_miner_cfg, 'use_llm_facet_plan', False) or os.environ.get('TRIDENT_LLM_FACET_PLAN','0')=='1')
-        if not use_llm_plan or not any(getattr(f, 'required', False) for f in facets):
-            facets = mark_required_facets(facets, query)
+        facets = mark_required_facets(facets, query)
 
         self.telemetry.log("facet_mining", {
             "num_facets": len(facets),
@@ -1747,25 +1710,7 @@ class TridentPipeline:
                 keyword_match = any(kw.lower() in combined_text for kw in outer_relation_keywords)
 
                 if entity_match and keyword_match:
-                    # Extra rigor: require the grounded lexical gate to pass for at least one hop-2 facet.
-                    # This prevents 'relation-only' passages (e.g., generic "son of"/"mother") from leaking in
-                    # when the conditioned retriever returns empty.
-                    gate_ok = False
-                    try:
-                        for hf in hop2_facets:
-                            if hasattr(self.nli_scorer, "check_gate"):
-                                if self.nli_scorer.check_gate(hf, p.get("text", "")):
-                                    gate_ok = True
-                                    break
-                            elif hasattr(self.nli_scorer, "_check_lexical_gate"):
-                                if self.nli_scorer._check_lexical_gate(hf, p.get("text", "")):
-                                    gate_ok = True
-                                    break
-                    except Exception:
-                        gate_ok = False
-
-                    if gate_ok:
-                        filtered_candidates.append(p)
+                    filtered_candidates.append(p)
 
             if debug:
                 print(f"  Found {len(filtered_candidates)} context-pool candidates for hop-2")
