@@ -2209,158 +2209,181 @@ def get_answer_facet_passages(
     certificates: List[Dict[str, Any]],
     all_passages: List[Dict[str, Any]],
     facets: Optional[List[Dict[str, Any]]] = None,
-    llm=None,
-    metrics: Optional[Dict[str, int]] = None,
+    llm: Optional[Any] = None,
+    max_answer_facets: int = 3,
+    max_answer_passages: int = 5,
 ) -> Tuple[List[Dict[str, Any]], List[str], str]:
     """
-    Get passages that won the answer-determining facet(s).
+    Select passages corresponding to the *answer-determining* facets.
 
-    CERTIFIED-ONLY INVARIANT:
-    - Only returns passages that have certificates (in _cert_pid set)
-    - Filters out passages with deny-listed titles
-    - Orders by p-value (best first)
-
-    For WH-questions, the answer facet is typically RELATION/TEMPORAL/NUMERIC.
-    ENTITY facets just confirm the question subject exists, not the answer.
-
-    Args:
-        question: The question
-        certificates: List of certificate dicts with passage_id, facet_id, etc.
-        all_passages: All passages
-        facets: Optional list of facet dicts for filtering
-
-    Returns:
-        Tuple of (answer_passages, answer_facet_ids, selection_reason)
+    Certified-only, fail-closed properties:
+    - Only passages whose PID appears in certificates are eligible.
+    - For each facet, only the best (lowest p-value) certificate is used to fetch evidence.
+    - LLM (if used) may only choose from certified facet IDs; outputs are intersected.
     """
+    import json
     import os
+
     debug = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
 
     if not certificates:
         return [], [], "NO_CERTIFICATES"
 
-    # CERTIFIED-ONLY: Get the set of certified passage IDs
+    # -----------------------------
+    # 1) Certified-only PID scope
+    # -----------------------------
     certified_pids = _cert_pid(certificates)
 
-    # Build passage lookup (only certified passages)
-    pid_to_passage = {}
-    for p in all_passages:
-        pid = p.get("pid")
-        if pid and pid in certified_pids:
-            # Filter out deny-listed titles
-            title = p.get("title", "")
-            if not _is_deny_title(title):
-                pid_to_passage[pid] = p
+    # Build passage lookup from certified-only pool
+    pid_to_passage = {
+        p.get("pid"): p
+        for p in all_passages
+        if p.get("pid") in certified_pids
+    }
 
-    if debug:
-        print(f"[ANSWER-FACET] certified_pids={len(certified_pids)}, valid_passages={len(pid_to_passage)}")
-
-    # Build facet_id -> certificates mapping
+    # -----------------------------
+    # 2) Best cert per facet (lowest p-value)
+    # -----------------------------
     facet_to_certs: Dict[str, List[Dict[str, Any]]] = {}
     for cert in certificates:
-        fid = cert.get("facet_id", "")
-        if fid:
-            if fid not in facet_to_certs:
-                facet_to_certs[fid] = []
-            facet_to_certs[fid].append(cert)
+        fid = cert.get("facet_id") or ""
+        pid = cert.get("passage_id") or cert.get("pid") or cert.get("passage_pid") or cert.get("winning_pid") or ""
+        if fid and pid and pid in pid_to_passage:
+            facet_to_certs.setdefault(fid, []).append(cert)
 
-    # Detect question type to determine answer facet priority
-    qtype = detect_question_type(question)
+    if not facet_to_certs:
+        # If schema drift: we have certificates but couldn't map to passages cleanly
+        return [], [], "NO_CERT_MAPPABLE_PASSAGES"
 
-    if debug:
-        print(f"[ANSWER-FACET] qtype={qtype.category} expected={qtype.expected_type}")
-        print(f"[ANSWER-FACET] facet_ids with certs: {list(facet_to_certs.keys())}")
+    best_cert_by_fid: Dict[str, Dict[str, Any]] = {}
+    for fid, certs in facet_to_certs.items():
+        best_cert_by_fid[fid] = min(certs, key=lambda c: float(c.get("p_value", 1.0)))
 
-    # Build facet type lookup if facets provided
-    facet_types: Dict[str, str] = {}
-    if facets:
-        for f in facets:
-            fid = f.get("facet_id", "")
-            ftype = f.get("facet_type", "")
-            if fid and ftype:
-                facet_types[fid] = ftype
+    certified_facet_ids = list(best_cert_by_fid.keys())
 
-    # Priority order for answer facets based on question type
-    # WH-questions need RELATION/TEMPORAL/NUMERIC facets for the actual answer
-    # ENTITY facets just confirm the question subject exists
-    priority_facet_types = []
+    # -----------------------------
+    # 3) Choose answer facets (LLM ranker, then heuristic)
+    # -----------------------------
+    selected_facet_ids: List[str] = []
+    selection_reason = "HEURISTIC"
 
-    if qtype.category == "when":
-        priority_facet_types = ["TEMPORAL", "RELATION", "NUMERIC"]
-    elif qtype.category == "where":
-        priority_facet_types = ["RELATION", "TEMPORAL"]
-    elif qtype.category in ("who", "what"):
-        priority_facet_types = ["RELATION", "TEMPORAL", "NUMERIC"]
-    elif qtype.category == "how_many":
-        priority_facet_types = ["NUMERIC", "RELATION", "TEMPORAL"]
-    else:
-        # Default: prefer RELATION over ENTITY
-        priority_facet_types = ["RELATION", "TEMPORAL", "NUMERIC", "ENTITY"]
+    if llm and facets and len(certified_facet_ids) > 1:
+        try:
+            facet_lookup = {f.get("facet_id"): f for f in facets if f.get("facet_id")}
+            valid_ids = set(certified_facet_ids)
 
-    # Find answer facets in priority order
-    answer_facet_ids = []
-    for ptype in priority_facet_types:
-        for fid in facet_to_certs:
-            if facet_types.get(fid) == ptype and fid not in answer_facet_ids:
-                answer_facet_ids.append(fid)
+            options_text = []
+            for fid in certified_facet_ids:
+                f_obj = facet_lookup.get(fid, {}) or {}
 
-    # If no priority facets, use all non-ENTITY facets first, then ENTITY
-    if not answer_facet_ids:
-        non_entity = [fid for fid in facet_to_certs if facet_types.get(fid) != "ENTITY"]
-        entity = [fid for fid in facet_to_certs if facet_types.get(fid) == "ENTITY"]
-        answer_facet_ids = non_entity + entity
+                ftype_raw = f_obj.get("facet_type") or f_obj.get("type") or "UNKNOWN"
+                if isinstance(ftype_raw, dict):
+                    ftype = str(ftype_raw.get("value", "UNKNOWN")).upper()
+                else:
+                    ftype = str(ftype_raw).upper()
 
-    # If still empty, use all facets
-    if not answer_facet_ids:
-        answer_facet_ids = list(facet_to_certs.keys())
+                tpl = f_obj.get("template", {}) or {}
+                subj = tpl.get("subject") or tpl.get("entity1") or tpl.get("entity") or "?"
+                pred = tpl.get("predicate") or tpl.get("relation") or "?"
+                obj = tpl.get("object") or tpl.get("bridge_entity") or tpl.get("entity2") or "?"
+                desc = f"{ftype}: {subj} -> {pred} -> {obj}"
+                options_text.append(f"- ID: {fid}\n  Desc: {desc}")
 
-    if debug:
-        print(f"[ANSWER-FACET] priority_types={priority_facet_types}")
-        print(f"[ANSWER-FACET] answer_facet_ids={answer_facet_ids}")
+            prompt = f"""Identify which facets directly determine the ANSWER to the question.
+Select from the provided Certified Facets only.
 
-    # Optional LLM ranking over certified facets (no expansion)
-    selection_reason = f"FACET_TARGETED:{','.join(answer_facet_ids[:3])}"
-    if llm and len(answer_facet_ids) > 1:
-        facet_descriptions = []
-        for fid in answer_facet_ids:
-            desc = {"facet_id": fid, "facet_type": facet_types.get(fid, "")}
-            if facets:
-                for f in facets:
-                    if f.get("facet_id") == fid:
-                        desc["facet_text"] = f.get("facet_text") or f.get("text") or ""
+Question: {question}
+
+Certified Facets:
+{chr(10).join(options_text)}
+
+Rules:
+1. Return JSON only: {{ "answer_facet_ids": ["fid1", ...], "reason": "..." }}
+2. Only include facet IDs from the list above.
+3. If unsure, include up to 2 best candidates.
+
+JSON:"""
+
+            resp = llm.generate(prompt, temperature=0.0)
+            raw = resp.text if hasattr(resp, "text") else str(resp)
+
+            s = raw.find("{")
+            e = raw.rfind("}")
+            if s != -1 and e != -1:
+                data = json.loads(raw[s:e+1])
+                proposed = data.get("answer_facet_ids", [])
+                if isinstance(proposed, list):
+                    proposed = [str(x) for x in proposed]
+                else:
+                    proposed = []
+
+                valid_proposed = [fid for fid in proposed if fid in valid_ids]
+                if valid_proposed:
+                    selected_facet_ids = valid_proposed[:max_answer_facets]
+                    selection_reason = f"LLM_RANKER:{','.join(selected_facet_ids)}"
+        except Exception as ex:
+            if debug:
+                print(f"[ANSWER-FACET] LLM selection failed: {ex}")
+
+    if not selected_facet_ids:
+        # Heuristic fallback: uses question-type detector
+        qtype = detect_question_type(question)
+
+        facet_types: Dict[str, str] = {}
+        if facets:
+            for f in facets:
+                fid = f.get("facet_id")
+                if not fid:
+                    continue
+                raw = f.get("facet_type", "UNKNOWN")
+                val = raw.get("value") if isinstance(raw, dict) else raw
+                facet_types[fid] = str(val).upper()
+
+        priority_order = ["RELATION", "TEMPORAL", "NUMERIC", "ENTITY"]
+        if getattr(qtype, "category", None) == "when":
+            priority_order = ["TEMPORAL", "RELATION", "NUMERIC"]
+        elif getattr(qtype, "category", None) == "where":
+            priority_order = ["RELATION", "TEMPORAL"]
+        elif getattr(qtype, "category", None) == "how_many":
+            priority_order = ["NUMERIC", "RELATION"]
+
+        for ptype in priority_order:
+            for fid in certified_facet_ids:
+                if facet_types.get(fid) == ptype and fid not in selected_facet_ids:
+                    selected_facet_ids.append(fid)
+                    if len(selected_facet_ids) >= max_answer_facets:
                         break
-            facet_descriptions.append(desc)
+            if len(selected_facet_ids) >= max_answer_facets:
+                break
 
-        ranked = _llm_rank_answer_facets(llm, question, facet_descriptions, debug, metrics=metrics)
-        if ranked:
-            remaining = [fid for fid in answer_facet_ids if fid not in ranked]
-            answer_facet_ids = ranked + remaining
-            selection_reason = f"LLM_RANKER:{','.join(ranked[:3])}"
+        if not selected_facet_ids:
+            selected_facet_ids = certified_facet_ids[:max_answer_facets]
 
-    # Get passages that won answer facets (CERTIFIED-ONLY: must be in pid_to_passage)
-    answer_passages = []
-    seen_pids = set()
+        selection_reason = f"HEURISTIC:{','.join(selected_facet_ids)}"
 
-    # Get all certs for answer facets, sorted by p-value (best first)
-    answer_certs = []
-    for fid in answer_facet_ids:
-        answer_certs.extend(facet_to_certs.get(fid, []))
+    # -----------------------------
+    # 4) Fetch winning passages from best certs (strict provenance)
+    # -----------------------------
+    target_certs = [best_cert_by_fid[fid] for fid in selected_facet_ids if fid in best_cert_by_fid]
+    target_certs.sort(key=lambda c: float(c.get("p_value", 1.0)))
 
-    answer_certs.sort(key=lambda c: c.get("p_value", 1.0))
-
-    for cert in answer_certs:
-        pid = cert.get("passage_id")
-        # CERTIFIED-ONLY: Only include if in pid_to_passage (certified and not deny-listed)
-        if pid and pid not in seen_pids and pid in pid_to_passage:
-            seen_pids.add(pid)
+    answer_passages: List[Dict[str, Any]] = []
+    seen = set()
+    for cert in target_certs:
+        pid = cert.get("passage_id") or cert.get("pid") or cert.get("passage_pid") or cert.get("winning_pid") or ""
+        if not pid or pid in seen:
+            continue
+        if pid in pid_to_passage:
+            seen.add(pid)
             answer_passages.append(pid_to_passage[pid])
+        if len(answer_passages) >= max_answer_passages:
+            break
 
     if debug:
-        print(f"[ANSWER-FACET] answer_passages: {len(answer_passages)}")
-        for ap in answer_passages[:3]:
-            print(f"  - {ap.get('pid', '')[:12]}... ({len(ap.get('text', ''))} chars)")
+        apids = [p.get("pid") for p in answer_passages]
+        print(f"[ANSWER-FACET] reason={selection_reason} facets={selected_facet_ids} pids={apids}")
 
-    return answer_passages, answer_facet_ids, selection_reason
-
+    return answer_passages, selected_facet_ids, selection_reason
 
 def constrained_span_select(
     llm,
@@ -2368,43 +2391,19 @@ def constrained_span_select(
     winner_passages: List[Dict[str, Any]],
     max_candidates: int = 10,
     max_chars_per_passage: int = 600,
-    certificates: Optional[List[Dict[str, Any]]] = None
+    certificates: Optional[List[Dict[str, Any]]] = None,
 ) -> ConstrainedSelectionResult:
     """
-    Full constrained selection pipeline: detect type -> extract candidates -> LLM pick.
+    Primary: Frozen span extraction (pid + offsets + verbatim check) from winner_passages.
+    Secondary: candidate-index selection (legacy) but still certified-only if certificates provided.
 
-    CERTIFIED-ONLY INVARIANT:
-    - If certificates provided, only use passages in _cert_pid(certificates)
-    - Candidates are FROZEN at extraction time (immutable list)
-    - LLM can only select by index from frozen candidates
-    - Final answer is verified to be verbatim substring before return
-
-    Args:
-        llm: LLM interface
-        question: The question to answer
-        winner_passages: Certificate-winning passages
-        max_candidates: Max candidates to extract
-        max_chars_per_passage: Max chars per passage in prompt
-        certificates: Optional certificates for certified-only enforcement
-
-    Returns:
-        ConstrainedSelectionResult with answer and metadata
+    Fail-closed: returns empty answer if nothing can be machine-verified.
     """
+    import json
     import os
+    import re
+
     debug = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
-
-    # CERTIFIED-ONLY: Filter passages if certificates provided
-    if certificates:
-        certified_pids = _cert_pid(certificates)
-        winner_passages = [
-            p for p in winner_passages
-            if p.get("pid") in certified_pids and not _is_deny_title(p.get("title", ""))
-        ]
-        if debug:
-            print(f"[CONSTRAINED] Filtered to {len(winner_passages)} certified passages")
-
-    # Enforce provenance: drop passages without a pid
-    winner_passages = [p for p in winner_passages if p.get("pid")]
 
     if not winner_passages:
         return ConstrainedSelectionResult(
@@ -2414,51 +2413,125 @@ def constrained_span_select(
             passage_id="",
             candidates=[],
             support_scores=[],
-            reason="NO_CERTIFIED_PASSAGES"
+            reason="NO_PASSAGES"
         )
 
-    # Step 0: Frozen span extraction (preferred)
-    css_first = certified_span_select(
-        llm=llm,
-        question=question,
-        winner_passages=winner_passages,
-        max_chars_per_passage=max_chars_per_passage,
-    )
+    if certificates:
+        certified_pids = _cert_pid(certificates)
+        winner_passages = [p for p in winner_passages if p.get("pid") in certified_pids]
+        if not winner_passages:
+            return ConstrainedSelectionResult(
+                answer="",
+                candidate_index=-1,
+                confidence=0.0,
+                passage_id="",
+                candidates=[],
+                support_scores=[],
+                reason="NO_CERTIFIED_PASSAGES"
+            )
 
-    if not css_first.abstain:
-        return ConstrainedSelectionResult(
-            answer=css_first.answer,
-            candidate_index=-1,
-            confidence=css_first.confidence,
-            passage_id=css_first.passage_id,
-            candidates=[],
-            support_scores=[],
-            reason="OK_FROZEN_SPAN",
-            tokens_used=css_first.tokens_used,
-            prompt_tokens=css_first.prompt_tokens,
-            completion_tokens=css_first.completion_tokens,
-        )
+    # -----------------------------
+    # Frozen span extraction prompt
+    # -----------------------------
+    snippet_map: Dict[str, str] = {}
+    evidence_parts = []
+    for p in winner_passages:
+        pid = p.get("pid")
+        if not pid:
+            continue
+        snip = (p.get("text") or "")[:max_chars_per_passage]
+        snippet_map[pid] = snip
+        evidence_parts.append(f"[{pid}] {snip}")
 
-    # Step 1: Detect question type
-    qtype = detect_question_type(question)
+    evidence_text = "\n\n".join(evidence_parts)
+
+    span_prompt = f"""Extract the answer as an EXACT substring from the evidence.
+
+Question: {question}
+
+Evidence:
+{evidence_text}
+
+Rules:
+1. The answer_span must be copied VERBATIM from the evidence.
+2. Provide start_char and end_char offsets relative to the snippet shown for that pid.
+3. Return JSON only:
+{{ "pid": "...", "start_char": 0, "end_char": 0, "answer_span": "...", "confidence": 0.0 }}
+4. If not found, return {{ "answer_span": null }}
+
+JSON:"""
+
+    def _norm_ws(s: str) -> str:
+        return " ".join((s or "").split())
+
+    try:
+        resp = llm.generate(span_prompt, temperature=0.0)
+        raw = resp.text if hasattr(resp, "text") else str(resp)
+        s = raw.find("{")
+        e = raw.rfind("}")
+        if s != -1 and e != -1:
+            data = json.loads(raw[s:e+1])
+
+            span = data.get("answer_span")
+            pid = data.get("pid")
+            start_char = data.get("start_char")
+            end_char = data.get("end_char")
+            conf = float(data.get("confidence", 0.0))
+
+            if span and pid in snippet_map and isinstance(start_char, int) and isinstance(end_char, int):
+                snippet = snippet_map[pid]
+
+                match = False
+                if 0 <= start_char < end_char <= len(snippet):
+                    sliced = snippet[start_char:end_char]
+                    if _norm_ws(sliced) == _norm_ws(span):
+                        match = True
+
+                # Deterministic repair: exact find in original snippet if offsets wrong
+                if not match:
+                    idx = snippet.find(span)
+                    if idx != -1:
+                        start_char, end_char = idx, idx + len(span)
+                        if _norm_ws(snippet[start_char:end_char]) == _norm_ws(span):
+                            match = True
+
+                if match:
+                    # Type sanity checks (lightweight)
+                    q_type = detect_question_type(question)
+                    ok = True
+                    if getattr(q_type, "expected_type", None) == "NUMBER":
+                        ok = bool(re.search(r"\d", span)) and len(span) <= 50
+                    elif getattr(q_type, "expected_type", None) == "DATE":
+                        ok = bool(re.search(r"\d{4}", span) or re.search(r"\d", span))
+                    elif getattr(q_type, "category", None) == "yes_no":
+                        ok = _norm_ws(span).lower() in {"yes", "no"}
+
+                    if ok:
+                        if debug:
+                            print(f"[FROZEN-SPAN] pid={pid} span='{span}' [{start_char}:{end_char}] conf={conf:.2f}")
+                        return ConstrainedSelectionResult(
+                            answer=span,
+                            candidate_index=0,
+                            confidence=conf,
+                            passage_id=pid,
+                            candidates=[span],
+                            support_scores=[1.0],
+                            reason="OK_FROZEN_SPAN"
+                        )
+    except Exception as ex:
+        if debug:
+            print(f"[FROZEN-SPAN] Failed: {ex}")
+
+    # -----------------------------
+    # Fallback: candidate list + index pick
+    # -----------------------------
     if debug:
-        print(f"[CONSTRAINED] Question type: {qtype.category}, expected: {qtype.expected_type}")
-        if qtype.options:
-            print(f"[CONSTRAINED] Options: {qtype.options}")
+        print("[CONSTRAINED] Falling back to candidate selection...")
 
-    # Step 2: Extract candidates (FROZEN at this point - immutable)
+    qtype = detect_question_type(question)
     candidates = extract_candidates(winner_passages, qtype, max_candidates)
 
-    # FREEZE: Convert to tuple to ensure immutability
-    frozen_candidates = tuple(candidates)
-
-    if debug:
-        print(f"[CONSTRAINED] Extracted {len(frozen_candidates)} candidates (frozen)")
-        for i, (text, score, pid) in enumerate(frozen_candidates[:5]):
-            pid_str = pid[:12] if pid else "?"
-            print(f"  {i}: '{text}' (support={score}, pid={pid_str}...)")
-
-    if not frozen_candidates:
+    if not candidates:
         return ConstrainedSelectionResult(
             answer="",
             candidate_index=-1,
@@ -2469,252 +2542,140 @@ def constrained_span_select(
             reason="NO_CANDIDATES"
         )
 
-    # Step 3: LLM picks from frozen candidates
-    result = llm_pick_candidate(
+    return llm_pick_candidate(
         llm=llm,
         question=question,
         passages=winner_passages,
-        candidates=list(frozen_candidates),  # Pass as list but from frozen source
+        candidates=candidates,
         max_chars_per_passage=max_chars_per_passage
     )
-
-    # Step 4: VERIFY the answer is verbatim in source passage
-    if result.answer and result.passage_id:
-        pid_to_passage = {p.get("pid", ""): p for p in winner_passages}
-        source_passage = pid_to_passage.get(result.passage_id)
-        if source_passage:
-            source_text = source_passage.get("text", "")
-            # Normalize for matching
-            source_norm = _normalize_text_unicode(source_text)
-            answer_norm = _normalize_text_unicode(result.answer)
-            if answer_norm and answer_norm not in source_norm:
-                if debug:
-                    print(f"[CONSTRAINED] VERIFY FAILED: '{result.answer}' not in passage")
-                # Return with VERIFY_FAILED reason but keep answer for debugging
-                return ConstrainedSelectionResult(
-                    answer=result.answer,
-                    candidate_index=result.candidate_index,
-                    confidence=0.0,  # Zero confidence on verify failure
-                    passage_id=result.passage_id,
-                    candidates=result.candidates,
-                    support_scores=result.support_scores,
-                    reason="VERIFY_FAILED"
-                )
-
-    return result
-
 
 def bind_entity_via_css(
     llm,
     inner_question: str,
     hop1_passages: List[Dict[str, Any]],
     max_chars: int = 600,
-    certificates: Optional[List[Dict[str, Any]]] = None
+    min_confidence: float = 0.55,
+    certificates: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
     """
-    CHOICE-ONLY entity binding using Certified Span Selection.
+    Canonical entity binder: deterministic candidate generation -> LLM index choice.
 
-    CERTIFIED-ONLY INVARIANT:
-    - First extracts PERSON candidates from passages
-    - LLM picks by index from frozen candidates (not free-form)
-    - Final answer is verified to be verbatim substring
-
-    Example:
-        inner_question: "Who is the director of Polish-Russian War (film)?"
-        Candidates: ["Xawery Żuławski", "John Smith", ...]
-        LLM picks: index 0
-        Returns: "Xawery Żuławski" (verbatim from passage)
-
-    Args:
-        llm: LLM interface
-        inner_question: The hop-1 question asking for the bridge entity
-        hop1_passages: Certificate-winning passages from hop-1
-        max_chars: Max chars per passage
-        certificates: Optional certificates for certified-only enforcement
-
-    Returns:
-        The bound entity string, or None if binding failed
+    Certified-only option:
+    - If certificates provided, restrict hop1_passages to certified PIDs.
+    Fail-closed:
+    - If parsing fails, index out of bounds, or confidence < threshold => None.
     """
-    import json as json_module
+    import json
     import os
+    from .nli_scorer import _normalize_text_unicode
 
     debug = os.environ.get("TRIDENT_DEBUG_CSS", "0") == "1"
 
     if not hop1_passages:
         return None
 
-    # CERTIFIED-ONLY: Filter passages if certificates provided
     if certificates:
         certified_pids = _cert_pid(certificates)
-        hop1_passages = [
-            p for p in hop1_passages
-            if p.get("pid") in certified_pids and not _is_deny_title(p.get("title", ""))
-        ]
-        if debug:
-            print(f"[CSS-BIND] Filtered to {len(hop1_passages)} certified passages")
+        hop1_passages = [p for p in hop1_passages if p.get("pid") in certified_pids]
+        if not hop1_passages:
+            return None
 
-    if not hop1_passages:
+    # Candidate enumeration via existing extractor (still deterministic downstream)
+    q_type = detect_question_type(inner_question)
+    raw_candidates = extract_candidates(hop1_passages, q_type, max_candidates=20)
+
+    # Build normalized -> (display_text, source_pid)
+    cand_map: Dict[str, Tuple[str, str]] = {}
+    for text, score, pid in raw_candidates:
+        if not text or not pid:
+            continue
+        toks = text.split()
+        ok = False
+        if len(toks) >= 2:
+            ok = True
+        elif len(toks) == 1:
+            t = toks[0]
+            if len(t) >= 4 and t.lower() not in {"this", "that", "film", "movie", "city"}:
+                ok = True
+        if not ok:
+            continue
+        norm = _normalize_text_unicode(text)
+        if norm and norm not in cand_map:
+            cand_map[norm] = (text, pid)
+
+    cand_items = list(cand_map.values())
+    # Deterministic ordering: longer (more specific) first, then lexicographic, then pid
+    cand_items.sort(key=lambda x: (-(len(x[0].split())), x[0].lower(), x[1]))
+    candidate_list = cand_items[:8]  # (text, pid)
+
+    if not candidate_list:
+        if debug:
+            print("[CSS-BIND] No candidates after filtering.")
         return None
 
-    # Step 1: Extract PERSON candidates from passages (FROZEN)
-    # Use the PERSON pattern from extract_candidates
-    person_pattern = re.compile(
-        r"\b([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+(?:de|van|von|la|el|al|bin|ibn)?[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,5})\b"
-    )
-
-    candidates: Dict[str, Tuple[float, str]] = {}  # text -> (score, pid)
-
-    for p in hop1_passages:
-        text = p.get("text") or ""
-        pid = p.get("pid", "")
-
-        for match in person_pattern.finditer(text):
-            name = match.group(1).strip()
-
-            # Validate: looks like a person name
-            if not _looks_like_person(name):
-                continue
-
-            # Compute support score
-            support = sum(
-                1 for pp in hop1_passages
-                if name.lower() in (pp.get("text") or "").lower()
-            )
-
-            # Multi-token bonus
-            token_count = len(name.split())
-            length_bonus = 0.5 * (token_count - 1)
-            adjusted_support = support + length_bonus
-
-            if name not in candidates or adjusted_support > candidates[name][0]:
-                candidates[name] = (adjusted_support, pid)
-
-    # Deduplicate: remove single-token candidates that are substrings of multi-token
-    if len(candidates) > 1:
-        to_remove = set()
-        sorted_cands = sorted(candidates.items(), key=lambda x: x[1][0], reverse=True)
-        for i, (name1, _) in enumerate(sorted_cands):
-            name1_norm = _normalize_for_dedup(name1)
-            for name2, _ in sorted_cands[i+1:]:
-                name2_norm = _normalize_for_dedup(name2)
-                if len(name2_norm) < len(name1_norm) and name2_norm in name1_norm:
-                    to_remove.add(name2)
-        for name in to_remove:
-            if name in candidates:
-                del candidates[name]
-
-    # Sort by support score
-    sorted_candidates = sorted(
-        [(text, score, pid) for text, (score, pid) in candidates.items()],
-        key=lambda x: x[1],
-        reverse=True
-    )[:10]  # Max 10 candidates
-
-    # FREEZE candidates
-    frozen_candidates = tuple(sorted_candidates)
-
-    if debug:
-        print(f"[CSS-BIND] Extracted {len(frozen_candidates)} PERSON candidates (frozen)")
-        for i, (text, score, pid) in enumerate(frozen_candidates[:5]):
-            print(f"  {i}: '{text}' (support={score})")
-
-    if not frozen_candidates:
-        if debug:
-            print(f"[CSS-BIND] No PERSON candidates found")
-        return None
-
-    # Step 2: LLM picks by index from frozen candidates
-    # Build compact evidence
+    # Build evidence snippets only from relevant PIDs (for provenance)
+    relevant_pids = {pid for _, pid in candidate_list}
+    snippet_map: Dict[str, str] = {}
     evidence_parts = []
-    for p in hop1_passages[:3]:  # Limit to 3 passages
-        pid = p.get("pid", "")
-        title = p.get("title", "")
-        text = (p.get("text") or "")[:max_chars]
-        evidence_parts.append(f"[{pid}] {title}\n{text}")
+    for p in hop1_passages:
+        pid = p.get("pid")
+        if pid in relevant_pids:
+            snip = (p.get("text") or "")[:max_chars]
+            snippet_map[pid] = snip
+            evidence_parts.append(f"[{pid}] {snip}")
 
-    evidence_text = "\n\n".join(evidence_parts)
+    candidates_formatted = "\n".join([f"{i}: {c[0]}" for i, c in enumerate(candidate_list)])
+    evidence_text = "\n".join(evidence_parts)
 
-    # Build numbered candidate list
-    candidate_list = []
-    for i, (text, score, pid) in enumerate(frozen_candidates):
-        candidate_list.append(f"{i}: {text}")
-    candidates_text = "\n".join(candidate_list)
-
-    # CHOICE-ONLY prompt: LLM must pick by index
-    prompt = f"""Pick the ONE person's name that answers the question.
-
-RULES:
-1. You MUST pick from the numbered candidates below BY INDEX.
-2. Output MUST be a single JSON object with "index" (integer) and "confidence" (0-1).
-3. Do NOT include code fences, prose, or extra text outside the JSON.
-4. If no candidate answers the question, return {{"index": -1, "confidence": 0}}.
+    prompt = f"""Identify the entity that answers the question.
+Select ONE candidate from the list by index.
 
 Question: {inner_question}
 
 Candidates:
-{candidates_text}
+{candidates_formatted}
 
 Evidence:
 {evidence_text}
 
+Rules:
+1. Return JSON only: {{ "index": int, "confidence": float }}
+2. If none match, return {{ "index": -1 }}
+
 JSON:"""
 
     try:
-        out, raw = strict_json_call(llm, prompt, max_new_tokens=96, temperature=0.0)
-        raw_text = raw.text if hasattr(raw, 'text') else str(raw)
-    except Exception as e:
-        if debug:
-            print(f"[CSS-BIND] JSON parse error: {e}")
-        return None
+        resp = llm.generate(prompt, temperature=0.0)
+        raw = resp.text if hasattr(resp, "text") else str(resp)
+        s = raw.find("{")
+        e = raw.rfind("}")
+        if s == -1 or e == -1:
+            return None
+        data = json.loads(raw[s:e+1])
 
-    if debug:
-        print(f"[CSS-BIND] Raw output: {raw_text[:200]}...")
+        idx = int(data.get("index", -1))
+        conf = float(data.get("confidence", 0.0))
 
-    index = out.get("index", -1)
+        if conf < min_confidence:
+            return None
+        if not (0 <= idx < len(candidate_list)):
+            return None
 
-    # Validate index
-    if not isinstance(index, int) or index < 0 or index >= len(frozen_candidates):
-        if debug:
-            print(f"[CSS-BIND] Invalid index: {index}")
-        # Fallback: pick highest-scoring candidate
-        if frozen_candidates:
-            answer = frozen_candidates[0][0]
+        chosen_text, source_pid = candidate_list[idx]
+        snippet = snippet_map.get(source_pid, "")
+
+        # Provenance check (normalization-consistent containment)
+        if _normalize_text_unicode(chosen_text) in _normalize_text_unicode(snippet):
             if debug:
-                print(f"[CSS-BIND] Fallback to highest-scoring: '{answer}'")
-            return answer
-        return None
+                print(f"[CSS-BIND] idx={idx} conf={conf:.2f} -> {chosen_text} (pid={source_pid})")
+            return chosen_text
 
-    # Get selected candidate
-    selected_text, selected_score, selected_pid = frozen_candidates[index]
-
-    if debug:
-        print(f"[CSS-BIND] Selected index {index}: '{selected_text}'")
-
-    # Step 3: Verify it's verbatim in passage
-    passage_map = {p.get("pid", ""): p for p in hop1_passages}
-    verified = False
-
-    if selected_pid and selected_pid in passage_map:
-        passage_text = passage_map[selected_pid].get("text", "")
-        if _find_exact_substring(passage_text, selected_text) is not None:
-            verified = True
-    else:
-        # Try all passages
-        for p in hop1_passages:
-            if _find_exact_substring(p.get("text", ""), selected_text) is not None:
-                verified = True
-                break
-
-    if not verified:
+    except Exception as ex:
         if debug:
-            print(f"[CSS-BIND] VERIFY FAILED: '{selected_text}' not found verbatim")
-        return None
+            print(f"[CSS-BIND] Failed: {ex}")
 
-    if debug:
-        print(f"[CSS-BIND] Accepted: '{selected_text}'")
-
-    return selected_text
-
+    return None
 
 def build_inner_question_from_facet(facet: Dict[str, Any]) -> str:
     """
