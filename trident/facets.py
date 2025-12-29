@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .relation_schema import RelationRegistry, get_default_registry
+
 try:
     import spacy
 except Exception:
@@ -61,6 +63,9 @@ def _normalize_relation_predicate(pred: str) -> str:
     return pred or "is related to"
 
 
+_RELATION_REGISTRY: RelationRegistry = get_default_registry()
+
+
 def _normalize_relation_schema(template: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize relation facet schema to a consistent contract.
 
@@ -78,6 +83,23 @@ def _normalize_relation_schema(template: Dict[str, Any]) -> Dict[str, Any]:
     # Preserve legacy hop detection while defaulting to provided value when available
     if hop is None and tpl.get("compositional") and tpl.get("bridge_entity"):
         hop = 2
+
+    # Resolve canonical relation schema using the public allowlist (Wikidata-style)
+    if relation_kind:
+        tpl.setdefault("raw_relation_kind", relation_kind)
+    spec = _RELATION_REGISTRY.lookup(relation_kind) or _RELATION_REGISTRY.lookup(predicate)
+
+    if spec:
+        tpl.setdefault("relation_pid", spec.pid)
+        tpl["relation_kind"] = spec.name  # Canonicalized name
+        tpl.setdefault("relation_label", spec.label)
+        tpl.setdefault("relation_schema_source", spec.schema_source)
+        tpl.setdefault("relation_schema_version", _RELATION_REGISTRY.version)
+        tpl.setdefault("subject_type", spec.subject_type)
+        tpl.setdefault("object_type", spec.object_type)
+        # Upgrade predicate to a schema alias when weak/empty
+        if not predicate or predicate.lower().strip() in {"is related to", "related to", "relation", "relate"}:
+            predicate = spec.default_predicate()
 
     tpl.update({
         "subject": subject,
@@ -108,7 +130,7 @@ def _normalize_relation_schema(template: Dict[str, Any]) -> Dict[str, Any]:
     if relation_kind:
         pred_clean = predicate.lower().strip()
         if not pred_clean or pred_clean in weak_predicates:
-            tpl["predicate"] = canonical_predicate.get(str(relation_kind).upper(), predicate)
+            tpl["predicate"] = canonical_predicate.get(str(relation_kind).upper(), tpl.get("predicate", predicate))
 
     return tpl
 

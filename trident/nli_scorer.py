@@ -21,6 +21,7 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from .facets import Facet, FacetType
 from .candidates import Passage
 from .config import NLIConfig
+from .relation_schema import get_default_registry
 
 @dataclass
 class NLIScore:
@@ -73,7 +74,7 @@ def _fuzzy_phrase_match(term: str, passage_norm: str, passage_tokens: set[str]) 
 
 # Deterministic, frozen relation keyword map used for predicate gating.
 # Changing this map changes the Tested-Set definition and must be versioned.
-RELATION_KEYWORDS: Dict[str, set[str]] = {
+_BASE_RELATION_KEYWORDS: Dict[str, set[str]] = {
     "DIRECTOR": {"director", "directed", "filmmaker", "helmed"},
     "BORN": {"born", "birth", "birthplace", "native"},
     "AWARD": {"award", "won", "prize", "winner", "nominated"},
@@ -89,20 +90,33 @@ RELATION_KEYWORDS: Dict[str, set[str]] = {
     "BIRTHPLACE": {"birthplace", "born", "raised", "grew"},
 }
 
+RELATION_REGISTRY = get_default_registry()
+RELATION_KEYWORDS: Dict[str, set[str]] = {
+    **_BASE_RELATION_KEYWORDS,
+    **{spec.name: spec.keyword_set() for spec in RELATION_REGISTRY.specs()},
+}
+
 # Versioned hashes for Tested-Set definition (normalizer + gate + keyword map)
 NORMALIZE_VERSION = "unicode_nfkc_nfkc_ws_v1"
-GATE_VERSION = "relation_gate_v1"
+GATE_VERSION = f"relation_gate_schema_v2_{RELATION_REGISTRY.version}"
 
 def _hash_relation_keywords() -> str:
     items = sorted((k, sorted(v)) for k, v in RELATION_KEYWORDS.items())
     flat = "|".join([f"{k}:{','.join(vals)}" for k, vals in items])
     return _sha1(flat)
 
-RELATION_KEYWORDS_HASH = _hash_relation_keywords()
+RELATION_KEYWORDS_HASH = _sha1(f"{RELATION_REGISTRY.keyword_hash()}|{_hash_relation_keywords()}")
 
 
-def _check_relation_keywords(kind: str, passage_norm: str, passage_tokens: set[str]) -> bool:
-    keywords = RELATION_KEYWORDS.get((kind or "").upper())
+def _check_relation_keywords(kind: str, passage_norm: str, passage_tokens: set[str], relation_pid: Optional[str] = None) -> bool:
+    # Prefer schema-backed keywords when available
+    keywords = set()
+    if relation_pid:
+        keywords = RELATION_REGISTRY.keywords_for(relation_pid)
+    if not keywords and kind:
+        keywords = RELATION_REGISTRY.keywords_for(kind)
+    if not keywords:
+        keywords = RELATION_KEYWORDS.get((kind or "").upper(), set())
     if not keywords:
         return False
     for kw in keywords:
@@ -267,6 +281,7 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         s_raw = str(tpl.get("subject", ""))
         o_raw = str(tpl.get("object", ""))
         predicate = str(tpl.get("predicate", ""))
+        relation_pid = str(tpl.get("relation_pid", "") or "") or None
 
         relation_kind = (
             tpl.get("scoring_relation_kind")
@@ -298,8 +313,8 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
 
         # Predicate constraint
         predicate_ok = False
-        if relation_kind:
-            predicate_ok = _check_relation_keywords(relation_kind, passage_norm, passage_tokens)
+        if relation_kind or relation_pid:
+            predicate_ok = _check_relation_keywords(relation_kind, passage_norm, passage_tokens, relation_pid=relation_pid)
         if not predicate_ok and predicate:
             predicate_ok = _fuzzy_phrase_match(predicate, passage_norm, passage_tokens)
 

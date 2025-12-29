@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import string
@@ -56,7 +57,9 @@ from .chain_builder import (
     keyword_route_relation,
     route_relation,
     KNOWN_RELATION_TYPES,
+    _extract_first_json_object,
 )
+from .relation_schema import get_default_registry
 
 
 @dataclass
@@ -407,6 +410,109 @@ class TridentPipeline:
         self.score_cache: Dict[Tuple[str, str, str], float] = {}
         self.retrieval_cache: Dict[str, RetrievalResult] = {}
 
+        self._relation_registry = get_default_registry()
+
+    def _apply_relation_planner(self, question: str, facets: List[Facet]) -> List[Facet]:
+        """Inject schema-bound relation facets using an LLM planner when needed.
+
+        The planner is query-only: it chooses normalized relations from the
+        allowlisted schema and never scores evidence. Existing relation facets
+        are canonicalized to the registry (pid + keywords) so gating remains
+        deterministic and reproducible.
+        """
+
+        registry = self._relation_registry
+        updated: List[Facet] = []
+        has_relation = False
+
+        # First, canonicalize existing relation facets to the registry
+        for facet in facets:
+            if facet.facet_type == FacetType.RELATION:
+                has_relation = True
+                tpl = dict(facet.template or {})
+                spec = registry.lookup(
+                    tpl.get("relation_pid")
+                    or tpl.get("relation_kind")
+                    or tpl.get("predicate")
+                )
+                if spec:
+                    tpl.setdefault("relation_pid", spec.pid)
+                    tpl["relation_kind"] = spec.name
+                    tpl.setdefault("predicate", tpl.get("predicate") or spec.default_predicate())
+                    tpl.setdefault("relation_schema_source", spec.schema_source)
+                    tpl.setdefault("relation_schema_version", registry.version)
+                    tpl.setdefault("subject_type", tpl.get("subject_type") or spec.subject_type)
+                    tpl.setdefault("object_type", tpl.get("object_type") or spec.object_type)
+                    updated.append(
+                        Facet(
+                            facet_id=facet.facet_id,
+                            facet_type=facet.facet_type,
+                            template=tpl,
+                            weight=facet.weight,
+                            metadata=facet.metadata,
+                            required=facet.required,
+                        )
+                    )
+                    continue
+            updated.append(facet)
+
+        facets = updated
+        if has_relation or self.llm is None:
+            return facets
+
+        # LLM semantic planner: map question -> normalized relation facets
+        allowed_relations = registry.all_names()
+        prompt = (
+            "You are a semantic planner."
+            " Parse the question and emit required facets using only the"
+            " allowed relations. JSON ONLY. No code fences, no explanations.\n"
+            "Question: " + question + "\n"
+            "Allowed relations: " + ", ".join(allowed_relations) + "\n"
+            "Return JSON with fields: answer_type (string) and required_facets"
+            " (list of objects with facet_type, relation, subject, object_type,"
+            " required)."
+        )
+
+        try:
+            raw = self.llm.generate(prompt, temperature=0.0, max_new_tokens=256)
+            raw_text = raw.text if hasattr(raw, "text") else str(raw)
+            parsed = json.loads(_extract_first_json_object(raw_text))
+        except Exception:
+            return facets
+
+        required = parsed.get("required_facets") or []
+        next_idx = sum(1 for f in facets if f.facet_type == FacetType.RELATION)
+        for idx, fac in enumerate(required):
+            if str(fac.get("facet_type", "")).upper() != "RELATION":
+                continue
+            rel_name = str(fac.get("relation") or "").upper()
+            spec = registry.lookup(rel_name)
+            if not spec:
+                continue
+            subject = fac.get("subject") or ""
+            tpl = {
+                "subject": subject,
+                "predicate": spec.default_predicate(),
+                "relation_kind": spec.name,
+                "relation_pid": spec.pid,
+                "relation_schema_source": spec.schema_source,
+                "relation_schema_version": registry.version,
+                "subject_type": fac.get("subject_type") or spec.subject_type,
+                "object_type": fac.get("object_type") or spec.object_type,
+            }
+            facets.append(
+                Facet(
+                    facet_id=f"relation_planned_{next_idx + idx}",
+                    facet_type=FacetType.RELATION,
+                    template=tpl,
+                    weight=1.0,
+                    metadata={"planned": True},
+                    required=bool(fac.get("required", True)),
+                )
+            )
+
+        return facets
+
     def process_query(
         self,
         query: str,
@@ -423,6 +529,9 @@ class TridentPipeline:
 
         # Step 1: Facet mining
         facets = self.facet_miner.extract_facets(query, supporting_facts)
+
+        # Canonicalize or infer relation facets using the schema-bound planner
+        facets = self._apply_relation_planner(query, facets)
 
         # Mark RELATION facets as required for WH-questions
         # This ensures that the key relation must be certified for valid answers
