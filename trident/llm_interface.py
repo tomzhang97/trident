@@ -11,7 +11,6 @@ from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     BitsAndBytesConfig,
-    GenerationConfig,
     set_seed
 )
 
@@ -68,14 +67,9 @@ class LLMInterface:
             low_cpu_mem_usage=True
         )
         
-        # Generation config
-        self.generation_config = GenerationConfig(
-            temperature=temperature if temperature > 0 else 1e-7,
-            do_sample=temperature > 0,
-            max_new_tokens=max_new_tokens,
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id
-        )
+        # Default generation parameters (sampling toggled per call)
+        self.default_max_new_tokens = max_new_tokens
+        self.default_temperature = temperature
     
     def generate(
         self, 
@@ -97,22 +91,28 @@ class LLMInterface:
         
         input_length = inputs['input_ids'].shape[1]
         
-        # Update generation config if needed
-        gen_config = self.generation_config
-        if max_new_tokens is not None:
-            gen_config.max_new_tokens = max_new_tokens
-        if temperature is not None:
-            gen_config.temperature = temperature if temperature > 0 else 1e-7
-            gen_config.do_sample = temperature > 0
-        
+        # Resolve generation parameters
+        max_tokens = max_new_tokens if max_new_tokens is not None else self.default_max_new_tokens
+        temp = temperature if temperature is not None else self.default_temperature
+        do_sample = temp is not None and temp > 0
+
+        generation_kwargs = dict(
+            **inputs,
+            max_new_tokens=max_tokens,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+            do_sample=do_sample,
+            output_scores=return_logprobs,
+            return_dict_in_generate=True,
+        )
+
+        # Only pass temperature when sampling is enabled
+        if do_sample:
+            generation_kwargs["temperature"] = temp
+
         # Generate
         with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                generation_config=gen_config,
-                output_scores=return_logprobs,
-                return_dict_in_generate=True
-            )
+            outputs = self.model.generate(**generation_kwargs)
         
         # Decode output
         generated_ids = outputs.sequences[0][input_length:]

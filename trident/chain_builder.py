@@ -73,8 +73,8 @@ def _normalize_text_unicode(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
 
     # Curly quotes -> straight
-    text = text.replace("'", "'").replace("'", "'")
-    text = text.replace(""", '"').replace(""", '"')
+    text = text.replace("“", '"').replace("”", '"')
+    text = text.replace("’", "'").replace("‘", "'")
 
     # Dashes -> hyphen
     text = text.replace("–", "-").replace("—", "-")
@@ -175,11 +175,7 @@ JSON:"""
 
     # Parse JSON response
     try:
-        json_match = re.search(r'\{[^{}]*\}', raw_text, flags=re.DOTALL)
-        if json_match:
-            out = json_module.loads(json_match.group(0))
-        else:
-            out = json_module.loads(raw_text.strip())
+        out = json_module.loads(_extract_first_json_object(raw_text))
     except Exception as e:
         if debug:
             print(f"[LLM-ROUTER] Parse error: {e}")
@@ -1304,7 +1300,34 @@ def _find_exact_substring(haystack: str, needle: str) -> Optional[Tuple[int, int
     if i >= 0:
         return (i, i + len(needle))
 
+    # Normalized unicode fallback (handles dash/quote variants)
+    hay_norm = _normalize_text_unicode(haystack)
+    needle_norm = _normalize_text_unicode(needle)
+    if needle_norm:
+        j = hay_norm.find(needle_norm)
+        if j >= 0:
+            return (j, j + len(needle_norm))
+
     return None
+
+
+def _extract_first_json_object(text: str) -> str:
+    """Extract the first balanced JSON object from a string."""
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("No JSON object found")
+
+    depth = 0
+    for idx in range(start, len(text)):
+        char = text[idx]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : idx + 1]
+
+    raise ValueError("Unbalanced JSON braces in text")
 
 
 def _find_fuzzy_substring(haystack: str, needle: str, max_distance: int = 2) -> Optional[Tuple[int, int, str]]:
@@ -1419,12 +1442,7 @@ JSON:"""
 
     # Parse JSON response
     try:
-        # Try to find JSON object in response
-        json_match = re.search(r'\{[^{}]*\}', raw_text, flags=re.DOTALL)
-        if json_match:
-            out = json_module.loads(json_match.group(0))
-        else:
-            out = json_module.loads(raw_text.strip())
+        out = json_module.loads(_extract_first_json_object(raw_text))
     except Exception as e:
         if debug:
             print(f"[CSS] JSON parse failed: {e}")
@@ -1963,11 +1981,7 @@ JSON:"""
 
     # Parse JSON response
     try:
-        json_match = re.search(r'\{[^{}]*\}', raw_text, flags=re.DOTALL)
-        if json_match:
-            out = json_module.loads(json_match.group(0))
-        else:
-            out = json_module.loads(raw_text.strip())
+        out = json_module.loads(_extract_first_json_object(raw_text))
     except Exception as e:
         if debug:
             print(f"[CONSTRAINED] JSON parse error: {e}")
@@ -2459,11 +2473,7 @@ JSON:"""
 
     # Parse JSON response
     try:
-        json_match = re.search(r'\{[^{}]*\}', raw_text, flags=re.DOTALL)
-        if json_match:
-            out = json_module.loads(json_match.group(0))
-        else:
-            out = json_module.loads(raw_text.strip())
+        out = json_module.loads(_extract_first_json_object(raw_text))
     except Exception as e:
         if debug:
             print(f"[CSS-BIND] JSON parse error: {e}")
