@@ -38,6 +38,9 @@ class ReliabilityCalibrator:
         self.use_mondrian = use_mondrian
         self.version = version
         self.conformal_calibrator = None
+        # Compatibility shim for legacy reliability tables and bin statistics
+        self.tables: Dict[str, List[Tuple[float, float]]] = {}
+        self.bins: Dict[str, Any] = {}
 
     def set_conformal_calibrator(self, calibrator):
         self.conformal_calibrator = calibrator
@@ -72,9 +75,19 @@ class ReliabilityCalibrator:
                         return self.conformal_calibrator.get_p_value(score, canon, text_length)
                     except KeyError:
                         pass
-                
+
                 # 2. Global Fallback (Fail-Closed)
                 return 1.0
+
+        # Legacy reliability tables fallback (step function on score)
+        canon = self._get_canonical_key(facet_type)
+        table = self.tables.get(canon)
+        if table:
+            sorted_table = sorted(table, key=lambda t: t[0])
+            for threshold, pval in sorted_table:
+                if score <= threshold:
+                    return pval
+            return sorted_table[-1][1]
 
         return 1.0
 
@@ -82,7 +95,9 @@ class ReliabilityCalibrator:
         data = {
             "version": self.version,
             "use_mondrian": self.use_mondrian,
-            "conformal": self.conformal_calibrator.to_dict() if self.conformal_calibrator else None
+            "conformal": self.conformal_calibrator.to_dict() if self.conformal_calibrator else None,
+            "tables": self.tables,
+            "bins": self.bins,
         }
         with open(path, "w") as f:
             json.dump(_to_plain(data), f, indent=2)
@@ -98,6 +113,8 @@ class ReliabilityCalibrator:
         )
         if data.get("conformal"):
             cal.conformal_calibrator = SelectionConditionalCalibrator.from_dict(data["conformal"])
+        cal.tables = data.get("tables", {}) or {}
+        cal.bins = data.get("bins", {}) or {}
         return cal
 
 # --- INNER CALIBRATOR ---
