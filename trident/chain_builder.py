@@ -1563,8 +1563,29 @@ def extract_candidates(
                         1 for pp in winner_passages
                         if name.lower() in (pp.get("text") or "").lower()
                     )
-                    if name not in candidates or support > candidates[name][0]:
-                        candidates[name] = (support, pid)
+                    # MULTI-TOKEN BONUS: Prefer longer spans (more specific)
+                    # Add 0.5 per token to favor multi-token names over single tokens
+                    token_count = len(name.split())
+                    length_bonus = 0.5 * (token_count - 1)
+                    adjusted_support = support + length_bonus
+                    if name not in candidates or adjusted_support > candidates[name][0]:
+                        candidates[name] = (adjusted_support, pid)
+
+        # SUBSTRING DEDUPLICATION: Remove single-token candidates that are
+        # substrings of higher-scoring multi-token candidates
+        if len(candidates) > 1:
+            to_remove = set()
+            sorted_cands = sorted(candidates.items(), key=lambda x: x[1][0], reverse=True)
+            for i, (name1, _) in enumerate(sorted_cands):
+                name1_lower = name1.lower()
+                for name2, _ in sorted_cands[i+1:]:
+                    name2_lower = name2.lower()
+                    # If shorter name is a substring of longer name, mark for removal
+                    if len(name2_lower) < len(name1_lower) and name2_lower in name1_lower:
+                        to_remove.add(name2)
+            for name in to_remove:
+                if name in candidates:
+                    del candidates[name]
 
     # For PLACE questions
     elif question_type.expected_type == "PLACE":
@@ -1635,18 +1656,45 @@ def extract_candidates(
         entity_pattern = re.compile(
             r'\b([A-Z][a-zA-ZÀ-ÿ\-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ\-]+){0,4})\b'
         )
+        # Common stop-words to filter out
+        stop_words = {'The', 'A', 'An', 'He', 'She', 'They', 'It', 'His', 'Her',
+                      'Their', 'Was', 'Were', 'Is', 'Are', 'Has', 'Had', 'Have',
+                      'This', 'That', 'These', 'Those', 'In', 'On', 'At', 'By'}
         for p in winner_passages:
             text = p.get("text") or ""
             pid = p.get("pid", "")
             for match in entity_pattern.finditer(text):
                 entity = match.group(1).strip()
+                # Skip single-token stop-words
+                if entity in stop_words:
+                    continue
                 if len(entity) >= 2:
                     support = sum(
                         1 for pp in winner_passages
                         if entity.lower() in (pp.get("text") or "").lower()
                     )
-                    if entity not in candidates or support > candidates[entity][0]:
-                        candidates[entity] = (support, pid)
+                    # MULTI-TOKEN BONUS: Prefer longer spans (more specific)
+                    token_count = len(entity.split())
+                    length_bonus = 0.5 * (token_count - 1)
+                    adjusted_support = support + length_bonus
+                    if entity not in candidates or adjusted_support > candidates[entity][0]:
+                        candidates[entity] = (adjusted_support, pid)
+
+        # SUBSTRING DEDUPLICATION: Remove single-token candidates that are
+        # substrings of higher-scoring multi-token candidates
+        if len(candidates) > 1:
+            to_remove = set()
+            sorted_cands = sorted(candidates.items(), key=lambda x: x[1][0], reverse=True)
+            for i, (name1, _) in enumerate(sorted_cands):
+                name1_lower = name1.lower()
+                for name2, _ in sorted_cands[i+1:]:
+                    name2_lower = name2.lower()
+                    # If shorter name is a substring of longer name, mark for removal
+                    if len(name2_lower) < len(name1_lower) and name2_lower in name1_lower:
+                        to_remove.add(name2)
+            for name in to_remove:
+                if name in candidates:
+                    del candidates[name]
 
     # Sort by support score and return top candidates
     sorted_candidates = sorted(
