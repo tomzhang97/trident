@@ -80,27 +80,56 @@ class WorkerResult:
 
 
 def _normalize(text: str) -> str:
-    """Normalize text for EM/F1 calculation."""
+    """Normalize text for EM/F1 calculation.
+
+    Follows official 2WikiMultiHop evaluation order:
+    1. Remove articles (a, an, the)
+    2. Lowercase
+    3. Remove punctuation
+    4. Normalize whitespace
+    """
+    # Remove articles first (case-insensitive)
+    text = re.sub(r'\b(a|an|the)\b', ' ', text, flags=re.IGNORECASE)
+    # Lowercase
     text = text.lower().strip()
-    # remove punctuation
+    # Remove punctuation
     text = text.translate(str.maketrans("", "", string.punctuation))
-    # remove articles
-    text = re.sub(r'\b(a|an|the)\b', ' ', text)
-    # normalize whitespace
+    # Normalize whitespace
     text = ' '.join(text.split())
     return text
 
 def _f1(pred: str, gt: str) -> float:
-    """Calculate F1 score between prediction and ground truth."""
-    pred_tokens = _normalize(pred).split()
-    gt_tokens = _normalize(gt).split()
-    common = set(pred_tokens) & set(gt_tokens)
+    """Calculate F1 score between prediction and ground truth.
+
+    Follows official 2WikiMultiHop evaluation:
+    - Special case: if either is yes/no/noanswer, require exact match
+    - Otherwise compute token overlap F1 using Counter (not set!)
+    """
+    from collections import Counter
+
+    pred_norm = _normalize(pred)
+    gt_norm = _normalize(gt)
+
+    # Special case for yes/no/noanswer
+    special_answers = {'yes', 'no', 'noanswer'}
+    if pred_norm in special_answers or gt_norm in special_answers:
+        return float(pred_norm == gt_norm)
+
+    pred_tokens = pred_norm.split()
+    gt_tokens = gt_norm.split()
+
     if not pred_tokens or not gt_tokens:
         return 0.0
-    if not common:
+
+    # Use Counter for proper handling of duplicate tokens (NOT set!)
+    common = Counter(pred_tokens) & Counter(gt_tokens)
+    num_same = sum(common.values())
+
+    if num_same == 0:
         return 0.0
-    prec = len(common) / len(pred_tokens)
-    rec = len(common) / len(gt_tokens)
+
+    prec = num_same / len(pred_tokens)
+    rec = num_same / len(gt_tokens)
     return 2 * prec * rec / (prec + rec)
 
 
@@ -773,8 +802,14 @@ class ExperimentRunner:
         abstained_count = 0
 
         for result in valid_results:
+            # Abstained questions count as 0 EM/F1 (don't skip!)
             if result.get('abstained'):
                 abstained_count += 1
+                em_scores.append(0.0)
+                f1_scores.append(0.0)
+                # Still track tokens/latency for abstained
+                tokens_used.append(result.get('tokens_used', 0))
+                latencies.append(result.get('latency_ms', 0))
                 continue
 
             pred = result.get('prediction')
@@ -789,6 +824,10 @@ class ExperimentRunner:
                     best_f1 = max(best_f1, f1)
                 em_scores.append(best_em)
                 f1_scores.append(best_f1)
+            else:
+                # No prediction or no ground truth - count as 0
+                em_scores.append(0.0)
+                f1_scores.append(0.0)
 
             tokens_used.append(result.get('tokens_used', 0))
             latencies.append(result.get('latency_ms', 0))
@@ -940,6 +979,8 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
                 cmd.extend(["--config_family", args.config_family])
             if args.load_in_8bit:
                 cmd.append("--load_in_8bit")
+            if hasattr(args, 'calibration_path') and args.calibration_path:
+                cmd.extend(["--calibration_path", args.calibration_path])
 
             # Per-process environment: pin to exactly one GPU
             env = os.environ.copy()
@@ -997,8 +1038,12 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
     latencies = []
 
     for result in all_results:
+        # Abstained/error questions count as 0 EM/F1 (don't skip!)
         if result.get('abstained') or 'error' in result:
             abstained += 1
+            em_scores.append(0.0)
+            f1_scores.append(0.0)
+            tokens_used.append(result.get('tokens_used', 0))
             continue
 
         pred = result.get('prediction', '')
@@ -1008,6 +1053,10 @@ def run_multi_gpu(args: argparse.Namespace) -> None:
             best_f1 = max(_f1(pred, gt) for gt in gts)
             em_scores.append(best_em)
             f1_scores.append(best_f1)
+        else:
+            # No prediction or no ground truth - count as 0
+            em_scores.append(0.0)
+            f1_scores.append(0.0)
 
         tokens_used.append(result.get('tokens_used', 0))
         metrics = result.get('metrics', {})
