@@ -1,6 +1,16 @@
 """Tests for calibration version metadata handling."""
 
-from trident.calibration import ReliabilityCalibrator
+import importlib.util
+
+import pytest
+
+HAS_NUMPY = importlib.util.find_spec("numpy") is not None
+pytestmark = pytest.mark.skipif(not HAS_NUMPY, reason="numpy is required for calibrator imports")
+
+if HAS_NUMPY:
+    from trident.calibration import ReliabilityCalibrator
+else:  # pragma: no cover - placeholders for type checking
+    ReliabilityCalibrator = None  # type: ignore
 
 
 def test_calibrator_load_preserves_version(tmp_path):
