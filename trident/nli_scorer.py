@@ -356,8 +356,15 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
             "MOTHER", "FATHER", "PARENT", "CHILD", "SPOUSE", "NATIONALITY", "BIRTHPLACE"
         }
 
-        # Check if this is a hop-2 compositional facet
-        is_hop2 = tpl.get("hop") == 2 or tpl.get("compositional", False)
+        # ================================================================
+        # STRUCTURAL hop2 detection (C1 fix)
+        # ================================================================
+        # CRITICAL: Only check "hop" == 2 from the template, NOT "compositional".
+        # "compositional" is True for BOTH hop-1 and hop-2, but only hop-2 facets
+        # should use the stricter entity-anchored gate.
+        # Hop-1 compositional facets like "Who is the director of X?" have
+        # subject="Who" and should be handled by the WH-subject branch.
+        is_hop2 = tpl.get("hop") == 2
 
         # Determine gate policy for logging
         gate_policy = "STRICT"

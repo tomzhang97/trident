@@ -1485,6 +1485,20 @@ def detect_question_type(question: str) -> QuestionType:
     return QuestionType(category="other", expected_type="OTHER")
 
 
+def _normalize_for_dedup(s: str) -> str:
+    """
+    E2 FIX: Normalize string for substring deduplication.
+
+    Handles punctuation variations so "D'Arcy Coulson" and "Darcy Coulson" compare correctly.
+    """
+    import re
+    # Replace apostrophes, quotes, hyphens, periods with space
+    s = re.sub(r"[\s''\.\-]+", " ", s.strip().lower())
+    # Collapse multiple spaces
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
 def extract_candidates(
     winner_passages: List[Dict[str, Any]],
     question_type: QuestionType,
@@ -1548,8 +1562,11 @@ def extract_candidates(
 
     # For PERSON questions
     if question_type.expected_type == "PERSON":
+        # E1 FIX: Punctuation-aware pattern for apostrophes, initials, etc.
+        # Handles: D'Arcy, O'Connor, J.K. Rowling
+        # Includes common name prefixes: de, van, von, la, el, al, bin, ibn
         person_pattern = re.compile(
-            r'\b([A-Z][a-zA-ZÀ-ÿ\']+(?:\s+(?:de|van|von|la|el|al|bin|ibn)?[A-Z][a-zA-ZÀ-ÿ\']+){0,4})\b'
+            r"\b([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+(?:de|van|von|la|el|al|bin|ibn)?[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,5})\b"
         )
         for p in winner_passages:
             text = p.get("text") or ""
@@ -1573,15 +1590,16 @@ def extract_candidates(
 
         # SUBSTRING DEDUPLICATION: Remove single-token candidates that are
         # substrings of higher-scoring multi-token candidates
+        # E2 FIX: Use normalization so punctuation variants compare correctly
         if len(candidates) > 1:
             to_remove = set()
             sorted_cands = sorted(candidates.items(), key=lambda x: x[1][0], reverse=True)
             for i, (name1, _) in enumerate(sorted_cands):
-                name1_lower = name1.lower()
+                name1_norm = _normalize_for_dedup(name1)
                 for name2, _ in sorted_cands[i+1:]:
-                    name2_lower = name2.lower()
+                    name2_norm = _normalize_for_dedup(name2)
                     # If shorter name is a substring of longer name, mark for removal
-                    if len(name2_lower) < len(name1_lower) and name2_lower in name1_lower:
+                    if len(name2_norm) < len(name1_norm) and name2_norm in name1_norm:
                         to_remove.add(name2)
             for name in to_remove:
                 if name in candidates:
@@ -1653,8 +1671,11 @@ def extract_candidates(
 
     # For ENTITY or OTHER: extract all capitalized spans
     else:
+        # E1 FIX: Punctuation-aware pattern for apostrophes, initials, etc.
+        # Handles: D'Arcy, O'Connor, J.K. Rowling, C.S. Lewis
+        # Increased max tokens from 4 to 6 for longer entity names
         entity_pattern = re.compile(
-            r'\b([A-Z][a-zA-ZÀ-ÿ\-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ\-]+){0,4})\b'
+            r"\b([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,6})\b"
         )
         # Common stop-words to filter out
         stop_words = {'The', 'A', 'An', 'He', 'She', 'They', 'It', 'His', 'Her',
@@ -1682,15 +1703,16 @@ def extract_candidates(
 
         # SUBSTRING DEDUPLICATION: Remove single-token candidates that are
         # substrings of higher-scoring multi-token candidates
+        # E2 FIX: Use normalization so punctuation variants compare correctly
         if len(candidates) > 1:
             to_remove = set()
             sorted_cands = sorted(candidates.items(), key=lambda x: x[1][0], reverse=True)
             for i, (name1, _) in enumerate(sorted_cands):
-                name1_lower = name1.lower()
+                name1_norm = _normalize_for_dedup(name1)
                 for name2, _ in sorted_cands[i+1:]:
-                    name2_lower = name2.lower()
+                    name2_norm = _normalize_for_dedup(name2)
                     # If shorter name is a substring of longer name, mark for removal
-                    if len(name2_lower) < len(name1_lower) and name2_lower in name1_lower:
+                    if len(name2_norm) < len(name1_norm) and name2_norm in name1_norm:
                         to_remove.add(name2)
             for name in to_remove:
                 if name in candidates:
@@ -1702,6 +1724,21 @@ def extract_candidates(
         key=lambda x: x[1],
         reverse=True
     )
+
+    # E3 FIX: Check for low-quality candidates and return empty to trigger fallback
+    # For PERSON/ENTITY types, if all candidates are single-token, it's likely noise
+    if question_type.expected_type in ("PERSON", "ENTITY"):
+        if sorted_candidates:
+            max_token_count = max(len(c[0].split()) for c in sorted_candidates)
+            if max_token_count < 2:
+                # All candidates are single tokens - likely low quality
+                # Return empty to trigger CSS fallback instead of picking noise
+                import os
+                debug = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
+                if debug:
+                    print(f"[EXTRACT] Low-quality candidates: all single-token, returning empty")
+                    print(f"[EXTRACT] Would have returned: {[c[0] for c in sorted_candidates[:5]]}")
+                return []
 
     return sorted_candidates[:max_candidates]
 

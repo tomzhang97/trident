@@ -587,9 +587,11 @@ class TridentPipeline:
             # ================================================================
             # PRIORITY 0: Constrained Candidate Selection (FACET-TARGETED)
             # ================================================================
-            # CRITICAL: Extract candidates from ANSWER-FACET winning passages only.
-            # This ensures we pick from passages that won the answer-determining facet,
-            # not just any passage that happened to certify an ENTITY facet.
+            # CRITICAL: Only run constrained selection when ANSWER facets are certified.
+            # ANSWER facets are RELATION/TEMPORAL/NUMERIC - they determine the final answer.
+            # ENTITY facets only confirm the question subject exists, NOT the answer.
+            # Running constrained selection from ENTITY-only evidence produces wrong answers.
+            skipped_constrained_reason = ""
             if certificates:
                 # Get passages that won the ANSWER facet (RELATION/TEMPORAL/NUMERIC)
                 # NOT just any winning passage (which may only have ENTITY facet)
@@ -600,28 +602,39 @@ class TridentPipeline:
                     facets=facet_dicts
                 )
 
-                # Also get all winner passages for fallback
+                # Also get all winner passages for CSS fallback
                 winner_passages = get_winner_passages_only(
                     certificates,
                     result['selected_passages']
                 )
 
+                # Build facet type lookup for metrics
+                facet_type_by_id = {f.get("facet_id"): f.get("facet_type") for f in facet_dicts}
+
+                # Check if any answer facets were actually certified
+                # Answer facets are non-ENTITY types that can determine the final answer
+                answer_facet_types = {"RELATION", "TEMPORAL", "NUMERIC", "COMPARISON", "BRIDGE_HOP"}
+                has_answer_facet_certified = any(
+                    facet_type_by_id.get(c.get("facet_id")) in answer_facet_types
+                    for c in certificates
+                )
+
                 if debug_chain or debug_constrained:
                     print(f"\n[CONSTRAINED] Attempting FACET-TARGETED Candidate Selection")
                     print(f"  Answer facets: {answer_facet_ids}")
+                    print(f"  Has answer facet certified: {has_answer_facet_certified}")
                     print(f"  Answer passages: {len(answer_passages)} (from answer facets)")
                     print(f"  All winner passages: {len(winner_passages)}")
                     for wp in answer_passages[:3]:
                         print(f"    - {wp.get('pid', '')[:12]}... ({len(wp.get('text', ''))} chars)")
 
-                # Use answer-facet passages if available, else fall back to all winners
-                constrained_passages = answer_passages if answer_passages else winner_passages
-
-                if constrained_passages:
+                # CRITICAL FIX: Only run constrained selection if answer facets are certified
+                # Do NOT fall back to ENTITY-only winner passages - that produces wrong answers
+                if has_answer_facet_certified and answer_passages:
                     constrained_result = constrained_span_select(
                         llm=self.llm,
                         question=query,
-                        winner_passages=constrained_passages,
+                        winner_passages=answer_passages,
                         max_candidates=10,
                         max_chars_per_passage=600
                     )
@@ -651,6 +664,12 @@ class TridentPipeline:
                             print(f"[CONSTRAINED] Failed: {constrained_result.reason}")
                             if constrained_result.candidates:
                                 print(f"[CONSTRAINED] Had {len(constrained_result.candidates)} candidates")
+                else:
+                    # No answer facets certified - skip constrained selection entirely
+                    skipped_constrained_reason = "no_answer_facets_certified"
+                    if debug_chain or debug_constrained:
+                        certified_types = [facet_type_by_id.get(c.get("facet_id")) for c in certificates]
+                        print(f"[CONSTRAINED] Skipped: only {certified_types} certified, no answer facets")
 
             # ================================================================
             # PRIORITY 1: Certified Span Selection (CSS) - fallback
