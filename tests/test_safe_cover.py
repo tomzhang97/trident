@@ -1,21 +1,10 @@
 """Tests for Safe-Cover algorithm."""
 
-import importlib.util
-
-import pytest
-
-HAS_NUMPY = importlib.util.find_spec("numpy") is not None
-pytestmark = pytest.mark.skipif(not HAS_NUMPY, reason="numpy is required for Safe-Cover")
-
-if HAS_NUMPY:
-    from trident.calibration import ReliabilityCalibrator
-    from trident.candidates import Passage
-    from trident.config import FacetConfig, SafeCoverConfig
-    from trident.facets import Facet, FacetType
-    from trident.safe_cover import SafeCoverAlgorithm, AbstentionReason
-else:  # pragma: no cover - placeholders to satisfy type checkers when skipped
-    ReliabilityCalibrator = Passage = FacetConfig = SafeCoverConfig = None  # type: ignore
-    Facet = FacetType = SafeCoverAlgorithm = AbstentionReason = None  # type: ignore
+from trident.calibration import ReliabilityCalibrator
+from trident.candidates import Passage
+from trident.config import FacetConfig, SafeCoverConfig
+from trident.facets import Facet, FacetType
+from trident.safe_cover import SafeCoverAlgorithm, AbstentionReason
 
 
 def test_safe_cover_selects_passage_when_threshold_met():

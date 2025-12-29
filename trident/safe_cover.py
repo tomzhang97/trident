@@ -16,9 +16,14 @@ import hashlib
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Set, Tuple, Any
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-import numpy as np
+from statistics import mean
+
+try:  # Optional dependency; fall back to built-ins when unavailable
+    import numpy as np
+except ImportError:  # pragma: no cover - exercised in minimal environments
+    np = None
 
 from .candidates import Passage
 from .facets import Facet, FacetType
@@ -226,7 +231,11 @@ class SafeCoverAlgorithm:
             # Dict of split lists
             total = 0
             for value in bin_record.values():
-                if isinstance(value, (list, tuple, set, np.ndarray)):
+                array_types = (list, tuple, set)
+                if np is not None:
+                    array_types = array_types + (np.ndarray,)
+
+                if isinstance(value, array_types):
                     total += len(value)
             return total
 
@@ -235,7 +244,7 @@ class SafeCoverAlgorithm:
             return len(bin_record)
 
         # Numpy arrays can store negative examples as well
-        if isinstance(bin_record, np.ndarray):
+        if np is not None and isinstance(bin_record, np.ndarray):
             return int(bin_record.size)
 
         return 0
@@ -575,7 +584,7 @@ class SafeCoverAlgorithm:
                 effectiveness = len(newly_covered) / max(passage.cost, 1)
 
                 # Mean p-value for tie-breaking
-                mean_p = np.mean([
+                mean_p = mean([
                     p_values.get((pid, fid), 1.0)
                     for fid in newly_covered
                 ])

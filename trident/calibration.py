@@ -13,7 +13,12 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 from collections import defaultdict
 
-import numpy as np
+import statistics
+
+try:  # Optional dependency; algorithm still works with pure Python fallback
+    import numpy as np
+except ImportError:  # pragma: no cover - exercised in minimal environments
+    np = None
 
 logger = logging.getLogger(__name__)
 
@@ -23,10 +28,11 @@ def _to_plain(obj):
         return {k: _to_plain(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_to_plain(i) for i in obj]
-    if isinstance(obj, np.generic):
-        return obj.item()
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
+    if np is not None:
+        if isinstance(obj, np.generic):
+            return obj.item()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
     return obj
 
 # FIX: Top-level factory function for pickling support
@@ -142,7 +148,10 @@ class SelectionConditionalCalibrator:
             if self.use_mondrian:
                 lengths = [x["len"] for x in items]
                 if not lengths: continue
-                med_len = float(np.median(lengths))
+                if np is not None:
+                    med_len = float(np.median(lengths))
+                else:  # Fallback median without numpy
+                    med_len = float(statistics.median(lengths))
                 
                 short_neg = [x["s"] for x in items if x["len"] <= med_len and not x["y"]]
                 long_neg  = [x["s"] for x in items if x["len"] > med_len and not x["y"]]

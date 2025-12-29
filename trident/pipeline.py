@@ -8,7 +8,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple, Any
 
-import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModel
 

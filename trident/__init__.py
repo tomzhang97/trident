@@ -8,7 +8,6 @@ from .config import (
 )
 from .facets import Facet
 from .candidates import Passage
-from .pipeline import TridentPipeline
 
 __all__ = [
     "CalibrationConfig",
@@ -19,3 +18,11 @@ __all__ = [
     "SafeCoverConfig",
     "TridentPipeline",
 ]
+
+
+def __getattr__(name):  # pragma: no cover - simple lazy import hook
+    if name == "TridentPipeline":
+        from .pipeline import TridentPipeline
+
+        return TridentPipeline
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
