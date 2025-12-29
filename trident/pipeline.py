@@ -413,7 +413,11 @@ class TridentPipeline:
         self._relation_registry = get_default_registry()
 
     def _route_relation_kind(
-        self, question: str, facet: Facet, registry
+        self,
+        question: str,
+        facet: Facet,
+        registry,
+        metrics: Optional[Dict[str, int]] = None,
     ) -> Optional[Dict[str, str]]:
         """Use an LLM to classify a relation facet into the schema allowlist.
 
@@ -446,6 +450,9 @@ class TridentPipeline:
         ]
         prompt = "\n".join(prompt_lines)
 
+        if metrics is not None:
+            metrics["relation_router_calls"] = metrics.get("relation_router_calls", 0) + 1
+
         try:
             raw = self.llm.generate(prompt, temperature=0.0, max_new_tokens=160)
             raw_text = raw.text if hasattr(raw, "text") else str(raw)
@@ -460,9 +467,17 @@ class TridentPipeline:
         if anchor_policy not in {"ANY", "ALL"}:
             anchor_policy = "ANY"
 
+        if metrics is not None:
+            metrics["relation_router_success"] = metrics.get("relation_router_success", 0) + 1
+
         return {"relation_kind": rk, "anchor_policy": anchor_policy}
 
-    def _apply_relation_planner(self, question: str, facets: List[Facet]) -> List[Facet]:
+    def _apply_relation_planner(
+        self,
+        question: str,
+        facets: List[Facet],
+        metrics: Optional[Dict[str, int]] = None,
+    ) -> List[Facet]:
         """Inject schema-bound relation facets using an LLM planner when needed.
 
         The planner is query-only: it chooses normalized relations from the
@@ -486,7 +501,7 @@ class TridentPipeline:
                 )
                 # If no schema match, attempt LLM routing into the allowlist
                 if spec is None:
-                    routed = self._route_relation_kind(question, facet, registry)
+                    routed = self._route_relation_kind(question, facet, registry, metrics=metrics)
                     if routed:
                         tpl["relation_kind"] = routed["relation_kind"]
                         tpl["anchor_policy"] = routed.get("anchor_policy")
@@ -495,11 +510,16 @@ class TridentPipeline:
                     has_schema_relation = True
                     tpl.setdefault("relation_pid", spec.pid)
                     tpl["relation_kind"] = spec.name
+                    weak_predicates = {"is related to", "related to", "relation", "relate", ""}
+                    pred_clean = str(tpl.get("predicate") or "").strip().lower()
+                    if pred_clean in weak_predicates:
+                        tpl["predicate"] = spec.default_predicate()
                     tpl.setdefault("predicate", tpl.get("predicate") or spec.default_predicate())
                     tpl.setdefault("relation_schema_source", spec.schema_source)
                     tpl.setdefault("relation_schema_version", registry.version)
                     tpl.setdefault("subject_type", tpl.get("subject_type") or spec.subject_type)
                     tpl.setdefault("object_type", tpl.get("object_type") or spec.object_type)
+                    tpl.setdefault("anchor_policy", tpl.get("anchor_policy") or "ANY")
                     updated.append(
                         Facet(
                             facet_id=facet.facet_id,
@@ -568,6 +588,9 @@ class TridentPipeline:
                 )
             )
 
+        if metrics is not None and required:
+            metrics["relation_router_success"] = metrics.get("relation_router_success", 0) + len(required)
+
         return facets
 
     def process_query(
@@ -584,11 +607,13 @@ class TridentPipeline:
         # Track telemetry
         self.telemetry.start_query(query)
 
+        llm_call_metrics: Dict[str, int] = {}
+
         # Step 1: Facet mining
         facets = self.facet_miner.extract_facets(query, supporting_facts)
 
         # Canonicalize or infer relation facets using the schema-bound planner
-        facets = self._apply_relation_planner(query, facets)
+        facets = self._apply_relation_planner(query, facets, metrics=llm_call_metrics)
 
         # Mark RELATION facets as required for WH-questions
         # This ensures that the key relation must be certified for valid answers
@@ -766,7 +791,8 @@ class TridentPipeline:
                     certificates=certificates,
                     all_passages=result['selected_passages'],
                     facets=facet_dicts,
-                    llm=self.llm
+                    llm=self.llm,
+                    metrics=llm_call_metrics,
                 )
 
                 # Also get all winner passages for CSS fallback
@@ -1133,6 +1159,11 @@ class TridentPipeline:
             'num_certificates': len(certificates),
             'num_certified_facets': len(certified_facet_ids),
             'certified_facet_ids': list(certified_facet_ids),
+            # LLM call instrumentation
+            'llm_relation_router_calls': llm_call_metrics.get('relation_router_calls', 0),
+            'llm_relation_router_success': llm_call_metrics.get('relation_router_success', 0),
+            'llm_answer_ranker_calls': llm_call_metrics.get('llm_ranker_calls', 0),
+            'llm_answer_ranker_success': llm_call_metrics.get('llm_ranker_success', 0),
             # Certificate-aware reasoning metrics (fallback)
             'relation_winning_passage': relation_info['passage_id'] if relation_info else None,
             'relation_winning_pvalue': relation_info['p_value'] if relation_info else None,

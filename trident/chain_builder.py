@@ -164,7 +164,7 @@ Rules:
 JSON:"""
 
     try:
-        raw = llm.generate(prompt)
+        raw = llm.generate(prompt, temperature=0.0, max_new_tokens=96)
         raw_text = raw.text if hasattr(raw, 'text') else str(raw)
     except Exception as e:
         if debug:
@@ -1438,6 +1438,7 @@ Return exactly ONE JSON object with keys:
 
 Rules (hard constraints):
 1) Output must be JSON ONLY. Do NOT include code fences, commentary, or extra text.
+1b) The first character of your reply must be '{' and you must end immediately after the closing '}'.
 2) The answer MUST be copied exactly from the evidence text (verbatim).
 3) Copy the shortest complete answer span - usually a name, place, date, or short phrase.
 4) If you cannot find an exact answer substring, output: {{"pid": "", "answer": "", "confidence": 0}}
@@ -1450,7 +1451,7 @@ Evidence:
 JSON:"""
 
     try:
-        raw = llm.generate(prompt)
+        raw = llm.generate(prompt, temperature=0.0, max_new_tokens=160)
         raw_text = raw.text if hasattr(raw, 'text') else str(raw)
     except Exception as e:
         if debug:
@@ -2057,7 +2058,7 @@ JSON:"""
         print(f"[CONSTRAINED] {len(candidates)} candidates")
 
     try:
-        raw = llm.generate(prompt)
+        raw = llm.generate(prompt, temperature=0.0, max_new_tokens=160)
         raw_text = raw.text if hasattr(raw, 'text') else str(raw)
     except Exception as e:
         if debug:
@@ -2173,7 +2174,8 @@ def _llm_rank_answer_facets(
     llm,
     question: str,
     facet_descriptions: List[Dict[str, str]],
-    debug: bool = False
+    debug: bool = False,
+    metrics: Optional[Dict[str, int]] = None,
 ) -> List[str]:
     """Use LLM to rank answer facets without expanding the certified set."""
 
@@ -2200,6 +2202,9 @@ def _llm_rank_answer_facets(
     prompt_lines.append("JSON:")
     prompt = "\n".join(prompt_lines)
 
+    if metrics is not None:
+        metrics["llm_ranker_calls"] = metrics.get("llm_ranker_calls", 0) + 1
+
     try:
         raw = llm.generate(prompt, temperature=0.0, max_new_tokens=128)
         raw_text = raw.text if hasattr(raw, "text") else str(raw)
@@ -2210,6 +2215,8 @@ def _llm_rank_answer_facets(
         # Validate subset
         allow_set = set(allow_ids)
         ranked = [fid for fid in chosen if fid in allow_set]
+        if metrics is not None and ranked:
+            metrics["llm_ranker_success"] = metrics.get("llm_ranker_success", 0) + 1
         if debug:
             print(f"[LLM_RANKER] chosen={ranked}")
         return ranked
@@ -2225,6 +2232,7 @@ def get_answer_facet_passages(
     all_passages: List[Dict[str, Any]],
     facets: Optional[List[Dict[str, Any]]] = None,
     llm=None,
+    metrics: Optional[Dict[str, int]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str], str]:
     """
     Get passages that won the answer-determining facet(s).
@@ -2344,7 +2352,7 @@ def get_answer_facet_passages(
                         break
             facet_descriptions.append(desc)
 
-        ranked = _llm_rank_answer_facets(llm, question, facet_descriptions, debug)
+        ranked = _llm_rank_answer_facets(llm, question, facet_descriptions, debug, metrics=metrics)
         if ranked:
             remaining = [fid for fid in answer_facet_ids if fid not in ranked]
             answer_facet_ids = ranked + remaining
@@ -2674,7 +2682,7 @@ Evidence:
 JSON:"""
 
     try:
-        raw = llm.generate(prompt)
+        raw = llm.generate(prompt, temperature=0.0, max_new_tokens=96)
         raw_text = raw.text if hasattr(raw, 'text') else str(raw)
     except Exception as e:
         if debug:
