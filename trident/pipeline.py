@@ -513,11 +513,13 @@ class TridentPipeline:
         passage: Passage,
         metrics: Optional[Dict[str, int]] = None,
     ) -> Optional[float]:
-        """Use the LLM as a semantic judge for relation facets.
+        """Use the LLM as a semantic judge for relation facets with span verification.
 
         The LLM never expands evidence; it only decides whether the certified
         passage expresses the schema-bound relation required by the facet. The
-        output is a single JSON object {"match": bool, "confidence": float}.
+        output must be a single JSON object {"match": bool, "confidence": float,
+        "support_span": str}. The support_span must be a substring of the passage
+        (after Unicode normalization); otherwise the match is rejected.
         """
 
         if self.llm is None or not question:
@@ -538,8 +540,8 @@ class TridentPipeline:
         prompt = "\n".join(
             [
                 "You judge whether a passage expresses a required relation for a question.",
-                "Output ONE JSON object only: {\"match\": true/false, \"confidence\": number between 0 and 1}.",
-                "No code fences, no extra text.",
+                "Return ONE JSON object only with keys match (true/false), confidence (0-1), and support_span (string).",
+                "support_span must be copied verbatim from the passage. No code fences, no commentary.",
                 f"Question: {question}",
                 f"Required relation: {relation_label}",
                 f"Subject anchor: {subject}",
@@ -563,8 +565,20 @@ class TridentPipeline:
             confidence = 0.0
 
         confidence = max(0.0, min(1.0, confidence))
+        support_span = (parsed.get("support_span") or "").strip()
 
-        if metrics is not None:
+        # Verify span is contained in the passage under stable normalization
+        if support_span:
+            passage_norm = _normalize_text_unicode(passage.text)
+            span_norm = _normalize_text_unicode(support_span)
+            if span_norm not in passage_norm:
+                match = False
+                confidence = 0.0
+        else:
+            match = False
+            confidence = 0.0
+
+        if metrics is not None and match:
             metrics["relation_match_success"] = metrics.get("relation_match_success", 0) + 1
 
         return confidence if match else 0.0
@@ -585,7 +599,7 @@ class TridentPipeline:
 
         registry = self._relation_registry
         updated: List[Facet] = []
-        has_schema_relation = False
+        existing_relations: Set[Tuple[str, str]] = set()
 
         # First, canonicalize existing relation facets to the registry
         for facet in facets:
@@ -604,7 +618,6 @@ class TridentPipeline:
                         tpl["anchor_policy"] = routed.get("anchor_policy")
                         spec = registry.lookup(routed["relation_kind"])
                 if spec:
-                    has_schema_relation = True
                     tpl.setdefault("relation_pid", spec.pid)
                     tpl["relation_kind"] = spec.name
                     weak_predicates = {"is related to", "related to", "relation", "relate", ""}
@@ -627,15 +640,20 @@ class TridentPipeline:
                             required=facet.required,
                         )
                     )
+                    subj_key = (tpl.get("subject") or "").strip().lower()
+                    rel_key = (tpl.get("relation_kind") or tpl.get("relation_pid") or "").upper()
+                    existing_relations.add((rel_key, subj_key))
                     continue
             updated.append(facet)
 
         facets = updated
-        if has_schema_relation or self.llm is None:
+        if self.llm is None:
             return facets
 
         # LLM semantic planner: map question -> normalized relation facets
         allowed_relations = registry.all_names()
+        if not allowed_relations:
+            return facets
         prompt = (
             "You are a semantic planner."
             " Parse the question and emit required facets using only the"
@@ -662,6 +680,10 @@ class TridentPipeline:
             if not spec:
                 continue
             subject = fac.get("subject") or ""
+            subj_key = str(subject).strip().lower()
+            rel_key = spec.name.upper()
+            if (rel_key, subj_key) in existing_relations:
+                continue
             tpl = {
                 "subject": subject,
                 "predicate": spec.default_predicate(),
@@ -682,6 +704,7 @@ class TridentPipeline:
                     required=bool(fac.get("required", True)),
                 )
             )
+            existing_relations.add((rel_key, subj_key))
 
         if metrics is not None and required:
             metrics["relation_router_success"] = metrics.get("relation_router_success", 0) + len(required)
