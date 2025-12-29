@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModel
 
-from .config import TridentConfig, SafeCoverConfig, ParetoConfig
+from .config import TridentConfig, SafeCoverConfig, ParetoConfig, FacetMinerConfig
 from .facets import Facet, FacetMiner, FacetType, instantiate_facets, mark_required_facets, is_wh_question
 from .candidates import Passage
 from .calibration import ReliabilityCalibrator, CalibrationMonitor
@@ -453,7 +453,15 @@ class TridentPipeline:
 
         # Mark RELATION facets as required for WH-questions
         # This ensures that the key relation must be certified for valid answers
-        use_llm_plan = bool(getattr(self.config.facet_miner, 'use_llm_facet_plan', False) or os.environ.get('TRIDENT_LLM_FACET_PLAN','0')=='1')
+        facet_miner_cfg = getattr(self.config, "facet_miner", None) or FacetMinerConfig()
+        # Persist the fallback on the config object when older configs are missing the field
+        if not getattr(self.config, "facet_miner", None):
+            try:
+                self.config.facet_miner = facet_miner_cfg
+            except Exception:
+                pass
+
+        use_llm_plan = bool(getattr(facet_miner_cfg, 'use_llm_facet_plan', False) or os.environ.get('TRIDENT_LLM_FACET_PLAN','0')=='1')
         if not use_llm_plan or not any(getattr(f, 'required', False) for f in facets):
             facets = mark_required_facets(facets, query)
 

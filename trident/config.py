@@ -36,6 +36,14 @@ class RetrievalConfig:
 
 
 @dataclass
+class FacetMinerConfig:
+    """Configuration for facet mining behavior."""
+
+    # Toggle LLM-driven facet planning (experimental)
+    use_llm_facet_plan: bool = False
+
+
+@dataclass
 class FacetConfig:
     """
     Per-facet statistical controls.
@@ -276,6 +284,7 @@ class TridentConfig:
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
+    facet_miner: FacetMinerConfig = field(default_factory=FacetMinerConfig)
     nli: NLIConfig = field(default_factory=NLIConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
@@ -289,6 +298,7 @@ class TridentConfig:
         calibration = CalibrationConfig(**config_dict.get("calibration", {}))
         llm = LLMConfig(**config_dict.get("llm", {}))
         retrieval = RetrievalConfig(**config_dict.get("retrieval", {}))
+        facet_miner = FacetMinerConfig(**config_dict.get("facet_miner", {}))
         nli = NLIConfig(**config_dict.get("nli", {}))
         evaluation = EvaluationConfig(**config_dict.get("evaluation", {}))
         telemetry = TelemetryConfig(**config_dict.get("telemetry", {}))
@@ -305,6 +315,7 @@ class TridentConfig:
             calibration=calibration,
             llm=llm,
             retrieval=retrieval,
+            facet_miner=facet_miner,
             nli=nli,
             evaluation=evaluation,
             telemetry=telemetry,
