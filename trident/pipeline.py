@@ -1146,21 +1146,6 @@ class TridentPipeline:
                     score = self.nli_scorer.score(passage, facet)
                     self.score_cache[cache_key] = score
 
-                import math
-
-                # Transform score to probability in [0,1]
-                # NLI scorer outputs entail - 0.5*contra, typically in [-0.5, 1]
-                # CRITICAL: Only apply sigmoid for obvious logits (far outside [0,1])
-                # Tiny negatives like -0.01 are just noise and should be clipped to 0
-                def score_to_prob(s: float) -> float:
-                    # If it looks like a probability (nearly in [0,1]), just clip
-                    if -0.05 <= s <= 1.05:
-                        return max(0.0, min(1.0, s))
-                    # Otherwise treat as a logit/margin
-                    return 1.0 / (1.0 + math.exp(-s))
-
-                prob = score_to_prob(score)
-
                 stage2_scores[(passage.pid, facet.facet_id)] = score
 
                 # Calibrate to conformal p-value with text length for Mondrian
@@ -1168,10 +1153,12 @@ class TridentPipeline:
                 text_length = len(passage.text.split())
 
                 if debug and len(p_values) < 5:
-                    print(f"[DEBUG] to_pvalue: bucket={bucket}, raw_score={score:.4f}, prob={prob:.4f}, len={text_length}")
+                    print(f"[DEBUG] to_pvalue: bucket={bucket}, raw_score={score:.4f}, len={text_length}")
 
-                # CRITICAL: Use calibrator's conformal p-value, NOT 1-score
-                p_value = self.calibrator.to_pvalue(prob, bucket, text_length)
+                # CRITICAL: Use raw NLI score for calibration, NOT transformed prob.
+                # The calibrator was trained on raw scores (entail - 0.5*contra),
+                # so we must use raw scores at inference for consistent conformal guarantees.
+                p_value = self.calibrator.to_pvalue(score, bucket, text_length)
 
                 if debug and len(p_values) < 5:
                     print(f"[DEBUG] conformal p_value={p_value:.4f}")
@@ -1280,14 +1267,14 @@ class TridentPipeline:
                         score = self.nli_scorer.score(passage, facet)
                         # Don't cache oracle-only scores to avoid bloating cache
 
-                    prob = score_to_prob(score)
                     text_length = len(passage.text.split())
-                    p_val = self.calibrator.to_pvalue(prob, bucket, text_length)
-                    oracle_results.append((passage.pid, score, prob, p_val))
+                    # Use raw score for calibration (consistent with main path)
+                    p_val = self.calibrator.to_pvalue(score, bucket, text_length)
+                    oracle_results.append((passage.pid, score, p_val))
 
-                oracle_results.sort(key=lambda x: x[3])  # Sort by p-value
+                oracle_results.sort(key=lambda x: x[2])  # Sort by p-value
                 oracle_best = oracle_results[0]
-                oracle_best_p = oracle_best[3]
+                oracle_best_p = oracle_best[2]  # (pid, score, p_val)
                 oracle_passes = oracle_best_p <= alpha_bar
 
                 # Diagnosis
@@ -1311,7 +1298,7 @@ class TridentPipeline:
                       f"DIAGNOSIS={diagnosis}")
 
                 # Show top-3 oracle results for context
-                for rank, (pid, score, prob, pval) in enumerate(oracle_results[:3]):
+                for rank, (pid, score, pval) in enumerate(oracle_results[:3]):
                     in_sl = "✓" if pid in shortlist_pids else "✗"
                     print(f"  [{rank+1}] pid={pid[:12]}... score={score:.4f} p={pval:.4g} in_shortlist={in_sl}")
 
