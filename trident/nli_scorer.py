@@ -283,6 +283,10 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         predicate = str(tpl.get("predicate", ""))
         relation_pid = str(tpl.get("relation_pid", "") or "") or None
 
+        # If the facet uses a WH-variable as subject (e.g., "Who"), do NOT require
+        # literal subject anchoring; the object/predicate must still anchor.
+        is_wh_subject = bool(meta.get("is_wh_subject")) or s_raw.strip().lower() in _WH_WORDS
+
         relation_kind = (
             tpl.get("scoring_relation_kind")
             or tpl.get("outer_relation_type")
@@ -294,10 +298,10 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         o_clean = _clean_relation_endpoint(o_raw)
         has_anchor = bool(s_clean or o_clean)
 
-        is_wh_subject = bool(meta.get("is_wh_subject")) or s_raw.strip().lower() in _WH_WORDS
-
         # Reject global probes or placeholder-only facets
-        if not has_anchor:
+        # WH-subject facets intentionally drop the subject endpoint from normalization,
+        # so allow them to route as long as there's an object anchor.
+        if not has_anchor and not is_wh_subject:
             _record_failure("no_anchor")
             return False
 
@@ -310,7 +314,8 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         o_match = _fuzzy_phrase_match(o_clean, passage_norm, passage_tokens) if o_clean else False
 
         if is_wh_subject and not s_clean:
-            # WH subjects are intentionally dropped from normalization; don't penalize routing
+            # WH subjects are intentionally dropped from normalization; don't penalize routing.
+            # Still require object+predicate downstream.
             s_match = True
 
         anchor_policy = str(tpl.get("anchor_policy") or "ANY").upper()
@@ -325,7 +330,9 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         else:
             anchor_ok = bool(s_match or o_match)
 
-        if not anchor_ok:
+        # For WH-subject facets we already enforce object anchoring above; do not
+        # fail solely due to missing subject surface-form.
+        if not anchor_ok and not is_wh_subject:
             _record_failure("anchor_not_found")
             return False
 
