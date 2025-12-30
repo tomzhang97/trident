@@ -610,9 +610,9 @@ class FacetMiner:
 
                     hyp = spec["hypothesis"].format(entity=ent)
                     tpl = {
-                        "subject": "",
+                        "subject": ent,
                         "predicate": spec["predicate"],
-                        "object": ent,
+                        "object": "?",
                         "relation_kind": spec["relation_kind"],
                         "relation_pid": spec.get("relation_pid"),
                         "answer_role": spec.get("answer_role", "object"),
@@ -627,7 +627,7 @@ class FacetMiner:
                             facet_type=FacetType.RELATION,
                             template=tpl,
                             weight=1.0,
-                            metadata={"planned": True, "slot": slot, "is_wh_subject": True},
+                            metadata={"planned": True, "slot": slot, "is_wh_subject": True, "is_wh_object": True},
                             required=True,
                         )
                     )

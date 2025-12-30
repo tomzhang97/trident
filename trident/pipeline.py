@@ -668,6 +668,42 @@ class TridentPipeline:
                             print(f"[CONSTRAINED] Failed: {constrained_result.reason}")
                             if constrained_result.candidates:
                                 print(f"[CONSTRAINED] Had {len(constrained_result.candidates)} candidates")
+                elif certificates and winner_passages:
+                    # No answer facets, but we still have certified passages (likely ENTITY).
+                    # Attempt extraction from best certified passages instead of skipping outright.
+                    if debug_chain or debug_constrained:
+                        print("[CONSTRAINED] No answer facets certified; attempting on certified passages")
+
+                    constrained_result = constrained_span_select(
+                        llm=self.llm,
+                        question=query,
+                        winner_passages=winner_passages,
+                        max_candidates=10,
+                        max_chars_per_passage=600
+                    )
+
+                    if constrained_result.reason == "OK":
+                        answer = constrained_result.answer
+                        is_grounded = True
+                        used_constrained = True
+                        prompt_type = "constrained_certified_only"
+
+                        if debug_chain or debug_constrained:
+                            print(f"[CONSTRAINED] Success (certified-only): '{answer[:50] if answer else ''}' (index={constrained_result.candidate_index})")
+                            print(f"[CONSTRAINED] Candidates: {constrained_result.candidates[:3]}...")
+                    elif constrained_result.reason == "FALLBACK_SUPPORT":
+                        answer = constrained_result.answer
+                        is_grounded = True
+                        used_constrained = True
+                        prompt_type = "constrained_certified_support"
+
+                        if debug_chain or debug_constrained:
+                            print(f"[CONSTRAINED] Fallback (certified-only) to support-based: '{answer[:50] if answer else ''}'")
+                    else:
+                        if debug_chain or debug_constrained:
+                            print(f"[CONSTRAINED] Certified-only attempt failed: {constrained_result.reason}")
+                            if constrained_result.candidates:
+                                print(f"[CONSTRAINED] Had {len(constrained_result.candidates)} candidates")
                 else:
                     # No answer facets certified - skip constrained selection entirely
                     skipped_constrained_reason = "no_answer_facets_certified"

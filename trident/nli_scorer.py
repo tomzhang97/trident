@@ -284,6 +284,7 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
 
         # WH-subject handling (Who / What / Where)
         is_wh_subject = bool(meta.get("is_wh_subject")) or s_raw.strip().lower() in _WH_WORDS
+        is_wh_object = bool(meta.get("is_wh_object"))
 
         relation_pid = str(tpl.get("relation_pid", "") or "") or None
 
@@ -296,7 +297,9 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         # Anchor constraint: require at least one grounded endpoint
         s_clean = _clean_relation_endpoint(s_raw)
         o_clean = _clean_relation_endpoint(o_raw)
-        if is_wh_subject:
+        if is_wh_subject and is_wh_object:
+            has_anchor = bool(s_clean or o_clean)
+        elif is_wh_subject:
             has_anchor = bool(o_clean)
         else:
             has_anchor = bool(s_clean or o_clean)
@@ -331,7 +334,9 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
             anchor_policy = "ANY"
 
         anchor_ok = False
-        if is_wh_subject:
+        if is_wh_subject and is_wh_object:
+            anchor_ok = bool(s_match or o_match)
+        elif is_wh_subject:
             anchor_ok = bool(o_match)
         elif anchor_policy == "ALL":
             anchor_ok = bool(s_match and o_match)
@@ -351,6 +356,7 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
 
         if not predicate_ok:
             _record_failure("predicate_mismatch")
+            return None
 
         return predicate_ok
 
