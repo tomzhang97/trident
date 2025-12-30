@@ -632,7 +632,20 @@ class FacetMiner:
 
         anchor = _choose_anchor(ents)
 
-        if "mother of" in q and anchor:
+        def _matches_mother(question_text: str) -> bool:
+            return bool(
+                re.search(r"\bwho\b[^?]*\bmother of\b", question_text)
+                or re.search(r"\bmother of\b[^?]*\bwho\b", question_text)
+            )
+
+        def _matches_director(question_text: str) -> bool:
+            return bool(
+                re.search(r"\bwho\b[^?]*\bdirector of\b", question_text)
+                or re.search(r"\bdirector of\b[^?]*\bwho\b", question_text)
+                or re.search(r"\bwho\b[^?]*\bdirected\b", question_text)
+            )
+
+        if anchor and _matches_mother(q):
             rel = self._relation_facet_builder(
                 "rel_mother",
                 template={
@@ -647,7 +660,7 @@ class FacetMiner:
             if rel:
                 facets.append(rel)
 
-        if "director of" in q and anchor:
+        if anchor and _matches_director(q):
             rel = self._relation_facet_builder(
                 "rel_director",
                 template={

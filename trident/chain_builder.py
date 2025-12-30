@@ -1410,6 +1410,36 @@ def _find_fuzzy_substring(haystack: str, needle: str, max_distance: int = 2) -> 
     return None
 
 
+def _coerce_json_object(text: str) -> Optional[dict]:
+    """Best-effort JSON coercion for CSS outputs.
+
+    Tries strict extraction first; if that fails, performs minimal repairs for
+    common model issues (unquoted keys, single quotes). Returns None on failure.
+    """
+    import json as json_module
+    try:
+        candidate = _extract_first_json_object(text)
+    except Exception:
+        return None
+
+    # Attempt strict parse first
+    try:
+        return json_module.loads(candidate)
+    except Exception:
+        pass
+
+    # Minimal, targeted repairs only for the expected schema
+    fixed = candidate
+    fixed = re.sub(r"\b(pid|answer|confidence)\b", r'"\\1"', fixed)
+    if "'" in fixed:
+        fixed = fixed.replace("'", '"')
+
+    try:
+        return json_module.loads(fixed)
+    except Exception:
+        return None
+
+
 def certified_span_select(
     llm,
     question: str,
@@ -1468,13 +1498,22 @@ Evidence:
 
 JSON:"""
 
+    raw = llm.generate(prompt, temperature=0.0, max_new_tokens=160)
+    raw_text = raw.text if hasattr(raw, 'text') else str(raw)
+
+    out: Optional[Dict[str, Any]] = None
     try:
-        out, raw = strict_json_call(llm, prompt, max_new_tokens=160, temperature=0.0)
-        raw_text = raw.text if hasattr(raw, 'text') else str(raw)
+        out = json.loads(_extract_first_json_object(raw_text))
     except Exception as e:
         if debug:
-            print(f"[CSS] JSON parse failed: {e}")
-        return CSSResult(abstain=True, answer="", passage_id="", reason="PARSE_ERROR")
+            print(f"[CSS] JSON parse failed (strict): {e}")
+
+    if out is None:
+        out = _coerce_json_object(raw_text)
+        if out is None:
+            if debug:
+                print(f"[CSS] JSON parse failed (coerce): raw='{raw_text[:200]}'")
+            return CSSResult(abstain=True, answer="", passage_id="", reason="PARSE_ERROR")
 
     if debug:
         print(f"[CSS] Raw LLM output: {raw_text[:200]}...")
