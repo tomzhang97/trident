@@ -433,6 +433,7 @@ class TridentPipeline:
 
         # Step 1: Facet mining
         facets = self.facet_miner.extract_facets(query, supporting_facts)
+        use_llm_plan = bool(getattr(getattr(self.config, "facet_miner", None), "use_llm_facet_plan", False))
 
         # Mark RELATION facets as required for WH-questions
         # This ensures that the key relation must be certified for valid answers
@@ -498,7 +499,7 @@ class TridentPipeline:
         # Step 4: Mode-specific selection
         # For compositional questions, check if we need two-pass certification
         hop1_facets, hop2_facets = self._split_facets_by_hop(facets)
-        is_compositional = len(hop2_facets) > 0
+        is_compositional = False if use_llm_plan else len(hop2_facets) > 0
 
         if is_compositional:
             self.telemetry.log("compositional_detected", {
