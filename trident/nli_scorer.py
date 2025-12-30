@@ -313,12 +313,18 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
             _record_failure("placeholder_anchor")
             return False
 
+        o_tokens = _get_token_set(_normalize_text_unicode(o_clean)) if o_clean else set()
+
         s_match = _fuzzy_phrase_match(s_clean, passage_norm, passage_tokens) if s_clean else False
         o_match = _fuzzy_phrase_match(o_clean, passage_norm, passage_tokens) if o_clean else False
 
-        # WH subjects are intentionally abstract; don't require subject grounding.
-        if is_wh_subject:
-            s_match = True
+        # If WH subject ("Who/What/..."), relax object anchoring:
+        # allow partial token overlap instead of full token subset.
+        if is_wh_subject and o_clean and not o_match:
+            overlap = o_tokens.intersection(passage_tokens)
+            # require at least 2 tokens overlap OR 1 token if object is short
+            if len(overlap) >= 2 or (len(o_tokens) <= 2 and len(overlap) >= 1):
+                o_match = True
 
         anchor_policy = str(tpl.get("anchor_policy") or "ANY").upper()
         if anchor_policy not in {"ANY", "ALL"}:

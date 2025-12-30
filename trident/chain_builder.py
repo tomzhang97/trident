@@ -1340,6 +1340,10 @@ def _extract_first_json_object(text: str) -> str:
     if depth != 0 or end_idx == -1:
         raise ValueError("Unbalanced JSON braces in text")
 
+    remainder = stripped[end_idx + 1:].strip()
+    if remainder:
+        raise ValueError("Extra text after JSON object")
+
     return stripped[start:end_idx + 1]
 
 

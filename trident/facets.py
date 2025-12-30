@@ -615,8 +615,6 @@ class FacetMiner:
                         "object": ent,
                         "relation_kind": spec["relation_kind"],
                         "relation_pid": spec.get("relation_pid"),
-                        "relation_schema_source": spec.get("relation_schema_source", ""),
-                        "relation_schema_version": spec.get("relation_schema_version", ""),
                         "answer_role": spec.get("answer_role", "object"),
                         "anchor_policy": spec.get("anchor_policy", "ANY"),
                         "custom_hypothesis": hyp,
