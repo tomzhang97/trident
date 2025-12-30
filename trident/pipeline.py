@@ -569,6 +569,7 @@ class TridentPipeline:
         is_grounded = False
         used_regex_fallback = False
         used_constrained = False  # Track if constrained selection was used
+        used_css = False  # Track if CSS-based selection was used
         constrained_result = None  # Track constrained selection result
         relation_info = None  # Track the RELATION-winning passage for typed fallback
         facet_id_map = {}  # Track all facet_id -> winning passage mappings
