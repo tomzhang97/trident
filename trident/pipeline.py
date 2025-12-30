@@ -345,7 +345,16 @@ class TridentPipeline:
         self.device = device
 
         # Initialize components
-        self.facet_miner = FacetMiner(config, llm_interface=self.llm)
+                # Public normalized relation schema (optional)
+        relation_registry = None
+        if RelationRegistry is not None:
+            try:
+                relation_registry = RelationRegistry()
+            except Exception:
+                relation_registry = None
+        
+        # Facet miner (optionally LLM-driven plan)
+        self.facet_miner = FacetMiner(config, llm=self.llm, relation_registry=relation_registry)
         self.nli_scorer = NLIScorer(config.nli, device)
 
         # Load calibrator from file if provided, otherwise create empty one
