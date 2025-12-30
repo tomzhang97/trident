@@ -27,16 +27,11 @@ from .logging_utils import TelemetryTracker
 from .vqc import VerifierQueryCompiler
 from .bwk import BwKController
 from .chain_builder import (
-    bind_entity_from_hop1_winner,
+    bind_entity_via_css,
     build_inner_question_from_facet,
-    detect_question_type,
-    extract_candidates,
-    compute_support_score,
-    constrained_span_select,
-    ConstrainedSelectionResult,
-    QuestionType,
-    get_answer_facet_passages,
+    certified_span_select,
     get_winner_passages_only,
+    get_winning_passages_from_certificates,
 )
 
 
@@ -540,218 +535,74 @@ class TridentPipeline:
         else:
             raise ValueError(f"Unknown mode: {mode}")
         
-        # Step 5: Generate answer using CONSTRAINED CANDIDATE SELECTION
-        # CRITICAL: Build candidate set from evidence, LLM picks by index.
-        # This ensures verbatim answers and enables support-based ranking.
+        # Step 5: Generate answer using CERTIFIED SPAN SELECTION only
+        # CRITICAL: Use only certified passages as evidence to avoid heuristic
+        # fallbacks or uncertified chains.
         answer = ""
-        chain = None
         is_grounded = False
-        used_regex_fallback = False
-        used_constrained = False  # Track if constrained selection was used
-        used_css = False  # Track if CSS-based selection was used
-        constrained_result = None  # Track constrained selection result
-        relation_info = None  # Track the RELATION-winning passage for typed fallback
-        facet_id_map = {}  # Track all facet_id -> winning passage mappings
-        prompt_type = "none"  # Track which prompt type was used
-
-        # Initialize variables for metrics (must be set before if block for scoping)
-        answer_facet_ids = []
-        answer_selection_reason = ""
-        winner_passages = []
+        prompt_type = "none"
+        css_result = None
+        css_abstained = False
+        total_tokens = 0
+        prompt_tokens = 0
+        completion_tokens = 0
 
         if not result['abstained'] and result['selected_passages']:
-            debug_chain = os.environ.get("TRIDENT_DEBUG_CHAIN", "0") == "1"
-            debug_css = os.environ.get("TRIDENT_DEBUG_CSS", "0") == "1"
-            debug_constrained = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
+            certificates = result.get('certificates') or []
             facet_dicts = [f.to_dict() for f in facets]
-            certificates = result.get('certificates', [])
-            prompt = ""  # Initialize prompt
 
-            # ================================================================
-            # PRIORITY 0: Constrained Candidate Selection (FACET-TARGETED)
-            # ================================================================
-            # CRITICAL: Only run constrained selection when ANSWER facets are certified.
-            # ANSWER facets are RELATION/TEMPORAL/NUMERIC - they determine the final answer.
-            # ENTITY facets only confirm the question subject exists, NOT the answer.
-            # Running constrained selection from ENTITY-only evidence produces wrong answers.
-            skipped_constrained_reason = ""
             if certificates:
-                # Get passages that won the ANSWER facet (RELATION/TEMPORAL/NUMERIC)
-                # NOT just any winning passage (which may only have ENTITY facet)
-                answer_passages, answer_facet_ids, answer_selection_reason = get_answer_facet_passages(
-                    question=query,
-                    certificates=certificates,
-                    all_passages=result['selected_passages'],
-                    facets=facet_dicts
-                )
-
-                # Also get all winner passages for CSS fallback
-                winner_passages = get_winner_passages_only(
+                facet_id_map, _ = get_winning_passages_from_certificates(
                     certificates,
-                    result['selected_passages']
+                    result['selected_passages'],
+                    facet_dicts
                 )
 
-                # Build facet type lookup for metrics
-                facet_type_by_id = {f.get("facet_id"): f.get("facet_type") for f in facet_dicts}
+                winning_passages: List[Dict[str, Any]] = []
+                seen_pids: Set[str] = set()
+                for info in facet_id_map.values():
+                    passage = info.get("passage", {})
+                    pid = passage.get("pid")
+                    if pid and pid not in seen_pids:
+                        seen_pids.add(pid)
+                        winning_passages.append(passage)
 
-                # Check if any answer facets were actually certified
-                # Answer facets are non-ENTITY types that can determine the final answer
-                answer_facet_types = {"RELATION", "TEMPORAL", "NUMERIC", "COMPARISON", "BRIDGE_HOP"}
-                has_answer_facet_certified = any(
-                    facet_type_by_id.get(c.get("facet_id")) in answer_facet_types
-                    for c in certificates
-                )
-
-                if debug_chain or debug_constrained:
-                    print(f"\n[CONSTRAINED] Attempting FACET-TARGETED Candidate Selection")
-                    print(f"  Answer facets: {answer_facet_ids}")
-                    print(f"  Has answer facet certified: {has_answer_facet_certified}")
-                    print(f"  Answer passages: {len(answer_passages)} (from answer facets)")
-                    print(f"  All winner passages: {len(winner_passages)}")
-                    for wp in answer_passages[:3]:
-                        print(f"    - {wp.get('pid', '')[:12]}... ({len(wp.get('text', ''))} chars)")
-
-                # CRITICAL FIX: Only run constrained selection if answer facets are certified
-                # Do NOT fall back to ENTITY-only winner passages - that produces wrong answers
-                if has_answer_facet_certified and answer_passages:
-                    constrained_result = constrained_span_select(
+                if winning_passages:
+                    css_result = certified_span_select(
                         llm=self.llm,
                         question=query,
-                        winner_passages=answer_passages,
-                        max_candidates=10,
+                        winner_passages=winning_passages,
                         max_chars_per_passage=600
                     )
 
-                    if constrained_result.reason == "OK":
-                        answer = constrained_result.answer
-                        is_grounded = True
-                        used_constrained = True
-                        prompt_type = "constrained"
+                    total_tokens = css_result.tokens_used
+                    prompt_tokens = css_result.prompt_tokens
+                    completion_tokens = css_result.completion_tokens
 
-                        if debug_chain or debug_constrained:
-                            print(f"[CONSTRAINED] Success: '{answer[:50] if answer else ''}' (index={constrained_result.candidate_index})")
-                            print(f"[CONSTRAINED] Confidence: {constrained_result.confidence}")
-                            print(f"[CONSTRAINED] Pool: {answer_selection_reason}")
-                            print(f"[CONSTRAINED] Candidates: {constrained_result.candidates[:3]}...")
-                    elif constrained_result.reason == "FALLBACK_SUPPORT":
-                        # LLM gave invalid index, but we used support-based fallback
-                        answer = constrained_result.answer
+                    if not css_result.abstain and css_result.answer:
+                        answer = css_result.answer
                         is_grounded = True
-                        used_constrained = True
-                        prompt_type = "constrained_fallback"
-
-                        if debug_chain or debug_constrained:
-                            print(f"[CONSTRAINED] Fallback to support-based: '{answer[:50] if answer else ''}'")
+                        prompt_type = "css"
                     else:
-                        if debug_chain or debug_constrained:
-                            print(f"[CONSTRAINED] Failed: {constrained_result.reason}")
-                            if constrained_result.candidates:
-                                print(f"[CONSTRAINED] Had {len(constrained_result.candidates)} candidates")
-                elif certificates and winner_passages:
-                    # No answer facets, but we still have certified passages (likely ENTITY).
-                    # Attempt extraction from best certified passages instead of skipping outright.
-                    if debug_chain or debug_constrained:
-                        print("[CONSTRAINED] No answer facets certified; attempting on certified passages")
-
-                    constrained_result = constrained_span_select(
-                        llm=self.llm,
-                        question=query,
-                        winner_passages=winner_passages,
-                        max_candidates=10,
-                        max_chars_per_passage=600
-                    )
-
-                    if constrained_result.reason == "OK":
-                        answer = constrained_result.answer
-                        is_grounded = True
-                        used_constrained = True
-                        prompt_type = "constrained_certified_only"
-
-                        if debug_chain or debug_constrained:
-                            print(f"[CONSTRAINED] Success (certified-only): '{answer[:50] if answer else ''}' (index={constrained_result.candidate_index})")
-                            print(f"[CONSTRAINED] Candidates: {constrained_result.candidates[:3]}...")
-                    elif constrained_result.reason == "FALLBACK_SUPPORT":
-                        answer = constrained_result.answer
-                        is_grounded = True
-                        used_constrained = True
-                        prompt_type = "constrained_certified_support"
-
-                        if debug_chain or debug_constrained:
-                            print(f"[CONSTRAINED] Fallback (certified-only) to support-based: '{answer[:50] if answer else ''}'")
-                    else:
-                        if debug_chain or debug_constrained:
-                            print(f"[CONSTRAINED] Certified-only attempt failed: {constrained_result.reason}")
-                            if constrained_result.candidates:
-                                print(f"[CONSTRAINED] Had {len(constrained_result.candidates)} candidates")
+                        answer = ABSTAIN_STR
+                        css_abstained = True
+                        prompt_type = "css_abstain"
                 else:
-                    # No answer facets certified - skip constrained selection entirely
-                    skipped_constrained_reason = "no_answer_facets_certified"
-                    if debug_chain or debug_constrained:
-                        certified_types = [facet_type_by_id.get(c.get("facet_id")) for c in certificates]
-                        print(f"[CONSTRAINED] Skipped: only {certified_types} certified, no answer facets")
-
-            # ANSWER VALIDATION: ensure we only keep grounded, non-empty answers
-            def _is_garbage_answer(ans: str) -> bool:
-                if not ans or not ans.strip():
-                    return True
-                ans_stripped = ans.strip()
-                if re.fullmatch(r"[_\-\s\.\,\!\?\:]+", ans_stripped):
-                    return True
-                if len(ans_stripped) < 2:
-                    return True
-                if _looks_like_meta(ans_stripped):
-                    return True
-                if _is_abstain_answer(ans_stripped):
-                    return True
-                return False
-
-            answer_is_invalid = _is_garbage_answer(answer)
-            if answer_is_invalid:
-                answer = ""
-                is_grounded = False
-            # DEBUG: Log when answer becomes empty after extraction
-            if not answer or answer.strip() == "":
-                if os.environ.get("TRIDENT_DEBUG_EMPTY_ANSWER", "0") == "1":
-                    print(f"\n[EMPTY ANSWER DEBUG]")
-                    print(f"  Query: {query[:100]}...")
-                    if prompt:
-                        print(f"  Prompt (last 300 chars): ...{prompt[-300:]}")
-                    print(f"  Extracted answer: '{answer}'")
-                    print(f"  Mode: {mode}")
-                    print(f"  Num passages: {len(result['selected_passages'])}")
-
-            # Compute token usage
-            if used_constrained:
-                # Constrained selection uses a single LLM call with structured output
-                total_tokens = 0  # Token usage is internal to the call
-                prompt_tokens = 0
-                completion_tokens = 0
-            elif used_css:
-                # CSS uses a single LLM call with structured output
-                total_tokens = 0  # CSS token usage is internal to the call
-                prompt_tokens = 0
-                completion_tokens = 0
-            elif prompt:
-                total_tokens = llm_output.tokens_used
-                prompt_tokens = self.llm.compute_token_cost(prompt)
-                completion_tokens = max(total_tokens - prompt_tokens, 0)
+                    css_abstained = True
+                    prompt_type = "no_winning_passages"
             else:
-                total_tokens = 0
-                prompt_tokens = 0
-                completion_tokens = 0
+                css_abstained = True
+                prompt_type = "no_certificates"
+                answer = "ABSTAINED"
         else:
             answer = "ABSTAINED" if result['abstained'] else ""
-            total_tokens = 0
-            prompt_tokens = 0
-            completion_tokens = 0
-            prompt_type = "none"
         
         # Calculate total latency
         latency_ms = (time.time() - start_time) * 1000
 
         # Check if model abstained (either selection abstained OR model said "I cannot answer")
         model_abstained = (answer == ABSTAIN_STR)
-        final_abstained = result['abstained'] or model_abstained
+        final_abstained = result['abstained'] or model_abstained or css_abstained
 
         # Prepare output
         metrics = result.get('metrics', {})
@@ -771,14 +622,9 @@ class TridentPipeline:
             'overhead_tokens': max(total_tokens - evidence_tokens, 0),
             'model_abstained': model_abstained,  # Track when model says "I cannot answer"
             'prompt_type': prompt_type,
-            'used_constrained': used_constrained,
-            'constrained_reason': constrained_result.reason if constrained_result else None,
-            'constrained_confidence': constrained_result.confidence if constrained_result else None,
-            'constrained_candidate_index': constrained_result.candidate_index if constrained_result else None,
-            'constrained_num_candidates': len(constrained_result.candidates) if constrained_result else 0,
-            'constrained_passage_id': constrained_result.passage_id if constrained_result else None,
-            'answer_facet_ids': answer_facet_ids,
-            'answer_selection_reason': answer_selection_reason,
+            'css_abstained': css_abstained,
+            'css_reason': css_result.reason if css_result else None,
+            'css_passage_id': css_result.passage_id if css_result else None,
             'num_certificates': len(certificates),
             'num_certified_facets': len(certified_facet_ids),
             'certified_facet_ids': list(certified_facet_ids),
