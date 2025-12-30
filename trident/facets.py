@@ -10,7 +10,6 @@ UPDATES:
 from __future__ import annotations
 
 import re
-import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -691,26 +690,30 @@ class Facet:
         )
 
 class FacetMiner:
-    def __init__(self, config: Any):
+
+    def __init__(self, config: Any, llm: Optional[Any] = None, relation_registry: Optional[Any] = None):
         self.config = config
-        if getattr(self.config, "relation_schema_json_path", None) is None:
-            self.config.relation_schema_json_path = "trident/relation_schema_wd.json"
-        if not hasattr(self.config, "use_llm_relation_plan"):
-            self.config.use_llm_relation_plan = True
-        # Optional components (always define to avoid AttributeError)
-        self.llm = getattr(config, 'llm', None) or getattr(config, 'llm_interface', None)
-        self.nlp = None
-        # Public normalized relation schema (optional)
-        try:
-            from .relation_schema import RelationRegistry
-            schema_path = getattr(config, 'relation_schema_json_path', None) or getattr(config, 'relation_schema_path', None)
-            self.relation_registry = RelationRegistry.load_json(schema_path) if schema_path else RelationRegistry.empty()
-        except Exception:
-            self.relation_registry = None
+
+        # Optional LLM for query-time facet planning / relation classification.
+        # Kept None-safe: all LLM-driven behavior is gated by config/env flags.
+        self.llm = llm
+
+        # Optional normalized relation schema/registry (public, versioned).
+        # If not provided, we instantiate a default registry when available.
+        self.relation_registry = relation_registry
+        if self.relation_registry is None and RelationRegistry is not None:
+            try:
+                self.relation_registry = RelationRegistry()
+            except Exception:
+                self.relation_registry = None
+
+        # Optional NLP (spaCy). Always define the attribute (fixes AttributeError in older runs).
         self.nlp = None
         if spacy is not None:
-            try: self.nlp = spacy.load("en_core_web_sm")
-            except Exception: self.nlp = None
+            try:
+                self.nlp = spacy.load("en_core_web_sm")
+            except Exception:
+                self.nlp = None
 
     def extract_facets(self, query: str, supporting_facts: Optional[List[Tuple[str, int]]] = None) -> List[Facet]:
         query = _clean_text(query)
@@ -747,8 +750,7 @@ class FacetMiner:
 
     def _extract_entity_facets(self, query: str) -> List[Facet]:
         mentions: List[str] = []
-        nlp = getattr(self, 'nlp', None)
-        if nlp is not None:
+        if self.nlp is not None:
             doc = self.nlp(query)
             for ent in doc.ents:
                 m = (ent.text or "").strip()
@@ -763,23 +765,6 @@ class FacetMiner:
 
     # ---- relation (FIXED) ----
     def _extract_relation_facets(self, query: str) -> List[Facet]:
-        # ------------------------------------------------------------
-        # LLM-driven relation planning (Option B)
-        # ------------------------------------------------------------
-        use_llm_plan = bool(getattr(self, 'llm', None)) and (
-            getattr(self.config, 'use_llm_relation_plan', False)
-            or getattr(self.config, 'use_llm_facet_plan', False)
-            or os.environ.get('TRIDENT_LLM_REL_PLAN', '0') == '1'
-        )
-        if use_llm_plan and getattr(self, 'relation_registry', None) is not None:
-            try:
-                plan = self._llm_relation_plan(query)
-                if plan:
-                    return plan
-            except Exception as _e:
-                if os.environ.get('TRIDENT_DEBUG_REL_PLAN', '0') == '1':
-                    print(f"[REL-PLAN] LLM plan failed, falling back: {_e}")
-
         facets: List[Facet] = []
         patterns = [
             (r"(.+?)\s+(?:is|was|were|are)\s+(?:founded|created|written|directed|produced)\s+by\s+(.+?)(?:\?|$)", "created"),
@@ -1078,33 +1063,68 @@ class FacetMiner:
         return facets
 
     # ---- bridge (GENERIC HOPS) ----
+
     def _extract_bridge_facets(self, query: str, supporting_facts: Optional[List[Tuple[str, int]]] = None) -> List[Facet]:
+        """Bridge facets (Hop-2) derived from supporting facts.
+
+        We emit schema-backed relation kinds/predicates and avoid WH-words as anchors.
+        """
         facets: List[Facet] = []
-        if not supporting_facts: return facets
-        
-        titles = _dedupe_strings([t for t, _ in supporting_facts])
-        if len(titles) < 2: return facets
+        if not supporting_facts:
+            return facets
 
-        q_lower = query.lower()
-        relation = "is related to"
-        if "guest appearance" in q_lower: relation = "includes guest appearances from"
-        elif "feature" in q_lower: relation = "features"
-        elif "directed" in q_lower: relation = "was directed by"
-        elif "written" in q_lower: relation = "was written by"
-        elif "located" in q_lower: relation = "is located in"
+        q_lower = (query or "").lower()
 
-        # Generate adjacent hops for any length (2, 3, 4...)
-        # Uses generic BRIDGE_HOP type.
-        for i in range(len(titles) - 1):
-            e1, e2 = titles[i], titles[i+1]
+        relation_kind = "DEFAULT"
+        raw_pred = "is related to"
+
+        if any(w in q_lower for w in ["directed", "director"]):
+            relation_kind = "DIRECTOR"
+        elif "mother" in q_lower:
+            relation_kind = "MOTHER"
+        elif "father" in q_lower:
+            relation_kind = "FATHER"
+        elif any(w in q_lower for w in ["born", "birth"]):
+            relation_kind = "BIRTH_DATE"
+        elif any(w in q_lower for w in ["died", "death"]):
+            relation_kind = "DEATH_DATE"
+        elif any(w in q_lower for w in ["award", "won", "winner"]):
+            relation_kind = "AWARD"
+        elif "capital" in q_lower:
+            relation_kind = "CAPITAL"
+        elif any(w in q_lower for w in ["spouse", "married"]):
+            relation_kind = "SPOUSE"
+
+        # Canonicalize against public schema if present
+        if self.relation_registry is not None:
+            try:
+                relation_kind = self.relation_registry.lookup(relation_kind)
+                raw_pred = self.relation_registry.default_predicate(relation_kind) or raw_pred
+            except Exception:
+                pass
+
+        for ent_text, hop in supporting_facts:
+            if hop != 1:
+                continue
+            ent = (ent_text or "").strip()
+            if not ent:
+                continue
+
+            fid = f"bridge_{len(facets)}"
             facets.append(Facet(
-                facet_id=f"bridge_hop_{i+1}",
-                facet_type=FacetType.BRIDGE_HOP,
-                template={"entity1": e1, "relation": relation, "bridge_entity": e2, "hop": i+1}
+                facet_id=fid,
+                facet_type="RELATION",
+                text=f"[BRIDGE] {relation_kind} of {ent}",
+                template={
+                    "subject": ent,
+                    "predicate": raw_pred,
+                    "object": "?",
+                    "relation_kind": relation_kind,
+                    "answer_role": "object",
+                },
             ))
-            
-        return facets
 
+        return facets
     def _is_multi_hop(self, query: str) -> bool:
         q = query.lower()
         return (" and " in q and " which " in q) or sum(1 for s in [" and ", " both ", " which "] if s in q) >= 2
@@ -1123,98 +1143,3 @@ class FacetMiner:
             seen.add(sig)
             unique.append(f)
         return unique
-def _relation_candidates_from_schema(self, question: str, k: int = 12):
-    """Deterministically shortlist schema entries by keyword overlap."""
-    rr = getattr(self, 'relation_registry', None)
-    if rr is None:
-        return []
-    q = (question or "").lower()
-    scored = []
-    specs = getattr(rr, "_specs_by_pid", {})
-    for pid, spec in specs.items():
-        kws = set(spec.keyword_set()) if hasattr(spec, "keyword_set") else set()
-        ov = sum(1 for w in kws if w and w in q)
-        if ov > 0:
-            scored.append((ov, pid, spec))
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    return scored[:k]
-
-def _llm_relation_plan(self, question: str):
-    """Single-call strict-JSON LLM plan -> [Facet] or None."""
-    import json, re
-    llm = getattr(self, 'llm', None)
-    if llm is None:
-        return None
-
-    cand = self._relation_candidates_from_schema(question, k=12)
-    if not cand:
-        return None
-
-    options_lines = []
-    valid_pids = []
-    for ov, pid, spec in cand:
-        valid_pids.append(pid)
-        name = getattr(spec, "canonical_name", None) or getattr(spec, "name", None) or pid
-        kws = sorted(list(spec.keyword_set()))[:6] if hasattr(spec, "keyword_set") else []
-        options_lines.append(f"- pid: {pid}\n  name: {name}\n  keywords: {', '.join(kws)}")
-
-    prompt = (
-        "Select the SINGLE best relation schema entry for the question.\n"
-        "Return STRICT JSON ONLY (no prose, no markdown).\n\n"
-        f"Question: {question}\n\n"
-        "Candidates (choose one pid):\n"
-        + "\n".join(options_lines)
-        + "\n\nJSON:\n{\n  \"pid\": \"P###\",\n  \"required_facet_types\": [\"RELATION\", \"ENTITY\"],\n  \"confidence\": 0.0\n}\n"
-    )
-
-    resp = llm.generate(prompt, temperature=0.0) if hasattr(llm, "generate") else llm(prompt)
-    raw = resp.text if hasattr(resp, "text") else str(resp)
-
-    m = re.search(r"\{.*\}", raw, flags=re.S)
-    if not m:
-        return None
-    data = json.loads(m.group(0))
-    pid = data.get("pid")
-    conf = float(data.get("confidence", 0.0) or 0.0)
-    if pid not in valid_pids or conf < 0.30:
-        return None
-
-    spec = self.relation_registry.lookup(pid) if getattr(self, 'relation_registry', None) else None
-    if spec is None:
-        return None
-
-    obj = ""
-    if hasattr(self, "_extract_entity_mentions"):
-        try:
-            mentions = self._extract_entity_mentions(question)
-            if mentions:
-                obj = mentions[0]
-        except Exception:
-            obj = ""
-    if not obj:
-        caps = re.findall(r"(?:[A-Z][\w\-']+(?:\s+[A-Z][\w\-']+)*)", question or "")
-        obj = max(caps, key=len) if caps else ""
-
-    try:
-        qtype = detect_question_type(question)
-        subj = "Who" if getattr(qtype, "category", "") in ("who", "person") else "What"
-    except Exception:
-        subj = "Who"
-
-    facet = Facet(
-        facet_id=f"rel_llm_{pid}",
-        facet_type=FacetType.RELATION,
-        text=f"{subj} -> {spec.canonical_name} -> {obj}",
-        template={"subject": subj, "predicate": spec.canonical_name, "object": obj},
-        metadata={
-            "relation_pid": pid,
-            "relation_name": spec.canonical_name,
-            "relation_aliases": list(getattr(spec, "aliases", []) or []),
-            "relation_keywords": list(spec.keyword_set()) if hasattr(spec, "keyword_set") else [],
-            "llm_plan_confidence": conf,
-            "llm_plan": True,
-            "required_facet_types": data.get("required_facet_types") or [],
-        },
-    )
-    return [facet]
-
