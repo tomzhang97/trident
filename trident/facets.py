@@ -14,8 +14,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .relation_templates import RELATION_SLOT_TO_TEMPLATE
-
 _PUNCT_FIX_RE = re.compile(r"\s+([,.;:?!])")
 _MULTI_SPACE_RE = re.compile(r"\s{2,}")
 _APOS_S_RE = re.compile(r"\s+'s\b", re.IGNORECASE)
@@ -246,7 +244,11 @@ def is_wh_question(question: str) -> bool:
     return q_lower.startswith(wh_starters) or any(f' {w}' in q_lower[:30] for w in ['who', 'what', 'where', 'when', 'which'])
 
 
-def mark_required_facets(facets: List["Facet"], question: str) -> List["Facet"]:
+def mark_required_facets(
+    facets: List["Facet"],
+    question: str,
+    require_relation: bool = False,
+) -> List["Facet"]:
     """
     Mark RELATION facets as required for WH-questions.
 
@@ -260,7 +262,7 @@ def mark_required_facets(facets: List["Facet"], question: str) -> List["Facet"]:
     Returns:
         List of facets with required flags set appropriately
     """
-    if not is_wh_question(question):
+    if not (require_relation or is_wh_question(question)):
         return facets
 
     import os
@@ -551,13 +553,12 @@ class FacetMiner:
         self,
         query: str,
         supporting_facts: Optional[List[Tuple[str, int]]] = None,
-        question_plan: Optional[Dict[str, Any]] = None,
     ) -> List[Facet]:
         query = _clean_text(query)
 
         facets: List[Facet] = []
         facets.extend(self._extract_entity_facets(query))
-        facets.extend(self._extract_relation_facets(query, question_plan=question_plan))
+        facets.extend(self._extract_relation_facets(query))
         facets.extend(self._extract_temporal_facets(query))
         facets.extend(self._extract_numeric_facets(query))
         facets.extend(self._extract_comparison_facets(query))
@@ -586,55 +587,41 @@ class FacetMiner:
         return [Facet(facet_id=f"entity_{i}", facet_type=FacetType.ENTITY, template={"mention": _safe_phrase(m)}) for i, m in enumerate(mentions)]
 
     # ---- relation (planned or heuristic) ----
-    def _extract_relation_facets(self, query: str, question_plan: Optional[Dict[str, Any]] = None) -> List[Facet]:
-        planned = self._extract_relation_facets_llm_plan(question_plan)
-        if planned:
-            return planned
-        return []
+    def _extract_relation_facets(self, query: str) -> List[Facet]:
+        q = query.lower()
+        facets: List[Facet] = []
 
-    def _extract_relation_facets_llm_plan(self, question_plan: Optional[Dict[str, Any]]) -> List[Facet]:
-        if question_plan and isinstance(question_plan, dict):
-            req = question_plan.get("required_facts", [])
-            if isinstance(req, list) and req:
-                facets: List[Facet] = []
-                for i, r in enumerate(req[:3]):
-                    if not isinstance(r, dict):
-                        continue
-                    slot = str(r.get("slot", "")).strip().lower()
-                    ent = _clean_text(str(r.get("entity", "")).strip())
-                    if not slot or not ent:
-                        continue
-                    spec = RELATION_SLOT_TO_TEMPLATE.get(slot)
-                    if not spec:
-                        continue
-
-                    hyp = spec["hypothesis"].format(entity=ent)
-                    tpl = {
-                        "subject": ent,
-                        "predicate": spec["predicate"],
+        if "mother of" in q:
+            facets.append(
+                Facet(
+                    facet_id="rel_mother",
+                    facet_type=FacetType.RELATION,
+                    template={
+                        "relation_kind": "MOTHER",
+                        "subject": "?",
                         "object": "?",
-                        "relation_kind": spec["relation_kind"],
-                        "relation_pid": spec.get("relation_pid"),
-                        "answer_role": spec.get("answer_role", "object"),
-                        "anchor_policy": spec.get("anchor_policy", "ANY"),
-                        "custom_hypothesis": hyp,
+                        "answer_role": "object",
                         "is_wh_subject": True,
-                    }
+                    },
+                )
+            )
 
-                    facets.append(
-                        Facet(
-                            facet_id=f"plan_rel_{i}",
-                            facet_type=FacetType.RELATION,
-                            template=tpl,
-                            weight=1.0,
-                            metadata={"planned": True, "slot": slot, "is_wh_subject": True, "is_wh_object": True},
-                            required=True,
-                        )
-                    )
-                if facets:
-                    return facets
+        if "director of" in q:
+            facets.append(
+                Facet(
+                    facet_id="rel_director",
+                    facet_type=FacetType.RELATION,
+                    template={
+                        "relation_kind": "DIRECTOR",
+                        "subject": "?",
+                        "object": "?",
+                        "answer_role": "object",
+                        "is_wh_subject": True,
+                    },
+                )
+            )
 
-        return []
+        return facets
 
     # ---- temporal ----
     def _extract_temporal_facets(self, query: str) -> List[Facet]:

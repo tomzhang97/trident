@@ -26,7 +26,6 @@ from .monitoring import DriftMonitor
 from .logging_utils import TelemetryTracker
 from .vqc import VerifierQueryCompiler
 from .bwk import BwKController
-from .llm_question_planner import LLMQuestionPlanner
 from .chain_builder import (
     bind_entity_from_hop1_winner,
     build_inner_question_from_facet,
@@ -328,15 +327,6 @@ class TridentPipeline:
 
         # Initialize components
 
-        # Optional question planner (single LLM call per query)
-        self.question_planner = None
-        use_planner = bool(getattr(config, "use_llm_question_planner", False)) or (
-            os.environ.get("TRIDENT_LLM_QUESTION_PLANNER", "0") == "1"
-        )
-        if use_planner and self.llm is not None:
-            max_tokens = getattr(config, "llm_planner_max_new_tokens", 160)
-            self.question_planner = LLMQuestionPlanner(self.llm, max_facts=3, max_new_tokens=max_tokens)
-
         # Facet miner
         self.facet_miner = FacetMiner(config, llm=self.llm)
         self.nli_scorer = NLIScorer(config.nli, device)
@@ -415,29 +405,20 @@ class TridentPipeline:
         self.telemetry.start_query(query)
 
         # Step 1: Facet mining
-        plan_obj = None
-        if self.question_planner is not None:
-            try:
-                plan = self.question_planner.plan(query)
-                plan_obj = {
-                    "question_type": plan.question_type,
-                    "required_facts": plan.required_facts,
-                }
-            except Exception:
-                plan_obj = None
-
-        facets = self.facet_miner.extract_facets(query, supporting_facts, question_plan=plan_obj)
-        use_llm_plan = plan_obj is not None
+        facets = self.facet_miner.extract_facets(query, supporting_facts)
+        use_llm_plan = False
 
         # Mark RELATION facets as required for WH-questions
         # This ensures that the key relation must be certified for valid answers
-        facets = mark_required_facets(facets, query)
+        facets = mark_required_facets(facets, query, require_relation=True)
 
         self.telemetry.log("facet_mining", {
             "num_facets": len(facets),
             "num_required": sum(1 for f in facets if f.required),
             "is_wh_question": is_wh_question(query),
         })
+
+        has_relation_facets = any(f.facet_type == FacetType.RELATION for f in facets)
 
         # CRITICAL FIX: Handle zero facets early with proper abstention
         if not facets:
@@ -580,7 +561,7 @@ class TridentPipeline:
         answer_selection_reason = ""
         winner_passages = []
 
-        if not result['abstained'] and result['selected_passages']:
+        if not result['abstained'] and result['selected_passages'] and has_relation_facets:
             debug_chain = os.environ.get("TRIDENT_DEBUG_CHAIN", "0") == "1"
             debug_css = os.environ.get("TRIDENT_DEBUG_CSS", "0") == "1"
             debug_constrained = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
@@ -760,6 +741,13 @@ class TridentPipeline:
                 total_tokens = 0
                 prompt_tokens = 0
                 completion_tokens = 0
+        elif not result['abstained'] and result['selected_passages'] and not has_relation_facets:
+            # TEMPORARY: Disable JSON-span selection when no relation facets are present
+            answer = ""
+            total_tokens = 0
+            prompt_tokens = 0
+            completion_tokens = 0
+            prompt_type = "none"
         else:
             answer = "ABSTAINED" if result['abstained'] else ""
             total_tokens = 0
