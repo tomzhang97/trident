@@ -410,15 +410,13 @@ class TridentPipeline:
 
         # Mark RELATION facets as required for WH-questions
         # This ensures that the key relation must be certified for valid answers
-        facets = mark_required_facets(facets, query, require_relation=True)
+        facets = mark_required_facets(facets, query)
 
         self.telemetry.log("facet_mining", {
             "num_facets": len(facets),
             "num_required": sum(1 for f in facets if f.required),
             "is_wh_question": is_wh_question(query),
         })
-
-        has_relation_facets = any(f.facet_type == FacetType.RELATION for f in facets)
 
         # CRITICAL FIX: Handle zero facets early with proper abstention
         if not facets:
@@ -561,7 +559,7 @@ class TridentPipeline:
         answer_selection_reason = ""
         winner_passages = []
 
-        if not result['abstained'] and result['selected_passages'] and has_relation_facets:
+        if not result['abstained'] and result['selected_passages']:
             debug_chain = os.environ.get("TRIDENT_DEBUG_CHAIN", "0") == "1"
             debug_css = os.environ.get("TRIDENT_DEBUG_CSS", "0") == "1"
             debug_constrained = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
@@ -741,13 +739,6 @@ class TridentPipeline:
                 total_tokens = 0
                 prompt_tokens = 0
                 completion_tokens = 0
-        elif not result['abstained'] and result['selected_passages'] and not has_relation_facets:
-            # TEMPORARY: Disable JSON-span selection when no relation facets are present
-            answer = ""
-            total_tokens = 0
-            prompt_tokens = 0
-            completion_tokens = 0
-            prompt_type = "none"
         else:
             answer = "ABSTAINED" if result['abstained'] else ""
             total_tokens = 0

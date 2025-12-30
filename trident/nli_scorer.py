@@ -348,15 +348,19 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
             return False
 
         # Predicate constraint
+        predicate_required = bool(relation_kind or relation_pid or predicate)
         predicate_ok = False
         if relation_kind or relation_pid:
             predicate_ok = _check_relation_keywords(relation_kind, passage_norm, passage_tokens, relation_pid=relation_pid)
         if not predicate_ok and predicate:
             predicate_ok = _fuzzy_phrase_match(predicate, passage_norm, passage_tokens)
 
+        if not predicate_required:
+            return True
+
         if not predicate_ok:
             _record_failure("predicate_mismatch")
-            return None
+            return False
 
         return predicate_ok
 

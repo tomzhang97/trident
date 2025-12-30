@@ -591,35 +591,38 @@ class FacetMiner:
         q = query.lower()
         facets: List[Facet] = []
 
-        if "mother of" in q:
-            facets.append(
-                Facet(
-                    facet_id="rel_mother",
-                    facet_type=FacetType.RELATION,
-                    template={
-                        "relation_kind": "MOTHER",
-                        "subject": "?",
-                        "object": "?",
-                        "answer_role": "object",
-                        "is_wh_subject": True,
-                    },
-                )
-            )
+        ents = self._extract_entity_facets(query)
+        anchor = ents[0].template.get("mention", "") if ents else ""
 
-        if "director of" in q:
-            facets.append(
-                Facet(
-                    facet_id="rel_director",
-                    facet_type=FacetType.RELATION,
-                    template={
-                        "relation_kind": "DIRECTOR",
-                        "subject": "?",
-                        "object": "?",
-                        "answer_role": "object",
-                        "is_wh_subject": True,
-                    },
-                )
+        if "mother of" in q and anchor:
+            rel = self._relation_facet_builder(
+                "rel_mother",
+                template={
+                    "relation_kind": "MOTHER",
+                    "subject": "?",
+                    "object": anchor,
+                    "predicate": "mother",
+                    "answer_role": "subject",
+                },
+                metadata={"is_wh_subject": True},
             )
+            if rel:
+                facets.append(rel)
+
+        if "director of" in q and anchor:
+            rel = self._relation_facet_builder(
+                "rel_director",
+                template={
+                    "relation_kind": "DIRECTOR",
+                    "subject": "?",
+                    "object": anchor,
+                    "predicate": "directed",
+                    "answer_role": "subject",
+                },
+                metadata={"is_wh_subject": True},
+            )
+            if rel:
+                facets.append(rel)
 
         return facets
 
