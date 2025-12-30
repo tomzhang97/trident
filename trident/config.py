@@ -41,9 +41,10 @@ class FacetMinerConfig:
 
     # Toggle LLM-driven facet planning (experimental)
     use_llm_facet_plan: bool = False
-
-    # Path to a public normalized relation schema JSON (optional)
-    relation_schema_json_path: Optional[str] = None
+    # Public normalized relation schema JSON (optional)
+    relation_schema_json_path: str | None = None
+    # Option B: single-call LLM to choose relation from schema
+    use_llm_relation_plan: bool = False
 
 
 @dataclass
