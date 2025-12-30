@@ -1340,10 +1340,6 @@ def _extract_first_json_object(text: str) -> str:
     if depth != 0 or end_idx == -1:
         raise ValueError("Unbalanced JSON braces in text")
 
-    remainder = stripped[end_idx + 1:].strip()
-    if remainder:
-        raise ValueError("Extra text after JSON object")
-
     return stripped[start:end_idx + 1]
 
 
@@ -1351,8 +1347,9 @@ def strict_json_call(llm, prompt: str, max_new_tokens: int = 160, temperature: f
     """Run an LLM call that must return exactly one JSON object.
 
     This helper centralizes the JSON-only contract so downstream callers do not
-    attempt their own permissive parsing. Any deviation (extra text, code
-    fences, multiple objects) raises a ValueError to keep behavior fail-closed.
+    attempt their own permissive parsing. It extracts the first balanced JSON
+    object and ignores any trailing text, while still rejecting code fences or
+    unbalanced braces to avoid ambiguous parses.
 
     Returns:
         tuple(parsed_json, raw_output)
