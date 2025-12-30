@@ -33,8 +33,6 @@ def strict_json_call(llm, prompt: str, max_new_tokens: int = 200):
         wrapped,
         temperature=0.0,
         max_new_tokens=max_new_tokens,
-        # stop helps a lot with local models emitting chatter
-        stop=["\n\n", "```", "\n- ", "\nAnswer", "\nExplanation"],
     )
     raw = out.text if hasattr(out, "text") else str(out)
     obj = json.loads(_extract_first_json_object(raw))

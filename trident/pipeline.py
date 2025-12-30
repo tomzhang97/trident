@@ -28,35 +28,16 @@ from .vqc import VerifierQueryCompiler
 from .bwk import BwKController
 from .llm_question_planner import LLMQuestionPlanner
 from .chain_builder import (
-    build_chain_from_certified,
-    build_chain_prompt,
-    build_certificate_aware_prompt,
-    extract_grounded_answer,
-    regex_extract_answer_from_hop2,
-    typed_extract_from_winning_passage,
     bind_entity_from_hop1_winner,
-    # Certified Span Selection (CSS) - general, relation-agnostic extraction
-    certified_span_select,
-    bind_entity_via_css,
     build_inner_question_from_facet,
-    get_winner_passages_only,
-    CSSResult,
-    ReasoningChain,
-    # Constrained Candidate Selection - LLM picks from extracted candidates by index
     detect_question_type,
     extract_candidates,
     compute_support_score,
-    llm_pick_candidate,
     constrained_span_select,
     ConstrainedSelectionResult,
     QuestionType,
-    # Answer-facet targeted passage selection
     get_answer_facet_passages,
-    # LLM-based relation routing
-    llm_route_relation,
-    keyword_route_relation,
-    route_relation,
-    KNOWN_RELATION_TYPES,
+    get_winner_passages_only,
 )
 
 
@@ -586,9 +567,7 @@ class TridentPipeline:
         chain = None
         is_grounded = False
         used_regex_fallback = False
-        used_css = False  # Track if CSS was used
         used_constrained = False  # Track if constrained selection was used
-        css_result = None  # Track CSS result for metrics
         constrained_result = None  # Track constrained selection result
         relation_info = None  # Track the RELATION-winning passage for typed fallback
         facet_id_map = {}  # Track all facet_id -> winning passage mappings
@@ -694,209 +673,25 @@ class TridentPipeline:
                         certified_types = [facet_type_by_id.get(c.get("facet_id")) for c in certificates]
                         print(f"[CONSTRAINED] Skipped: only {certified_types} certified, no answer facets")
 
-            # ================================================================
-            # PRIORITY 1: Certified Span Selection (CSS) - fallback
-            # ================================================================
-            # If constrained selection failed, try free-form CSS with verbatim check.
-            if not answer and certificates:
-                if not winner_passages:
-                    winner_passages = get_winner_passages_only(
-                        certificates,
-                        result['selected_passages']
-                    )
-
-                if debug_chain or debug_css:
-                    print(f"\n[CSS] Attempting Certified Span Selection (fallback)")
-                    print(f"  Winner passages: {len(winner_passages)}")
-
-                if winner_passages:
-                    css_result = certified_span_select(
-                        llm=self.llm,
-                        question=query,
-                        winner_passages=winner_passages,
-                        max_chars_per_passage=800
-                    )
-
-                    if not css_result.abstain:
-                        answer = css_result.answer
-                        is_grounded = True
-                        used_css = True
-                        prompt_type = "css"
-
-                        if debug_chain or debug_css:
-                            print(f"[CSS] Success: '{answer[:50]}...' from {css_result.passage_id}")
-                            print(f"[CSS] Reason: {css_result.reason}, Confidence: {css_result.confidence}")
-                    else:
-                        if debug_chain or debug_css:
-                            print(f"[CSS] Abstained: {css_result.reason}")
-                            if css_result.answer:
-                                print(f"[CSS] Attempted answer: '{css_result.answer[:50]}...'")
-
-            # ================================================================
-            # FALLBACK: Certificate-aware prompting (if CSS abstains)
-            # ================================================================
-            if not answer and certificates:
-                prompt, relation_info, facet_id_map = build_certificate_aware_prompt(
-                    question=query,
-                    certificates=certificates,
-                    passages=result['selected_passages'],
-                    facets=facet_dicts
-                )
-                if prompt:
-                    prompt_type = "certificate_aware"
-                if debug_chain:
-                    print(f"\n[CERT-AWARE DEBUG] Built certificate-aware prompt:")
-                    print(f"  Facets with winners: {list(facet_id_map.keys())[:5]}...")
-                    if relation_info:
-                        print(f"  RELATION-winning passage: {relation_info['passage_id'][:12]}...")
-                        print(f"  RELATION-winning p-value: {relation_info['p_value']:.4g}")
-                        print(f"  RELATION passage text: {relation_info['passage'].get('text', '')[:100]}...")
-
-            # ================================================================
-            # FALLBACK PATH: Only if CSS didn't produce an answer
-            # ================================================================
-            if not answer:
-                # FALLBACK: If no certificate-aware prompt, try chain-based approach
-                if not prompt:
-                    # Build reasoning chain from certified passages
-                    chain = build_chain_from_certified(
-                        certified_passages=result['selected_passages'],
-                        question=query,
-                        facets=facet_dicts,
-                        certificates=certificates
-                    )
-
-                    if debug_chain and chain:
-                        print(f"\n[CHAIN DEBUG] Built chain (fallback):")
-                        print(f"  Bridge entity: {chain.bridge_entity}")
-                        print(f"  Hop1: {chain.hop1.passage_text[:100]}...")
-                        print(f"  Hop2: {chain.hop2.passage_text[:100]}...")
-                        print(f"  Score: {chain.score}")
-
-                    if chain:
-                        # Use chain-based prompt for structured reasoning
-                        prompt = build_chain_prompt(
-                            question=query,
-                            chain=chain,
-                            facets=facet_dicts
-                        )
-                        prompt_type = "chain_based"
-
-                # FINAL FALLBACK: Regular prompt if nothing else works
-                if not prompt:
-                    dataset_name = getattr(self.config.evaluation, 'dataset', 'multi-hop QA')
-                    prompt = self.llm.build_multi_hop_prompt(
-                        question=query,
-                        passages=result['selected_passages'],
-                        facets=facet_dicts,
-                        dataset=dataset_name
-                    )
-                    prompt_type = "regular"
-
-                llm_output = self.llm.generate(prompt)
-                raw_answer = llm_output.text
-
-                # Extract and clean the final answer
-                answer = extract_final_answer(raw_answer, query)
-
-                # GROUNDED EXTRACTION: Verify answer is in the RELATION-winning passage (or hop2)
-                grounding_text = None
-                if relation_info:
-                    grounding_text = relation_info['passage'].get('text', '')
-                elif chain:
-                    grounding_text = chain.hop2.passage_text
-
-                if grounding_text and answer:
-                    grounded_answer, is_grounded = extract_grounded_answer(
-                        llm_answer=answer,
-                        hop2_text=grounding_text
-                    )
-                    if debug_chain:
-                        print(f"[GROUNDING DEBUG] Grounding check:")
-                        print(f"  Raw answer: {answer[:100]}...")
-                        print(f"  Grounded: {is_grounded}")
-                        if is_grounded:
-                            print(f"  Grounded answer: {grounded_answer[:100]}...")
-
-                    # Use grounded answer if found
-                    if is_grounded:
-                        answer = grounded_answer
-
-            # ANSWER VALIDATION: Check for garbage answers even with certified evidence
-            # LLM can still output: empty, underscores, partial clauses, instruction text
+            # ANSWER VALIDATION: ensure we only keep grounded, non-empty answers
             def _is_garbage_answer(ans: str) -> bool:
-                """Check if answer is garbage (empty, meta, punctuation-only, etc.)."""
                 if not ans or not ans.strip():
                     return True
                 ans_stripped = ans.strip()
-                # Punctuation/underscore only
                 if re.fullmatch(r"[_\-\s\.\,\!\?\:]+", ans_stripped):
                     return True
-                # Too short (likely garbage)
                 if len(ans_stripped) < 2:
                     return True
-                # Looks like meta/instruction text
                 if _looks_like_meta(ans_stripped):
                     return True
-                # Abstention pattern
                 if _is_abstain_answer(ans_stripped):
                     return True
                 return False
 
-            def _is_grounded_in_text(ans: str, text: str) -> bool:
-                """Check if answer is a substring of the text (case-insensitive)."""
-                if not ans or not text:
-                    return False
-                return ans.strip().lower() in text.lower()
-
-            # TYPED FALLBACK: If model abstains OR produces garbage, use typed extraction
             answer_is_invalid = _is_garbage_answer(answer)
-
-            # Extra validation: if we have RELATION-winning passage, check grounding
-            if not answer_is_invalid and relation_info and not is_grounded:
-                rel_text = relation_info['passage'].get('text', '')
-                if rel_text and not _is_grounded_in_text(answer, rel_text):
-                    # Answer not grounded in RELATION-winning passage - suspicious
-                    if debug_chain:
-                        print(f"[VALIDATION DEBUG] Answer not grounded in RELATION-winning passage")
-                        print(f"  Answer: {answer[:50]}...")
-                    # Only mark as invalid if it looks like a partial clause
-                    if len(answer.split()) <= 3 and answer.lower().startswith(('of ', 'the ', 'a ', 'in ')):
-                        answer_is_invalid = True
-
             if answer_is_invalid:
-                if debug_chain:
-                    print(f"[VALIDATION DEBUG] Answer invalid, triggering typed fallback:")
-                    print(f"  Original answer: {answer[:50]}...")
-
-                fb = None
-
-                # PRIORITY 1: Typed extraction from RELATION-winning passage
-                if relation_info:
-                    fb = typed_extract_from_winning_passage(
-                        question=query,
-                        relation_info=relation_info
-                    )
-                    if debug_chain and fb:
-                        print(f"[TYPED FALLBACK DEBUG] Extracted from RELATION-winning passage:")
-                        print(f"  Extracted answer: {fb}")
-
-                # FALLBACK: Old regex extraction from hop2 (less accurate)
-                if not fb and chain:
-                    fb = regex_extract_answer_from_hop2(
-                        question=query,
-                        facets=facet_dicts,
-                        hop2_text=chain.hop2.passage_text
-                    )
-                    if debug_chain and fb:
-                        print(f"[REGEX FALLBACK DEBUG] Extracted from hop2 (less reliable):")
-                        print(f"  Extracted answer: {fb}")
-
-                if fb:
-                    answer = fb
-                    is_grounded = True
-                    used_regex_fallback = True
-
+                answer = ""
+                is_grounded = False
             # DEBUG: Log when answer becomes empty after extraction
             if not answer or answer.strip() == "":
                 if os.environ.get("TRIDENT_DEBUG_EMPTY_ANSWER", "0") == "1":
@@ -904,9 +699,6 @@ class TridentPipeline:
                     print(f"  Query: {query[:100]}...")
                     if prompt:
                         print(f"  Prompt (last 300 chars): ...{prompt[-300:]}")
-                    print(f"  Used CSS: {used_css}")
-                    if css_result:
-                        print(f"  CSS result: abstain={css_result.abstain}, reason={css_result.reason}")
                     print(f"  Extracted answer: '{answer}'")
                     print(f"  Mode: {mode}")
                     print(f"  Num passages: {len(result['selected_passages'])}")
@@ -961,37 +753,19 @@ class TridentPipeline:
             'total_tokens': total_tokens,
             'overhead_tokens': max(total_tokens - evidence_tokens, 0),
             'model_abstained': model_abstained,  # Track when model says "I cannot answer"
-            # Extraction method tracking (constrained > css > certificate_aware > chain_based > regular > none)
             'prompt_type': prompt_type,
-            # Constrained Candidate Selection metrics - primary extraction method
             'used_constrained': used_constrained,
             'constrained_reason': constrained_result.reason if constrained_result else None,
             'constrained_confidence': constrained_result.confidence if constrained_result else None,
             'constrained_candidate_index': constrained_result.candidate_index if constrained_result else None,
             'constrained_num_candidates': len(constrained_result.candidates) if constrained_result else 0,
             'constrained_passage_id': constrained_result.passage_id if constrained_result else None,
-            # Answer-facet targeting metrics
             'answer_facet_ids': answer_facet_ids,
             'answer_selection_reason': answer_selection_reason,
-            # Certified Span Selection (CSS) metrics - fallback extraction method
-            'used_css': used_css,
-            'css_reason': css_result.reason if css_result else None,
-            'css_confidence': css_result.confidence if css_result else None,
-            'css_passage_id': css_result.passage_id if css_result else None,
-            # Certificate metrics - FIXED: use actual certificate count, not facet_id_map
             'num_certificates': len(certificates),
             'num_certified_facets': len(certified_facet_ids),
             'certified_facet_ids': list(certified_facet_ids),
-            # Certificate-aware reasoning metrics (fallback)
-            'relation_winning_passage': relation_info['passage_id'] if relation_info else None,
-            'relation_winning_pvalue': relation_info['p_value'] if relation_info else None,
-            # Chain-based reasoning metrics (fallback)
-            'chain_built': chain is not None,
-            'chain_score': chain.score if chain else 0.0,
-            'bridge_entity': chain.bridge_entity if chain else None,
             'answer_grounded': is_grounded,
-            'answer_from_typed_fallback': used_regex_fallback and relation_info is not None,
-            'answer_from_regex_fallback': used_regex_fallback and relation_info is None,
         })
 
         return PipelineOutput(

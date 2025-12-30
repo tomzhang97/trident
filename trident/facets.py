@@ -16,11 +16,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .relation_templates import RELATION_SLOT_TO_TEMPLATE
 
-try:
-    import spacy
-except Exception:
-    spacy = None
-
 _PUNCT_FIX_RE = re.compile(r"\s+([,.;:?!])")
 _MULTI_SPACE_RE = re.compile(r"\s{2,}")
 _APOS_S_RE = re.compile(r"\s+'s\b", re.IGNORECASE)
@@ -45,23 +40,6 @@ def _safe_phrase(s: str) -> str:
     s = s.strip("`\"' ")
     return _clean_text(s)
 
-def _normalize_relation_predicate(pred: str) -> str:
-    pred = _clean_text(pred).lower().strip()
-    mapping = {
-        "capital_of": "is the capital of",
-        "located_in": "is located in",
-        "created": "was created by",
-        "directed": "was directed by",
-        "written": "was written by",
-        "produced": "was produced by",
-        "founded": "was founded by",
-        "related_to": "is related to",
-        "features": "features"
-    }
-    for k, v in mapping.items():
-        if k in pred: return v
-    return pred or "is related to"
-
 def _looks_like_junk_entity(mention: str) -> bool:
     m = _safe_phrase(mention)
     if not m: return True
@@ -79,26 +57,6 @@ _RELATION_GENERIC = {"the", "a", "an", "of", "to", "in", "on", "for", "and", "or
                      "did", "will", "would", "could", "should", "may", "might", "must", "shall",
                      "director", "film", "movie", "actor", "actress", "person", "thing", "place",
                      "name", "title", "author", "writer", "book", "song", "album", "band", "group"}
-
-def _clean_relation_endpoint_for_hypothesis(x: str) -> str:
-    """
-    Clean a RELATION endpoint for hypothesis construction.
-    Removes WH-words and generic terms, returns what's left or empty string.
-    """
-    if not x:
-        return ""
-    x = _safe_phrase(x)
-    # Check if it's a pure WH-word
-    if x.lower() in _RELATION_WH_WORDS:
-        return ""
-    # Extract tokens and filter
-    toks = re.findall(r"[A-Za-z0-9]+", x)
-    cleaned = [t for t in toks if t.lower() not in _RELATION_WH_WORDS
-               and t.lower() not in _RELATION_GENERIC and len(t) > 1]
-    if not cleaned:
-        return ""
-    # Return original if it contains meaningful content, otherwise cleaned version
-    return x if len(cleaned) >= len(toks) // 2 else " ".join(cleaned)
 
 def _dedupe_strings(xs: List[str]) -> List[str]:
     seen: Set[str] = set()
@@ -380,214 +338,12 @@ class Facet:
             if custom_hyp:
                 return _ensure_sentence(str(custom_hyp))
 
-            s_raw = tpl.get('subject', '')
-            o_raw = tpl.get('object', '')
-            p = _normalize_relation_predicate(tpl.get('predicate', ''))
-            # Clean endpoints - remove WH-words and generic terms
-            s = _clean_relation_endpoint_for_hypothesis(s_raw)
-            o = _clean_relation_endpoint_for_hypothesis(o_raw)
-
-            # PREDICATE-SPECIFIC HYPOTHESIS TEMPLATES
-            # "The passage states something about X" is TOO PERMISSIVE
-            # Use predicate-specific templates that require the actual relation
-            #
-            # CRITICAL FIX: Check for EXPLICIT relation_kind in template FIRST
-            # This is needed for compositional hop-2 facets where the subject
-            # contains "[DIRECTOR_RESULT]" but the actual relation is MOTHER
-            #
-            # PARENT NORMALIZATION: Prefer scoring_relation_kind over outer_relation_type.
-            # This allows MOTHER/FATHER to be scored as PARENT for better NLI matching.
-            explicit_relation_kind = (
-                tpl.get('scoring_relation_kind') or
-                tpl.get('outer_relation_type') or
-                tpl.get('relation_kind')
-            )
-
-            # D1 FIX: For hop-2 compositional facets, make hypothesis entity-anchored
-            # After instantiation, the subject should be a real entity name (not placeholder)
-            is_hop2 = tpl.get('hop') == 2
-            is_instantiated = (self.metadata or {}).get('instantiated', False)
-            is_placeholder = s_raw.startswith('[') and s_raw.endswith('_RESULT]')
-
-            if is_hop2:
-                if is_placeholder:
-                    # Subject still has placeholder - not yet instantiated
-                    # Use generic "the person" (this facet shouldn't be scored yet)
-                    s = "the person"
-                elif is_instantiated and s:
-                    # D1 FIX: Subject is instantiated - use the actual entity name
-                    # This anchors the hypothesis to the specific person for NLI matching
-                    # e.g., "The passage states the mother of Andrzej Żuławski"
-                    pass  # s is already set correctly from s_raw via _clean_relation_endpoint_for_hypothesis
-                # If hop-2 but not instantiated and not placeholder, use s as-is
-
-            # Detect relation kind - explicit first, then keyword fallback
-            relation_kind = "DEFAULT"
-            hypothesis = None
-
-            # Helper: strip relation suffix words from entity to avoid duplication
-            # e.g., "film X won" -> "film X" when template adds "won"
-            def _strip_relation_suffix(entity: str, suffixes: list) -> str:
-                """Strip trailing relation words from entity string."""
-                if not entity:
-                    return entity
-                import re
-                # Build pattern: match any suffix word at end (with optional punctuation)
-                pattern = r'\s+(?:' + '|'.join(re.escape(w) for w in suffixes) + r')[\s\.\?\!]*$'
-                return re.sub(pattern, '', entity, flags=re.IGNORECASE).strip()
-
-            # ================================================================
-            # EXPLICIT RELATION KIND (from compositional facets)
-            # ================================================================
-            if explicit_relation_kind:
-                relation_kind = explicit_relation_kind
-
-                if relation_kind == "MOTHER":
-                    # "The passage states who is the mother of X" or
-                    # "The passage states that X is the son/daughter of Y"
-                    hypothesis = f"The passage states the mother of {s}" if s else "The passage identifies a mother-child relationship"
-
-                elif relation_kind == "FATHER":
-                    hypothesis = f"The passage states the father of {s}" if s else "The passage identifies a father-child relationship"
-
-                elif relation_kind in ("PARENT", "CHILD"):
-                    hypothesis = f"The passage states a parent-child relationship involving {s}" if s else "The passage identifies a parent-child relationship"
-
-                elif relation_kind == "SPOUSE":
-                    hypothesis = f"The passage states who {s} married" if s else "The passage identifies a marriage/spouse relationship"
-
-                elif relation_kind == "NATIONALITY":
-                    hypothesis = f"The passage states the nationality of {s}" if s else "The passage identifies someone's nationality"
-
-                elif relation_kind == "BIRTHPLACE":
-                    hypothesis = f"The passage states where {s} was born" if s else "The passage identifies someone's birthplace"
-
-                elif relation_kind == "AWARD":
-                    hypothesis = f"The passage states what award {s} won" if s else "The passage identifies an award"
-
-                # If explicit relation kind matched, return now
-                if hypothesis:
-                    import os
-                    if os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1":
-                        print(f"[RELATION HYP] EXPLICIT relation_kind={relation_kind} hypothesis={hypothesis}")
-                    return _ensure_sentence(hypothesis)
-
-            # ================================================================
-            # KEYWORD-BASED RELATION KIND (fallback for non-compositional facets)
-            # ================================================================
-            # CRITICAL: For compositional hop-2 facets, we should have matched above.
-            # This section is for regular (non-compositional) RELATION facets.
-            facet_text_lower = f"{s_raw} {o_raw} {p}".lower()
-
-            # Skip keyword detection if this is a hop-2 facet (should have been handled above)
-            if tpl.get('hop') == 2:
-                # Hop-2 without explicit relation_kind - use generic hypothesis
-                if bound_entity_var:
-                    relation_kind = "HOP2_GENERIC"
-                    hypothesis = f"The passage states information about {s}"
-                    import os
-                    if os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1":
-                        print(f"[RELATION HYP] HOP2 generic: {hypothesis}")
-                    return _ensure_sentence(hypothesis)
-
-            # Director/directed
-            if 'direct' in facet_text_lower or 'director' in facet_text_lower:
-                relation_kind = "DIRECTOR"
-                # Strip director-related words from object to avoid "directed directed"
-                o_clean = _strip_relation_suffix(o, ['director', 'directed', 'directs', 'directing',
-                                                      'director of', 'directed by'])
-                s_clean = _strip_relation_suffix(s, ['director', 'directed', 'directs', 'directing'])
-                if o_clean:
-                    hypothesis = f"The passage states who directed {o_clean}"
-                elif s_clean:
-                    hypothesis = f"The passage states that {s_clean} directed a film"
-
-            # Born/birthplace
-            elif 'born' in facet_text_lower or 'birth' in facet_text_lower:
-                relation_kind = "BORN"
-                # Strip birth-related words from object
-                o_clean = _strip_relation_suffix(o, ['born', 'birth', 'birthplace', 'born in',
-                                                      'was born', 'birthdate', 'birthday'])
-                s_clean = _strip_relation_suffix(s, ['born', 'birth', 'birthplace', 'was born'])
-                if 'where' in s_raw.lower() or 'place' in facet_text_lower:
-                    if o_clean:
-                        hypothesis = f"The passage states where {o_clean} was born"
-                    elif s_clean:
-                        hypothesis = f"The passage states the birthplace of {s_clean}"
-                else:
-                    if o_clean:
-                        hypothesis = f"The passage states when {o_clean} was born"
-                    elif s_clean:
-                        hypothesis = f"The passage states when {s_clean} was born"
-
-            # Won/award/prize
-            elif any(w in facet_text_lower for w in ['won', 'win', 'award', 'prize', 'honor']):
-                relation_kind = "AWARD"
-                # Strip award-related words from object to avoid "X won won"
-                o_clean = _strip_relation_suffix(o, ['won', 'wins', 'winning', 'win', 'award',
-                                                      'awards', 'awarded', 'nominated', 'prize',
-                                                      'prizes', 'honor', 'honors', 'honoured'])
-                s_clean = _strip_relation_suffix(s, ['won', 'wins', 'winning', 'win', 'award'])
-                if o_clean:
-                    hypothesis = f"The passage states what award {o_clean} won"
-                elif s_clean:
-                    hypothesis = f"The passage states what {s_clean} won"
-
-            # Created/founded/written
-            elif any(w in facet_text_lower for w in ['creat', 'found', 'writ', 'author', 'compose']):
-                relation_kind = "CREATED"
-                o_clean = _strip_relation_suffix(o, ['created', 'wrote', 'written', 'founded',
-                                                      'authored', 'composed', 'created by'])
-                s_clean = _strip_relation_suffix(s, ['created', 'wrote', 'written', 'founded'])
-                if o_clean:
-                    hypothesis = f"The passage states who created {o_clean}"
-                elif s_clean:
-                    hypothesis = f"The passage states what {s_clean} created"
-
-            # Located/capital
-            elif any(w in facet_text_lower for w in ['locat', 'capital', 'situat', 'based']):
-                relation_kind = "LOCATION"
-                if o:
-                    hypothesis = f"The passage states where {o} is located"
-                elif s:
-                    hypothesis = f"The passage states the location of {s}"
-
-            # Married/spouse
-            elif any(w in facet_text_lower for w in ['marr', 'spouse', 'wife', 'husband']):
-                relation_kind = "MARRIAGE"
-                if o:
-                    hypothesis = f"The passage states who {o} married"
-                elif s:
-                    hypothesis = f"The passage states the spouse of {s}"
-
-            # Debug logging
-            import os
-            if os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1":
-                print(f"[RELATION HYP] relation_kind={relation_kind} raw_predicate='{p}' "
-                      f"facet_text='{facet_text_lower[:60]}...' hypothesis={hypothesis}")
-
-            # Return specific hypothesis if we matched a relation kind
-            if hypothesis:
-                # Sanity check in debug mode
-                if os.environ.get("TRIDENT_DEBUG_RELATION", "0") == "1":
-                    hyp_lower = hypothesis.lower()
-                    if relation_kind == "DIRECTOR" and "direct" not in hyp_lower:
-                        print(f"[RELATION HYP] WARNING: DIRECTOR kind but 'direct' not in hypothesis!")
-                    if relation_kind == "AWARD" and not any(w in hyp_lower for w in ["award", "won"]):
-                        print(f"[RELATION HYP] WARNING: AWARD kind but no award word in hypothesis!")
-                return _ensure_sentence(hypothesis)
-
-            # Default: use predicate in hypothesis (still better than "something about")
-            if s and o:
-                return _ensure_sentence(f"The passage states that {s} {p} {o}")
-            elif o:
-                # Use predicate in template to be more specific
-                return _ensure_sentence(f"The passage states the {p} of {o}")
-            elif s:
-                return _ensure_sentence(f"The passage states what {s} {p}")
-            else:
-                # Both endpoints are garbage - use a generic hypothesis that NLI will likely reject
-                return _ensure_sentence(f"The passage states a factual relationship")
+            subject = _safe_phrase(tpl.get("subject", ""))
+            predicate = _safe_phrase(tpl.get("predicate", ""))
+            obj = _safe_phrase(tpl.get("object", ""))
+            anchor = obj or subject or "the topic"
+            core = predicate if predicate else "is related to"
+            return _ensure_sentence(f"The passage states that {anchor} {core}.")
 
         if ft == FacetType.TEMPORAL:
             time = tpl.get('time', '')
@@ -704,13 +460,8 @@ class FacetMiner:
         # Kept None-safe: all LLM-driven behavior is gated by config/env flags.
         self.llm = llm
 
-        # Optional NLP (spaCy). Always define the attribute (fixes AttributeError in older runs).
+        # NLP dependency removed for stability; keep attribute for compatibility.
         self.nlp = None
-        if spacy is not None:
-            try:
-                self.nlp = spacy.load("en_core_web_sm")
-            except Exception:
-                self.nlp = None
 
     def _relation_facet_builder(
         self,
@@ -812,17 +563,6 @@ class FacetMiner:
         facets.extend(self._extract_comparison_facets(query))
         facets.extend(self._extract_causal_facets(query))
 
-        # CRITICAL: Extract compositional (2-hop) facets BEFORE bridge facets
-        # e.g., "mother of the director of film X" -> DIRECTOR + MOTHER facets
-        facets.extend(self._extract_compositional_facets(query))
-
-        dataset = str(getattr(self.config, "dataset", "")).lower()
-        if "hotpot" not in dataset:
-            facets.extend(self._extract_procedural_facets(query))
-
-        if self._is_multi_hop(query):
-            facets.extend(self._extract_bridge_facets(query, supporting_facts))
-
         return self._deduplicate_facets(facets)
 
     # ---- entity ----
@@ -837,11 +577,6 @@ class FacetMiner:
 
     def _extract_entity_facets(self, query: str) -> List[Facet]:
         mentions: List[str] = []
-        if self.nlp is not None:
-            doc = self.nlp(query)
-            for ent in doc.ents:
-                m = (ent.text or "").strip()
-                if not _looks_like_junk_entity(m): mentions.append(m)
         mentions.extend(self._extract_or_entities(query))
         if not mentions:
             mentions.extend(re.findall(r"\b[A-Z][A-Za-z0-9']+(?:\s+[A-Z][A-Za-z0-9']+)*\b", query))
@@ -892,35 +627,7 @@ class FacetMiner:
                 if facets:
                     return facets
 
-        return self._extract_relation_facets_heuristic(query)
-
-    def _extract_relation_facets_heuristic(self, query: str) -> List[Facet]:
-        facets: List[Facet] = []
-        patterns = [
-            (r"(.+?)\s+(?:is|was|were|are)\s+(?:founded|created|written|directed|produced)\s+by\s+(.+?)(?:\?|$)", "created"),
-            (r"(.+?)\s+(?:is|was|are|were)\s+the\s+capital\s+of\s+(.+?)(?:\?|$)", "capital_of"),
-            (r"(.+?)\s+(?:is|was|are|were)\s+(?:located|situated)\s+in\s+(.+?)(?:\?|$)", "located_in"),
-            (r"(.+?)\s+(?:is|was|are|were)\s+(.+?)\s+of\s+(.+?)(?:\?|$)", "related_to"),
-        ]
-        q = _clean_text(query)
-        for pat, rel_type in patterns:
-            for m in re.finditer(pat, q, flags=re.IGNORECASE):
-                g = []
-                for grp in m.groups():
-                    clean = _safe_phrase(grp)
-                    clean = re.sub(r"^(which|what|who|where|when|why|how)\s+\w+\s*", "", clean, flags=re.IGNORECASE).strip()
-                    clean = re.sub(r"^(which|what|who|where|when|why|how)\s+(?:of\s+the\s+following\s+)?", "", clean, flags=re.IGNORECASE).strip()
-                    g.append(clean)
-
-                if len(g) < 2 or not g[0] or not g[-1]:
-                    continue
-                facet = self._build_relation_facet(
-                    f"relation_{len(facets)}",
-                    {"subject": g[0], "predicate": rel_type, "object": g[-1]},
-                )
-                if facet is not None:
-                    facets.append(facet)
-        return facets
+        return []
 
     # ---- temporal ----
     def _extract_temporal_facets(self, query: str) -> List[Facet]:
@@ -937,30 +644,13 @@ class FacetMiner:
     def _extract_numeric_facets(self, query: str) -> List[Facet]:
         facets: List[Facet] = []
         numeric_pattern = r"\b(\d+(?:\.\d+)?)\s*(%|percent|million|billion|thousand|hundred)?\b"
-        doc = self.nlp(query) if self.nlp else None
-        
         for m in re.finditer(numeric_pattern, query, flags=re.IGNORECASE):
             value = _safe_phrase(m.group(1))
             unit = _safe_phrase(m.group(2) or "")
             if not value: continue
-            
+
             entity, attribute = "", ""
-            if doc:
-                val_start, val_end = m.span(1)
-                for token in doc:
-                    if token.idx >= val_start and token.idx < val_end:
-                        head = token.head
-                        if head.pos_ in ["NOUN", "PROPN"]:
-                            attribute = head.text
-                            for child in head.children:
-                                if child.dep_ == "prep" and child.text == "of":
-                                    for pobj in child.children:
-                                        if pobj.dep_ == "pobj": entity = self._get_compound_noun(pobj)
-                        if head.dep_ == "prep" and head.head.pos_ == "VERB":
-                            attribute = head.head.text
-                            for child in head.head.children:
-                                if child.dep_ in ["nsubj", "nsubjpass"]: entity = self._get_compound_noun(child)
-            
+
             if not entity and not attribute:
                 q_lower = query.lower()
                 if "population" in q_lower: attribute = "population"
@@ -970,12 +660,6 @@ class FacetMiner:
             
             facets.append(Facet(facet_id=f"numeric_{len(facets)}", facet_type=FacetType.NUMERIC, template={"value": value, "unit": unit, "entity": entity, "attribute": attribute}))
         return facets
-
-    def _get_compound_noun(self, token) -> str:
-        phrase = token.text
-        lefts = sorted([t for t in token.lefts if t.dep_ in ["compound", "det", "amod"]], key=lambda t: t.i)
-        if lefts: phrase = f"{' '.join(t.text for t in lefts)} {phrase}"
-        return phrase
 
     # ---- comparison ----
     def _extract_comparison_facets(self, query: str) -> List[Facet]:

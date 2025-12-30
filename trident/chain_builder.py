@@ -1356,13 +1356,10 @@ def strict_json_call(llm, prompt: str, max_new_tokens: int = 160, temperature: f
 
     guard = "Return ONLY JSON. No extra keys. No commentary."
     wrapped_prompt = f"{guard}\n{prompt.strip()}\n{guard}"
-    stop_sequences = ["\n\n", "\n[", "}\n"]
-
     raw = llm.generate(
         wrapped_prompt,
         temperature=temperature,
         max_new_tokens=max_new_tokens,
-        stop=stop_sequences,
     )
     raw_text = raw.text if hasattr(raw, "text") else str(raw)
     parsed = json.loads(_extract_first_json_object(raw_text))
@@ -1592,6 +1589,21 @@ class QuestionType:
     category: str  # "either_or", "who", "what", "where", "when", "how_many", "yes_no", "other"
     expected_type: str  # "PERSON", "PLACE", "DATE", "NUMBER", "BINARY", "ENTITY", "OTHER"
     options: Optional[List[str]] = None  # For either/or questions
+
+
+@dataclass
+class ConstrainedSelectionResult:
+    """Result from constrained candidate selection."""
+    answer: str
+    candidate_index: int
+    confidence: float
+    passage_id: str
+    candidates: List[str]
+    support_scores: List[float]
+    reason: str  # OK, NO_PASSAGES, NO_VERIFIED_SPAN, etc.
+    tokens_used: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 def detect_question_type(question: str) -> QuestionType:
@@ -1966,253 +1978,11 @@ def compute_support_score(
     return score
 
 
-@dataclass
-class ConstrainedSelectionResult:
-    """Result from constrained candidate selection."""
-    answer: str
-    candidate_index: int
-    confidence: float
-    passage_id: str
-    candidates: List[str]
-    support_scores: List[float]
-    reason: str  # OK, NO_CANDIDATES, LLM_ERROR, INVALID_INDEX
-    tokens_used: int = 0
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-
-
-def llm_pick_candidate(
-    llm,
-    question: str,
-    passages: List[Dict[str, Any]],
-    candidates: List[Tuple[str, float, str]],
-    max_chars_per_passage: int = 600
-) -> ConstrainedSelectionResult:
-    """
-    Ask LLM to pick ONE candidate by index from a constrained set.
-
-    CRITICAL: LLM can ONLY pick from the provided candidates by index.
-    This ensures the answer is always a verbatim substring from evidence.
-
-    Args:
-        llm: LLM interface with generate() method
-        question: The question to answer
-        passages: Winner passages for context
-        candidates: List of (text, support_score, source_pid) tuples
-        max_chars_per_passage: Max chars per passage in prompt
-
-    Returns:
-        ConstrainedSelectionResult with selected answer and metadata
-    """
-    import json as json_module
-    import os
-
-    debug = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
-
-    if not candidates:
-        return ConstrainedSelectionResult(
-            answer="",
-            candidate_index=-1,
-            confidence=0.0,
-            passage_id="",
-            candidates=[],
-            support_scores=[],
-            reason="NO_CANDIDATES"
-        )
-
-    # Build evidence text
-    evidence_parts = []
-    for i, p in enumerate(passages[:5]):  # Limit to 5 passages
-        pid = p.get("pid", f"P{i}")
-        title = p.get("title", "")
-        text = (p.get("text") or "")[:max_chars_per_passage]
-        evidence_parts.append(f"[{pid}] {title}\n{text}")
-    evidence_text = "\n\n".join(evidence_parts)
-
-    # Build candidate list with indices
-    candidate_list = []
-    candidate_texts = []
-    support_scores = []
-    for i, (text, score, pid) in enumerate(candidates):
-        candidate_list.append(f"{i}: {text}")
-        candidate_texts.append(text)
-        support_scores.append(score)
-    candidates_text = "\n".join(candidate_list)
-
-    # Prompt: LLM must pick by index ONLY
-    prompt = f"""Pick the ONE candidate that best answers the question.
-
-RULES:
-1. You MUST pick from the numbered candidates below
-2. Return ONLY a JSON object with "index" (integer) and "confidence" (0-1)
-3. If no candidate answers the question, return {{"index": -1, "confidence": 0}}
-
-Question: {question}
-
-Candidates:
-{candidates_text}
-
-Evidence:
-{evidence_text}
-
-JSON:"""
-
-    if debug:
-        print(f"[CONSTRAINED] Prompt:\n{prompt[:500]}...")
-        print(f"[CONSTRAINED] {len(candidates)} candidates")
-
-    try:
-        out, raw = strict_json_call(llm, prompt, max_new_tokens=160, temperature=0.0)
-        raw_text = raw.text if hasattr(raw, 'text') else str(raw)
-    except Exception as e:
-        if debug:
-            print(f"[CONSTRAINED] JSON parse error: {e}")
-        return ConstrainedSelectionResult(
-            answer="",
-            candidate_index=-1,
-            confidence=0.0,
-            passage_id="",
-            candidates=candidate_texts,
-            support_scores=support_scores,
-            reason="PARSE_ERROR"
-        )
-
-    if debug:
-        print(f"[CONSTRAINED] Raw output: {raw_text[:200]}...")
-
-    prompt_tokens = getattr(raw, "prompt_tokens", 0) or 0
-    completion_tokens = getattr(raw, "completion_tokens", 0) or 0
-    tokens_used = getattr(raw, "tokens_used", 0) or (prompt_tokens + completion_tokens)
-
-    if not prompt_tokens and hasattr(llm, "compute_token_cost"):
-        try:
-            prompt_tokens = llm.compute_token_cost(prompt)
-            tokens_used = tokens_used or prompt_tokens + completion_tokens
-        except Exception:
-            prompt_tokens = prompt_tokens
-
-    # JSON already parsed via strict_json_call
-
-    index = out.get("index", -1)
-    confidence = float(out.get("confidence", 0.5))
-
-    # Validate index
-    if not isinstance(index, int) or index < 0 or index >= len(candidates):
-        if debug:
-            print(f"[CONSTRAINED] Invalid index: {index}")
-        # Fallback: pick the candidate with highest support score
-        if candidates:
-            best_idx = 0
-            best_score = candidates[0][1]
-            for i, (_, score, _) in enumerate(candidates):
-                if score > best_score:
-                    best_score = score
-                    best_idx = i
-            return ConstrainedSelectionResult(
-                answer=candidates[best_idx][0],
-                candidate_index=best_idx,
-                confidence=0.3,  # Low confidence for fallback
-                passage_id=candidates[best_idx][2],
-                candidates=candidate_texts,
-                support_scores=support_scores,
-                reason="FALLBACK_SUPPORT",
-                tokens_used=tokens_used,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-            )
-        return ConstrainedSelectionResult(
-            answer="",
-            candidate_index=-1,
-            confidence=0.0,
-            passage_id="",
-            candidates=candidate_texts,
-            support_scores=support_scores,
-            reason="INVALID_INDEX",
-            tokens_used=tokens_used,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-        )
-
-    # Valid selection
-    selected = candidates[index]
-    if debug:
-        print(f"[CONSTRAINED] Selected index {index}: '{selected[0]}'")
-
-    return ConstrainedSelectionResult(
-        answer=selected[0],
-        candidate_index=index,
-        confidence=confidence,
-        passage_id=selected[2],
-        candidates=candidate_texts,
-        support_scores=support_scores,
-        reason="OK",
-        tokens_used=tokens_used,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-    )
-
-
-def _llm_rank_answer_facets(
-    llm,
-    question: str,
-    facet_descriptions: List[Dict[str, str]],
-    debug: bool = False,
-    metrics: Optional[Dict[str, int]] = None,
-) -> List[str]:
-    """Use LLM to rank answer facets without expanding the certified set."""
-
-    if not llm or not facet_descriptions:
-        return []
-
-    allow_ids = [f.get("facet_id", "") for f in facet_descriptions if f.get("facet_id")]
-    if not allow_ids:
-        return []
-
-    prompt_lines = [
-        "You are selecting which certified facets determine the answer.",
-        "Pick up to 3 facet_ids from the list. Return JSON: {\"facet_ids\":[...]} only.",
-        f"Question: {question}",
-        "Facets:",
-    ]
-
-    for f in facet_descriptions:
-        fid = f.get("facet_id", "")
-        ftype = f.get("facet_type", "")
-        ftext = f.get("facet_text", "") or f.get("text", "")
-        prompt_lines.append(f"- {fid} ({ftype}): {ftext}")
-
-    prompt_lines.append("JSON:")
-    prompt = "\n".join(prompt_lines)
-
-    if metrics is not None:
-        metrics["llm_ranker_calls"] = metrics.get("llm_ranker_calls", 0) + 1
-
-    try:
-        out, raw = strict_json_call(llm, prompt, max_new_tokens=128, temperature=0.0)
-        raw_text = raw.text if hasattr(raw, "text") else str(raw)
-        chosen = out.get("facet_ids") or []
-        if not isinstance(chosen, list):
-            return []
-        # Validate subset
-        allow_set = set(allow_ids)
-        ranked = [fid for fid in chosen if fid in allow_set]
-        if metrics is not None and ranked:
-            metrics["llm_ranker_success"] = metrics.get("llm_ranker_success", 0) + 1
-        if debug:
-            print(f"[LLM_RANKER] chosen={ranked}")
-        return ranked
-    except Exception as e:
-        if debug:
-            print(f"[LLM_RANKER] failed: {e}")
-        return []
-
-
 def get_answer_facet_passages(
     question: str,
     certificates: List[Dict[str, Any]],
     all_passages: List[Dict[str, Any]],
     facets: Optional[List[Dict[str, Any]]] = None,
-    llm: Optional[Any] = None,
     max_answer_facets: int = 3,
     max_answer_passages: int = 5,
 ) -> Tuple[List[Dict[str, Any]], List[str], str]:
@@ -2265,103 +2035,18 @@ def get_answer_facet_passages(
     certified_facet_ids = list(best_cert_by_fid.keys())
 
     # -----------------------------
-    # 3) Choose answer facets (LLM ranker, then heuristic)
+    # 3) Choose answer facets deterministically
     # -----------------------------
-    selected_facet_ids: List[str] = []
-    selection_reason = "HEURISTIC"
-
-    if llm and facets and len(certified_facet_ids) > 1:
-        try:
-            facet_lookup = {f.get("facet_id"): f for f in facets if f.get("facet_id")}
-            valid_ids = set(certified_facet_ids)
-
-            options_text = []
-            for fid in certified_facet_ids:
-                f_obj = facet_lookup.get(fid, {}) or {}
-
-                ftype_raw = f_obj.get("facet_type") or f_obj.get("type") or "UNKNOWN"
-                if isinstance(ftype_raw, dict):
-                    ftype = str(ftype_raw.get("value", "UNKNOWN")).upper()
-                else:
-                    ftype = str(ftype_raw).upper()
-
-                tpl = f_obj.get("template", {}) or {}
-                subj = tpl.get("subject") or tpl.get("entity1") or tpl.get("entity") or "?"
-                pred = tpl.get("predicate") or tpl.get("relation") or "?"
-                obj = tpl.get("object") or tpl.get("bridge_entity") or tpl.get("entity2") or "?"
-                desc = f"{ftype}: {subj} -> {pred} -> {obj}"
-                options_text.append(f"- ID: {fid}\n  Desc: {desc}")
-
-            prompt = f"""Identify which facets directly determine the ANSWER to the question.
-Select from the provided Certified Facets only.
-
-Question: {question}
-
-Certified Facets:
-{chr(10).join(options_text)}
-
-Rules:
-1. Return JSON only: {{ "answer_facet_ids": ["fid1", ...], "reason": "..." }}
-2. Only include facet IDs from the list above.
-3. If unsure, include up to 2 best candidates.
-
-JSON:"""
-
-            resp = llm.generate(prompt, temperature=0.0)
-            raw = resp.text if hasattr(resp, "text") else str(resp)
-
-            s = raw.find("{")
-            e = raw.rfind("}")
-            if s != -1 and e != -1:
-                data = json.loads(raw[s:e+1])
-                proposed = data.get("answer_facet_ids", [])
-                if isinstance(proposed, list):
-                    proposed = [str(x) for x in proposed]
-                else:
-                    proposed = []
-
-                valid_proposed = [fid for fid in proposed if fid in valid_ids]
-                if valid_proposed:
-                    selected_facet_ids = valid_proposed[:max_answer_facets]
-                    selection_reason = f"LLM_RANKER:{','.join(selected_facet_ids)}"
-        except Exception as ex:
-            if debug:
-                print(f"[ANSWER-FACET] LLM selection failed: {ex}")
+    selected_facet_ids = [
+        fid for fid, _ in sorted(
+            ((fid, cert.get("p_value", 1.0)) for fid, cert in best_cert_by_fid.items()),
+            key=lambda x: float(x[1])
+        )
+    ][:max_answer_facets]
+    selection_reason = "TOP_PVALUE"
 
     if not selected_facet_ids:
-        # Heuristic fallback: uses question-type detector
-        qtype = detect_question_type(question)
-
-        facet_types: Dict[str, str] = {}
-        if facets:
-            for f in facets:
-                fid = f.get("facet_id")
-                if not fid:
-                    continue
-                raw = f.get("facet_type", "UNKNOWN")
-                val = raw.get("value") if isinstance(raw, dict) else raw
-                facet_types[fid] = str(val).upper()
-
-        priority_order = ["RELATION", "TEMPORAL", "NUMERIC", "ENTITY"]
-        if getattr(qtype, "category", None) == "when":
-            priority_order = ["TEMPORAL", "RELATION", "NUMERIC"]
-        elif getattr(qtype, "category", None) == "where":
-            priority_order = ["RELATION", "TEMPORAL"]
-        elif getattr(qtype, "category", None) == "how_many":
-            priority_order = ["NUMERIC", "RELATION"]
-
-        for ptype in priority_order:
-            for fid in certified_facet_ids:
-                if facet_types.get(fid) == ptype and fid not in selected_facet_ids:
-                    selected_facet_ids.append(fid)
-                    if len(selected_facet_ids) >= max_answer_facets:
-                        break
-            if len(selected_facet_ids) >= max_answer_facets:
-                break
-
-        if not selected_facet_ids:
-            selected_facet_ids = certified_facet_ids[:max_answer_facets]
-
+        selected_facet_ids = certified_facet_ids[:max_answer_facets]
         selection_reason = f"HEURISTIC:{','.join(selected_facet_ids)}"
 
     # -----------------------------
@@ -2525,32 +2210,14 @@ JSON:"""
         if debug:
             print(f"[FROZEN-SPAN] Failed: {ex}")
 
-    # -----------------------------
-    # Fallback: candidate list + index pick
-    # -----------------------------
-    if debug:
-        print("[CONSTRAINED] Falling back to candidate selection...")
-
-    qtype = detect_question_type(question)
-    candidates = extract_candidates(winner_passages, qtype, max_candidates)
-
-    if not candidates:
-        return ConstrainedSelectionResult(
-            answer="",
-            candidate_index=-1,
-            confidence=0.0,
-            passage_id="",
-            candidates=[],
-            support_scores=[],
-            reason="NO_CANDIDATES"
-        )
-
-    return llm_pick_candidate(
-        llm=llm,
-        question=question,
-        passages=winner_passages,
-        candidates=candidates,
-        max_chars_per_passage=max_chars_per_passage
+    return ConstrainedSelectionResult(
+        answer="",
+        candidate_index=-1,
+        confidence=0.0,
+        passage_id="",
+        candidates=[],
+        support_scores=[],
+        reason="NO_VERIFIED_SPAN"
     )
 
 def bind_entity_via_css(
