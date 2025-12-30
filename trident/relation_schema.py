@@ -101,6 +101,33 @@ class RelationRegistry:
         spec = self.lookup(key)
         return spec.default_predicate() if spec else ""
 
+    def get(self, key: Optional[str], default=None) -> Optional[RelationSpec]:
+        """Dictionary-style accessor used by some callers."""
+
+        spec = self.lookup(key)
+        return spec if spec is not None else default
+
+    def match_from_name(self, name: Optional[str]) -> Optional[RelationSpec]:
+        """Best-effort match using pid, canonical name, label, or aliases."""
+
+        if not name:
+            return None
+
+        # Normalize common variations (e.g., json schema enums)
+        key = str(name).replace("_", " ").strip()
+        spec = self.lookup(key)
+        if spec:
+            return spec
+
+        key_lower = key.lower()
+        for candidate in self._specs_by_pid.values():
+            if key_lower == candidate.label.lower():
+                return candidate
+            if key_lower in {alias.lower() for alias in candidate.aliases}:
+                return candidate
+
+        return None
+
     def all_names(self) -> List[str]:
         return sorted({spec.name for spec in self._specs_by_pid.values()})
 
