@@ -26,6 +26,7 @@ from .monitoring import DriftMonitor
 from .logging_utils import TelemetryTracker
 from .vqc import VerifierQueryCompiler
 from .bwk import BwKController
+from .relation_schema import RelationRegistry
 from .chain_builder import (
     build_chain_from_certified,
     build_chain_prompt,
@@ -933,7 +934,8 @@ class TridentPipeline:
         # Prepare output
         metrics = result.get('metrics', {})
         evidence_tokens = result.get('evidence_tokens', 0)
-        certificates = result.get('certificates', [])
+        # Certificates may be absent or explicitly set to None (e.g., Pareto mode).
+        certificates = result.get('certificates') or []
 
         # CRITICAL FIX: num_certified_facets must match len(certificates)
         # Count unique facet_ids in certificates

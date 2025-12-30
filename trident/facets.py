@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .relation_schema import RelationRegistry
+
 try:
     import spacy
 except Exception:
@@ -715,6 +717,135 @@ class FacetMiner:
             except Exception:
                 self.nlp = None
 
+    def _normalize_relation_schema(self, template: Dict[str, Any]) -> Dict[str, Any]:
+        """Align a relation facet template with the normalized schema if available."""
+
+        tpl = dict(template or {})
+        if not tpl:
+            return tpl
+
+        tpl["predicate"] = _normalize_relation_predicate(tpl.get("predicate", ""))
+
+        if self.relation_registry is None:
+            return tpl
+
+        relation_key = (
+            tpl.get("relation_kind")
+            or tpl.get("outer_relation_type")
+            or tpl.get("scoring_relation_kind")
+        )
+
+        spec = self.relation_registry.lookup(relation_key) if relation_key else None
+        if spec:
+            tpl["relation_kind"] = spec.name
+            tpl["relation_pid"] = spec.pid
+            default_pred = spec.default_predicate() or tpl.get("predicate", "")
+            normalized_pred = _normalize_relation_predicate(default_pred) or default_pred
+            tpl["predicate"] = normalized_pred
+
+        return tpl
+
+    def _relation_facet_builder(
+        self,
+        facet_id: str,
+        template: Dict[str, Any],
+        *,
+        weight: float = 1.0,
+        metadata: Optional[Dict[str, Any]] = None,
+        text: Optional[str] = None,
+        normalize: bool = True,
+    ) -> Optional[Facet]:
+        """Construct a RELATION facet with WH detection and placeholder gating."""
+
+        def _is_placeholder(x: str) -> bool:
+            x = (x or "").strip().lower()
+            return (not x) or (x in {"?", "person", "someone", "something"}) or x in {
+                "who",
+                "what",
+                "where",
+                "when",
+                "which",
+                "whom",
+                "whose",
+                "why",
+                "how",
+            }
+
+        tpl = dict(template or {})
+        if normalize:
+            tpl = self._normalize_relation_schema(tpl)
+
+        subject_str = str(tpl.get("subject", ""))
+        object_str = str(tpl.get("object", ""))
+        if _is_placeholder(subject_str) and _is_placeholder(object_str):
+            return None
+
+        subj = subject_str.strip().lower()
+        is_wh_subject = subj in {
+            "who",
+            "what",
+            "where",
+            "when",
+            "which",
+            "whom",
+            "whose",
+            "why",
+            "how",
+        }
+
+        meta = dict(metadata or {})
+        meta["is_wh_subject"] = is_wh_subject
+        if text:
+            meta.setdefault("debug_text", text)
+        if is_wh_subject:
+            tpl["anchor_policy"] = "ANY"
+
+        return Facet(
+            facet_id=facet_id,
+            facet_type=FacetType.RELATION,
+            template=tpl,
+            weight=weight,
+            metadata=meta,
+        )
+
+    def _build_relation_facet(
+        self,
+        facet_id: str,
+        template: Dict[str, Any],
+        *,
+        weight: float = 1.0,
+        metadata: Optional[Dict[str, Any]] = None,
+        text: Optional[str] = None,
+        normalize: bool = True,
+    ) -> Optional[Facet]:
+        """Wrapper to keep backward compatibility with callers expecting this name."""
+
+        return self._relation_facet_builder(
+            facet_id,
+            template,
+            weight=weight,
+            metadata=metadata,
+            text=text,
+            normalize=normalize,
+        )
+
+    def apply_llm_relation_plan(self, relation_templates: List[Dict[str, Any]]) -> List[Facet]:
+        """Convert LLM-produced relation templates into normalized facets."""
+
+        facets: List[Facet] = []
+        for idx, tpl in enumerate(relation_templates or []):
+            normalized_tpl = self._normalize_relation_schema(tpl)
+            facet = self._build_relation_facet(
+                f"llm_rel_{idx}",
+                normalized_tpl,
+                weight=1.0,
+                metadata={"llm_planned": True, "schema_normalized": True},
+            )
+            if facet is not None:
+                facets.append(facet)
+
+        return facets
+
     def extract_facets(self, query: str, supporting_facts: Optional[List[Tuple[str, int]]] = None) -> List[Facet]:
         query = _clean_text(query)
         facets: List[Facet] = []
@@ -781,9 +912,14 @@ class FacetMiner:
                     clean = re.sub(r"^(which|what|who|where|when|why|how)\s+\w+\s*", "", clean, flags=re.IGNORECASE).strip()
                     clean = re.sub(r"^(which|what|who|where|when|why|how)\s+(?:of\s+the\s+following\s+)?", "", clean, flags=re.IGNORECASE).strip()
                     g.append(clean)
-                
+
                 if len(g) < 2 or not g[0] or not g[-1]: continue
-                facets.append(Facet(facet_id=f"relation_{len(facets)}", facet_type=FacetType.RELATION, template={"subject": g[0], "predicate": rel_type, "object": g[-1]}))
+                facet = self._build_relation_facet(
+                    f"relation_{len(facets)}",
+                    {"subject": g[0], "predicate": rel_type, "object": g[-1]},
+                )
+                if facet is not None:
+                    facets.append(facet)
         return facets
 
     # ---- temporal ----
@@ -936,11 +1072,9 @@ class FacetMiner:
                 outer_type, outer_name = outer_relations[outer_word]
                 inner_type = inner_relations[inner_word]
 
-                # Hop1: Inner relation facet (e.g., director of film X)
-                hop1_facet = Facet(
-                    facet_id=f"comp_hop1_{len(facets)}",
-                    facet_type=FacetType.RELATION,
-                    template={
+                hop1_facet = self._build_relation_facet(
+                    f"comp_hop1_{len(facets)}",
+                    {
                         "subject": "Who",
                         "predicate": f"is the {inner_word} of",
                         "object": inner_object,
@@ -948,17 +1082,15 @@ class FacetMiner:
                         "compositional": True,
                         "inner_relation_type": inner_type,
                     },
-                    metadata={"compositional_hop": 1, "outer_relation": outer_type}
+                    metadata={"compositional_hop": 1, "outer_relation": outer_type},
                 )
-                facets.append(hop1_facet)
+                if hop1_facet is not None:
+                    facets.append(hop1_facet)
 
-                # Hop2: Outer relation facet (e.g., mother of [hop1_result])
-                # Note: subject is a variable reference to hop1 result
-                hop2_facet = Facet(
-                    facet_id=f"comp_hop2_{len(facets)}",
-                    facet_type=FacetType.RELATION,
-                    template={
-                        "subject": f"[{inner_type}_RESULT]",  # Variable reference
+                hop2_facet = self._build_relation_facet(
+                    f"comp_hop2_{len(facets)}",
+                    {
+                        "subject": f"[{inner_type}_RESULT]",
                         "predicate": f"'s {outer_name}",
                         "object": "",
                         "hop": 2,
@@ -966,9 +1098,10 @@ class FacetMiner:
                         "outer_relation_type": outer_type,
                         "depends_on_hop": 1,
                     },
-                    metadata={"compositional_hop": 2, "depends_on": f"comp_hop1_{len(facets)-1}"}
+                    metadata={"compositional_hop": 2, "depends_on": f"comp_hop1_{len(facets)-1}"},
                 )
-                facets.append(hop2_facet)
+                if hop2_facet is not None:
+                    facets.append(hop2_facet)
 
                 import os
                 if os.environ.get("TRIDENT_DEBUG_COMPOSITIONAL", "0") == "1":
@@ -987,11 +1120,9 @@ class FacetMiner:
             if inner_word in inner_relations:
                 inner_type = inner_relations[inner_word]
 
-                # Hop1: Inner relation facet
-                hop1_facet = Facet(
-                    facet_id=f"comp_hop1_{len(facets)}",
-                    facet_type=FacetType.RELATION,
-                    template={
+                hop1_facet = self._build_relation_facet(
+                    f"comp_hop1_{len(facets)}",
+                    {
                         "subject": "Who",
                         "predicate": f"is the {inner_word} of",
                         "object": inner_object,
@@ -999,15 +1130,14 @@ class FacetMiner:
                         "compositional": True,
                         "inner_relation_type": inner_type,
                     },
-                    metadata={"compositional_hop": 1, "outer_relation": "BIRTHPLACE"}
+                    metadata={"compositional_hop": 1, "outer_relation": "BIRTHPLACE"},
                 )
-                facets.append(hop1_facet)
+                if hop1_facet is not None:
+                    facets.append(hop1_facet)
 
-                # Hop2: Birthplace facet
-                hop2_facet = Facet(
-                    facet_id=f"comp_hop2_{len(facets)}",
-                    facet_type=FacetType.RELATION,
-                    template={
+                hop2_facet = self._build_relation_facet(
+                    f"comp_hop2_{len(facets)}",
+                    {
                         "subject": f"[{inner_type}_RESULT]",
                         "predicate": "was born in",
                         "object": "",
@@ -1016,9 +1146,10 @@ class FacetMiner:
                         "outer_relation_type": "BIRTHPLACE",
                         "depends_on_hop": 1,
                     },
-                    metadata={"compositional_hop": 2, "depends_on": f"comp_hop1_{len(facets)-1}"}
+                    metadata={"compositional_hop": 2, "depends_on": f"comp_hop1_{len(facets)-1}"},
                 )
-                facets.append(hop2_facet)
+                if hop2_facet is not None:
+                    facets.append(hop2_facet)
 
         # Pattern: "What award did the (inner) of (object) win?"
         pattern3 = r"what\s+(?:award|prize)\s+did\s+(?:the\s+)?(\w+)\s+of\s+(?:(?:the\s+)?(?:film|movie|book|song|album|show|series|novel|play)\s+)?(.+?)\s+(?:win|receive)\s*\?"
@@ -1029,10 +1160,9 @@ class FacetMiner:
             if inner_word in inner_relations:
                 inner_type = inner_relations[inner_word]
 
-                hop1_facet = Facet(
-                    facet_id=f"comp_hop1_{len(facets)}",
-                    facet_type=FacetType.RELATION,
-                    template={
+                hop1_facet = self._build_relation_facet(
+                    f"comp_hop1_{len(facets)}",
+                    {
                         "subject": "Who",
                         "predicate": f"is the {inner_word} of",
                         "object": inner_object,
@@ -1040,14 +1170,14 @@ class FacetMiner:
                         "compositional": True,
                         "inner_relation_type": inner_type,
                     },
-                    metadata={"compositional_hop": 1, "outer_relation": "AWARD"}
+                    metadata={"compositional_hop": 1, "outer_relation": "AWARD"},
                 )
-                facets.append(hop1_facet)
+                if hop1_facet is not None:
+                    facets.append(hop1_facet)
 
-                hop2_facet = Facet(
-                    facet_id=f"comp_hop2_{len(facets)}",
-                    facet_type=FacetType.RELATION,
-                    template={
+                hop2_facet = self._build_relation_facet(
+                    f"comp_hop2_{len(facets)}",
+                    {
                         "subject": f"[{inner_type}_RESULT]",
                         "predicate": "won",
                         "object": "",
@@ -1056,9 +1186,10 @@ class FacetMiner:
                         "outer_relation_type": "AWARD",
                         "depends_on_hop": 1,
                     },
-                    metadata={"compositional_hop": 2, "depends_on": f"comp_hop1_{len(facets)-1}"}
+                    metadata={"compositional_hop": 2, "depends_on": f"comp_hop1_{len(facets)-1}"},
                 )
-                facets.append(hop2_facet)
+                if hop2_facet is not None:
+                    facets.append(hop2_facet)
 
         return facets
 
@@ -1111,18 +1242,22 @@ class FacetMiner:
                 continue
 
             fid = f"bridge_{len(facets)}"
-            facets.append(Facet(
-                facet_id=fid,
-                facet_type="RELATION",
+            template = {
+                "subject": ent,
+                "predicate": raw_pred,
+                "object": "?",
+                "relation_kind": relation_kind,
+                "answer_role": "object",
+            }
+            template = self._normalize_relation_schema(template)
+            facet = self._build_relation_facet(
+                fid,
+                template,
                 text=f"[BRIDGE] {relation_kind} of {ent}",
-                template={
-                    "subject": ent,
-                    "predicate": raw_pred,
-                    "object": "?",
-                    "relation_kind": relation_kind,
-                    "answer_role": "object",
-                },
-            ))
+                metadata={"schema_normalized": True},
+            )
+            if facet is not None:
+                facets.append(facet)
 
         return facets
     def _is_multi_hop(self, query: str) -> bool:

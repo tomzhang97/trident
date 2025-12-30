@@ -294,6 +294,8 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         o_clean = _clean_relation_endpoint(o_raw)
         has_anchor = bool(s_clean or o_clean)
 
+        is_wh_subject = bool(meta.get("is_wh_subject")) or s_raw.strip().lower() in _WH_WORDS
+
         # Reject global probes or placeholder-only facets
         if not has_anchor:
             _record_failure("no_anchor")
@@ -307,12 +309,18 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         s_match = _fuzzy_phrase_match(s_clean, passage_norm, passage_tokens) if s_clean else False
         o_match = _fuzzy_phrase_match(o_clean, passage_norm, passage_tokens) if o_clean else False
 
+        if is_wh_subject and not s_clean:
+            # WH subjects are intentionally dropped from normalization; don't penalize routing
+            s_match = True
+
         anchor_policy = str(tpl.get("anchor_policy") or "ANY").upper()
         if anchor_policy not in {"ANY", "ALL"}:
             anchor_policy = "ANY"
 
         anchor_ok = False
-        if anchor_policy == "ALL":
+        if is_wh_subject and not s_clean:
+            anchor_ok = bool(o_match)
+        elif anchor_policy == "ALL":
             anchor_ok = bool(s_match and o_match)
         else:
             anchor_ok = bool(s_match or o_match)

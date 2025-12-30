@@ -74,11 +74,13 @@ class LLMInterface:
         self.default_temperature = temperature
     
     def generate(
-        self, 
+        self,
         prompt: str,
         max_new_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
-        return_logprobs: bool = False
+        top_p: Optional[float] = None,
+        stop: Optional[List[str]] = None,
+        return_logprobs: bool = False,
     ) -> LLMOutput:
         """Generate text from prompt."""
         start_time = time.time()
@@ -97,6 +99,7 @@ class LLMInterface:
         max_tokens = max_new_tokens if max_new_tokens is not None else self.default_max_new_tokens
         temp = temperature if temperature is not None else self.default_temperature
         do_sample = temp is not None and temp > 0
+        top_p_val = top_p if top_p is not None else 1.0
 
         generation_kwargs = dict(
             **inputs,
@@ -111,14 +114,22 @@ class LLMInterface:
         # Only pass temperature when sampling is enabled
         if do_sample:
             generation_kwargs["temperature"] = temp
+            generation_kwargs["top_p"] = top_p_val
 
         # Generate
         with torch.no_grad():
             outputs = self.model.generate(**generation_kwargs)
-        
+
         # Decode output
         generated_ids = outputs.sequences[0][input_length:]
         generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+        if stop:
+            for s in stop:
+                idx = generated_text.find(s)
+                if idx != -1:
+                    generated_text = generated_text[:idx]
+                    break
 
         # Calculate token usage
         prompt_tokens = input_length
@@ -367,13 +378,20 @@ class VLLMInterface:
     def generate(self, prompt: str, **kwargs) -> LLMOutput:
         """Generate using vLLM."""
         start_time = time.time()
-        
+
         # Update sampling params if provided
-        sampling_params = self.sampling_params
-        if 'temperature' in kwargs:
-            sampling_params.temperature = kwargs['temperature']
-        if 'max_new_tokens' in kwargs:
-            sampling_params.max_tokens = kwargs['max_new_tokens']
+        temperature = kwargs.get('temperature', self.sampling_params.temperature)
+        max_tokens = kwargs.get('max_new_tokens', self.sampling_params.max_tokens)
+        top_p = kwargs.get('top_p', getattr(self.sampling_params, 'top_p', 1.0))
+        stop = kwargs.get('stop', None)
+
+        from vllm import SamplingParams
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            stop=stop,
+        )
         
         # Generate
         outputs = self.llm.generate([prompt], sampling_params)
@@ -392,8 +410,21 @@ class VLLMInterface:
     def batch_generate(self, prompts: List[str], **kwargs) -> List[LLMOutput]:
         """Batch generation with vLLM."""
         start_time = time.time()
-        
-        outputs = self.llm.generate(prompts, self.sampling_params)
+
+        from vllm import SamplingParams
+        temperature = kwargs.get('temperature', self.sampling_params.temperature)
+        max_tokens = kwargs.get('max_new_tokens', self.sampling_params.max_tokens)
+        top_p = kwargs.get('top_p', getattr(self.sampling_params, 'top_p', 1.0))
+        stop = kwargs.get('stop', None)
+
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            stop=stop,
+        )
+
+        outputs = self.llm.generate(prompts, sampling_params)
         
         results = []
         for output in outputs:

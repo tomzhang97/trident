@@ -1316,24 +1316,22 @@ def _find_exact_substring(haystack: str, needle: str) -> Optional[Tuple[int, int
 
 
 def _extract_first_json_object(text: str) -> str:
-    """Extract the first balanced JSON object from a string with strict guards."""
-
     stripped = text.strip()
-    if not stripped.startswith("{"):
-        raise ValueError("Output must start with JSON object")
+    start = stripped.find("{")
+    if start == -1:
+        raise ValueError("No JSON object found in text")
 
-    # Reject code fences / markdown wrappers outright
-    if "```" in stripped.split("{", 1)[0]:
+    # reject code fences before the JSON
+    if "```" in stripped[:start]:
         raise ValueError("Code fences found before JSON")
 
-    start = stripped.find("{")
     depth = 0
     end_idx = -1
     for idx in range(start, len(stripped)):
-        char = stripped[idx]
-        if char == "{":
+        ch = stripped[idx]
+        if ch == "{":
             depth += 1
-        elif char == "}":
+        elif ch == "}":
             depth -= 1
             if depth == 0:
                 end_idx = idx
@@ -1342,11 +1340,7 @@ def _extract_first_json_object(text: str) -> str:
     if depth != 0 or end_idx == -1:
         raise ValueError("Unbalanced JSON braces in text")
 
-    remainder = stripped[end_idx + 1 :].strip()
-    if remainder and remainder not in {"", "```"}:
-        raise ValueError("Extra text after JSON object")
-
-    return stripped[start : end_idx + 1]
+    return stripped[start:end_idx + 1]
 
 
 def strict_json_call(llm, prompt: str, max_new_tokens: int = 160, temperature: float = 0.0):
@@ -1360,7 +1354,16 @@ def strict_json_call(llm, prompt: str, max_new_tokens: int = 160, temperature: f
         tuple(parsed_json, raw_output)
     """
 
-    raw = llm.generate(prompt, temperature=temperature, max_new_tokens=max_new_tokens)
+    guard = "Return ONLY JSON. No extra keys. No commentary."
+    wrapped_prompt = f"{guard}\n{prompt.strip()}\n{guard}"
+    stop_sequences = ["\n\n", "\n[", "}\n"]
+
+    raw = llm.generate(
+        wrapped_prompt,
+        temperature=temperature,
+        max_new_tokens=max_new_tokens,
+        stop=stop_sequences,
+    )
     raw_text = raw.text if hasattr(raw, "text") else str(raw)
     parsed = json.loads(_extract_first_json_object(raw_text))
     return parsed, raw
