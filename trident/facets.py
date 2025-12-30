@@ -587,6 +587,12 @@ class FacetMiner:
 
     # ---- relation (planned or heuristic) ----
     def _extract_relation_facets(self, query: str, question_plan: Optional[Dict[str, Any]] = None) -> List[Facet]:
+        planned = self._extract_relation_facets_llm_plan(question_plan)
+        if planned:
+            return planned
+        return []
+
+    def _extract_relation_facets_llm_plan(self, question_plan: Optional[Dict[str, Any]]) -> List[Facet]:
         if question_plan and isinstance(question_plan, dict):
             req = question_plan.get("required_facts", [])
             if isinstance(req, list) and req:

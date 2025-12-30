@@ -334,7 +334,8 @@ class TridentPipeline:
             os.environ.get("TRIDENT_LLM_QUESTION_PLANNER", "0") == "1"
         )
         if use_planner and self.llm is not None:
-            self.question_planner = LLMQuestionPlanner(self.llm, max_facts=3)
+            max_tokens = getattr(config, "llm_planner_max_new_tokens", 160)
+            self.question_planner = LLMQuestionPlanner(self.llm, max_facts=3, max_new_tokens=max_tokens)
 
         # Facet miner
         self.facet_miner = FacetMiner(config, llm=self.llm)

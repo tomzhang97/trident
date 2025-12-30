@@ -54,9 +54,10 @@ class LLMQuestionPlanner:
     No hypothesis phrasing allowed here.
     """
 
-    def __init__(self, llm: Any, max_facts: int = 3):
+    def __init__(self, llm: Any, max_facts: int = 3, max_new_tokens: int = 200):
         self.llm = llm
         self.max_facts = max_facts
+        self.max_new_tokens = max_new_tokens
 
     def plan(self, question: str) -> QuestionPlan:
         prompt = f"""
@@ -89,7 +90,7 @@ Question:
 {question}
 """.strip()
 
-        obj, _raw = strict_json_call(self.llm, prompt)
+        obj, _raw = strict_json_call(self.llm, prompt, max_new_tokens=self.max_new_tokens)
 
         qt = str(obj.get("question_type", "OTHER")).upper().strip()
         rf = obj.get("required_facts", [])

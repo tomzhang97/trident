@@ -283,7 +283,8 @@ class BaselineConfig:
 class TridentConfig:
     """Complete TRIDENT system configuration."""
     mode: str = "safe_cover"  # safe_cover, pareto, both
-    use_llm_question_planner: bool = False
+    use_llm_question_planner: bool = True
+    llm_planner_max_new_tokens: int = 160
     safe_cover: SafeCoverConfig = field(default_factory=SafeCoverConfig)
     pareto: ParetoConfig = field(default_factory=ParetoConfig)
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
@@ -315,7 +316,8 @@ class TridentConfig:
 
         return cls(
             mode=config_dict.get("mode", "safe_cover"),
-            use_llm_question_planner=config_dict.get("use_llm_question_planner", False),
+            use_llm_question_planner=config_dict.get("use_llm_question_planner", True),
+            llm_planner_max_new_tokens=config_dict.get("llm_planner_max_new_tokens", 160),
             safe_cover=safe_cover,
             pareto=pareto,
             calibration=calibration,
