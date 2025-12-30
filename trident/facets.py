@@ -343,6 +343,22 @@ class Facet:
             subject = _safe_phrase(tpl.get("subject", ""))
             predicate = _safe_phrase(tpl.get("predicate", ""))
             obj = _safe_phrase(tpl.get("object", ""))
+            relation_kind = _safe_phrase(tpl.get("relation_kind", ""))
+            is_wh_subject = bool((self.metadata or {}).get("is_wh_subject"))
+
+            # WH-subject: use existential hypothesis entailed by typical passive phrasing
+            if is_wh_subject:
+                anchor = obj or subject or "the topic"
+                if relation_kind.upper() == "DIRECTOR" or "direct" in predicate.lower():
+                    return _ensure_sentence(f"{anchor} was directed by someone")
+                if relation_kind.upper() == "MOTHER":
+                    return _ensure_sentence(f"Someone is the mother of {anchor}")
+                if relation_kind.upper() == "FATHER":
+                    return _ensure_sentence(f"Someone is the father of {anchor}")
+                if relation_kind.upper() == "PARENT":
+                    return _ensure_sentence(f"Someone is a parent of {anchor}")
+                return _ensure_sentence(f"Someone is related to {anchor}")
+
             anchor = obj or subject or "the topic"
             core = predicate if predicate else "is related to"
             return _ensure_sentence(f"The passage states that {anchor} {core}.")
@@ -580,7 +596,7 @@ class FacetMiner:
         mentions: List[str] = []
         mentions.extend(self._extract_or_entities(query))
         if not mentions:
-            mentions.extend(re.findall(r"\b[A-Z][A-Za-z0-9']+(?:\s+[A-Z][A-Za-z0-9']+)*\b", query))
+            mentions.extend(re.findall(r"\b[A-Z][A-Za-z0-9'\-’]+(?:\s+[A-Z][A-Za-z0-9'\-’]+)*\b", query))
         # CRITICAL: Use longest-span dedup to prevent "Michael" when "Michael Doeberl" exists
         # This prevents partial matches from covering wrong passages
         mentions = [m for m in _dedupe_entities_by_longest_span(mentions) if not _looks_like_junk_entity(m)]
@@ -592,7 +608,29 @@ class FacetMiner:
         facets: List[Facet] = []
 
         ents = self._extract_entity_facets(query)
-        anchor = ents[0].template.get("mention", "") if ents else ""
+
+        def _choose_anchor(entity_facets: List[Facet]) -> str:
+            mentions: List[str] = []
+            for e in entity_facets:
+                mention = _safe_phrase((e.template or {}).get("mention", ""))
+                if mention:
+                    mentions.append(mention)
+
+            if not mentions:
+                return ""
+
+            generic_singletons = {"film", "movie", "person", "someone", "something", "director"}
+
+            def _score(m: str) -> Tuple[int, int]:
+                tokens = m.split()
+                if len(tokens) == 1 and tokens[0].lower() in generic_singletons:
+                    return (-1, len(m))
+                return (1 if len(tokens) > 1 else 0, len(m))
+
+            mentions.sort(key=_score, reverse=True)
+            return mentions[0]
+
+        anchor = _choose_anchor(ents)
 
         if "mother of" in q and anchor:
             rel = self._relation_facet_builder(
