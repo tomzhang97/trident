@@ -26,7 +26,7 @@ from .monitoring import DriftMonitor
 from .logging_utils import TelemetryTracker
 from .vqc import VerifierQueryCompiler
 from .bwk import BwKController
-from .relation_schema import RelationRegistry
+from .llm_question_planner import LLMQuestionPlanner
 from .chain_builder import (
     build_chain_from_certified,
     build_chain_prompt,
@@ -346,16 +346,17 @@ class TridentPipeline:
         self.device = device
 
         # Initialize components
-                # Public normalized relation schema (optional)
-        relation_registry = None
-        if RelationRegistry is not None:
-            try:
-                relation_registry = RelationRegistry()
-            except Exception:
-                relation_registry = None
-        
-        # Facet miner (optionally LLM-driven plan)
-        self.facet_miner = FacetMiner(config, llm=self.llm, relation_registry=relation_registry)
+
+        # Optional question planner (single LLM call per query)
+        self.question_planner = None
+        use_planner = bool(getattr(config, "use_llm_question_planner", False)) or (
+            os.environ.get("TRIDENT_LLM_QUESTION_PLANNER", "0") == "1"
+        )
+        if use_planner and self.llm is not None:
+            self.question_planner = LLMQuestionPlanner(self.llm, max_facts=3)
+
+        # Facet miner
+        self.facet_miner = FacetMiner(config, llm=self.llm)
         self.nli_scorer = NLIScorer(config.nli, device)
 
         # Load calibrator from file if provided, otherwise create empty one
@@ -432,8 +433,19 @@ class TridentPipeline:
         self.telemetry.start_query(query)
 
         # Step 1: Facet mining
-        facets = self.facet_miner.extract_facets(query, supporting_facts)
-        use_llm_plan = bool(getattr(getattr(self.config, "facet_miner", None), "use_llm_facet_plan", False))
+        plan_obj = None
+        if self.question_planner is not None:
+            try:
+                plan = self.question_planner.plan(query)
+                plan_obj = {
+                    "question_type": plan.question_type,
+                    "required_facts": plan.required_facts,
+                }
+            except Exception:
+                plan_obj = None
+
+        facets = self.facet_miner.extract_facets(query, supporting_facts, question_plan=plan_obj)
+        use_llm_plan = plan_obj is not None
 
         # Mark RELATION facets as required for WH-questions
         # This ensures that the key relation must be certified for valid answers

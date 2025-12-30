@@ -9,14 +9,12 @@ UPDATES:
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .relation_schema import RelationRegistry
-from .chain_builder import _extract_first_json_object
+from .relation_templates import RELATION_SLOT_TO_TEMPLATE
 
 try:
     import spacy
@@ -369,7 +367,7 @@ class Facet:
             return _ensure_sentence(f'The passage mentions "{mention}".')
 
         if ft == FacetType.NUMERIC:
-            entity = _safe_phrase(tpl.get("entity", "")) 
+            entity = _safe_phrase(tpl.get("entity", ""))
             value = _safe_phrase(tpl.get("value", ""))
             unit = _safe_phrase(tpl.get("unit", ""))
             attr = _safe_phrase(tpl.get("attribute", ""))
@@ -378,6 +376,10 @@ class Facet:
             return _ensure_sentence(f"The passage binds the value {val_str} to a specific property")
 
         if ft == FacetType.RELATION:
+            custom_hyp = tpl.get("custom_hypothesis")
+            if custom_hyp:
+                return _ensure_sentence(str(custom_hyp))
+
             s_raw = tpl.get('subject', '')
             o_raw = tpl.get('object', '')
             p = _normalize_relation_predicate(tpl.get('predicate', ''))
@@ -695,21 +697,12 @@ class Facet:
 
 class FacetMiner:
 
-    def __init__(self, config: Any, llm: Optional[Any] = None, relation_registry: Optional[Any] = None):
+    def __init__(self, config: Any, llm: Optional[Any] = None):
         self.config = config
 
         # Optional LLM for query-time facet planning / relation classification.
         # Kept None-safe: all LLM-driven behavior is gated by config/env flags.
         self.llm = llm
-
-        # Optional normalized relation schema/registry (public, versioned).
-        # If not provided, we instantiate a default registry when available.
-        self.relation_registry = relation_registry
-        if self.relation_registry is None and RelationRegistry is not None:
-            try:
-                self.relation_registry = RelationRegistry()
-            except Exception:
-                self.relation_registry = None
 
         # Optional NLP (spaCy). Always define the attribute (fixes AttributeError in older runs).
         self.nlp = None
@@ -718,166 +711,6 @@ class FacetMiner:
                 self.nlp = spacy.load("en_core_web_sm")
             except Exception:
                 self.nlp = None
-
-        # Single-call facet plan cache to prevent repeated LLM invocations.
-        self._facet_plan_cache: Dict[str, List[Facet]] = {}
-
-    # ---- LLM facet plan (single call, no heuristics) ----
-    def _facet_plan_enabled(self) -> bool:
-        facet_cfg = getattr(self.config, "facet_miner", self.config)
-        return bool(getattr(facet_cfg, "use_llm_facet_plan", False)) and self.llm is not None
-
-    def _facet_plan_prompt(self, query: str) -> str:
-        schema_hint = ""
-        if self.relation_registry is not None:
-            names = ", ".join(self.relation_registry.all_names()[:20])
-            schema_hint = f"Available relation kinds: {names}. Use these names/pids when possible."
-
-        guard = "Return ONLY JSON. No extra keys. No commentary."
-        return (
-            f"{guard}\n"
-            f"You are TRIDENT's facet planner. Produce exactly ONE JSON object with keys: \n"
-            f"  - relation_pid: string | null\n"
-            f"  - relation_kind: string | null (normalized schema name)\n"
-            f"  - required_facets: an array (<=5) of minimal facets needed to answer.\n"
-            f"Each facet must include a 'type' field. Supported types: ENTITY (text), RELATION (subject/predicate/object/[relation_pid]/[relation_kind]), TEMPORAL, NUMERIC.\n"
-            f"Rules:\n"
-            f"- Use at most 5 facets; prefer 1-3.\n"
-            f"- For WH questions (Who/What/Where/When/Which/Whom/Whose/Why/How), set the RELATION subject to '?'.\n"
-            f"- Ground anchors only when explicit; do NOT invent entities.\n"
-            f"- Do not add heuristics or extra relation variants.\n"
-            f"- {schema_hint}\n"
-            f"Question: {query}\n"
-            f"Output JSON only.\n"
-            f"{guard}"
-        )
-
-    def _run_facet_plan_llm(self, query: str) -> Optional[Dict[str, Any]]:
-        prompt = self._facet_plan_prompt(query)
-        raw = self.llm.generate(
-            prompt,
-            temperature=0.0,
-            max_new_tokens=256,
-            stop=["\n\n", "\n[", "}\n"],
-        )
-        raw_text = raw.text if hasattr(raw, "text") else str(raw)
-        return json.loads(_extract_first_json_object(raw_text))
-
-    def _facet_from_template(self, tpl: Dict[str, Any], idx: int, *, required: bool = True, default_relation: Optional[Dict[str, Any]] = None) -> Optional[Facet]:
-        ftype = str(tpl.get("type", "")).upper()
-        meta = {"llm_planned": True}
-
-        if ftype == "ENTITY":
-            mention = _safe_phrase(tpl.get("text") or tpl.get("mention") or "")
-            if not mention:
-                return None
-            return Facet(
-                facet_id=f"plan_entity_{idx}",
-                facet_type=FacetType.ENTITY,
-                template={"mention": mention},
-                weight=1.0,
-                metadata=meta,
-                required=required,
-            )
-
-        if ftype == "RELATION":
-            tpl_copy = dict(tpl)
-            tpl_copy.pop("type", None)
-            if default_relation:
-                tpl_copy.setdefault("relation_pid", default_relation.get("relation_pid"))
-                tpl_copy.setdefault("relation_kind", default_relation.get("relation_kind"))
-            facet = self._relation_facet_builder(
-                f"plan_relation_{idx}",
-                tpl_copy,
-                metadata=meta,
-            )
-            if facet is not None:
-                facet.required = required
-            return facet
-
-        if ftype == "TEMPORAL":
-            time_text = _safe_phrase(tpl.get("time") or tpl.get("text") or "")
-            event = _safe_phrase(tpl.get("event") or "")
-            if not time_text:
-                return None
-            return Facet(
-                facet_id=f"plan_temporal_{idx}",
-                facet_type=FacetType.TEMPORAL,
-                template={"time": time_text, "event": event},
-                metadata=meta,
-                required=required,
-            )
-
-        if ftype == "NUMERIC":
-            value = _safe_phrase(tpl.get("value") or tpl.get("text") or "")
-            unit = _safe_phrase(tpl.get("unit") or "")
-            entity = _safe_phrase(tpl.get("entity") or "")
-            attribute = _safe_phrase(tpl.get("attribute") or "")
-            if not value:
-                return None
-            return Facet(
-                facet_id=f"plan_numeric_{idx}",
-                facet_type=FacetType.NUMERIC,
-                template={"value": value, "unit": unit, "entity": entity, "attribute": attribute},
-                metadata=meta,
-                required=required,
-            )
-
-        return None
-
-    def _extract_facets_from_llm_plan(self, query: str) -> List[Facet]:
-        cached = self._facet_plan_cache.get(query)
-        if cached is not None:
-            return list(cached)
-
-        try:
-            plan = self._run_facet_plan_llm(query)
-        except Exception:
-            return []
-
-        required_tpls = plan.get("required_facets") or []
-        default_relation = {
-            "relation_pid": plan.get("relation_pid") or None,
-            "relation_kind": plan.get("relation_kind") or None,
-        }
-
-        facets: List[Facet] = []
-        for idx, tpl in enumerate(required_tpls[:5]):
-            facet = self._facet_from_template(tpl or {}, idx, required=True, default_relation=default_relation)
-            if facet is not None:
-                facets.append(facet)
-
-        facets = self._deduplicate_facets(facets)
-        self._facet_plan_cache[query] = facets
-        return list(facets)
-
-    def _normalize_relation_schema(self, template: Dict[str, Any]) -> Dict[str, Any]:
-        """Align a relation facet template with the normalized schema if available."""
-
-        tpl = dict(template or {})
-        if not tpl:
-            return tpl
-
-        tpl["predicate"] = _normalize_relation_predicate(tpl.get("predicate", ""))
-
-        if self.relation_registry is None:
-            return tpl
-
-        relation_key = (
-            tpl.get("relation_kind")
-            or tpl.get("outer_relation_type")
-            or tpl.get("scoring_relation_kind")
-        )
-
-        spec = self.relation_registry.lookup(relation_key) if relation_key else None
-        if spec:
-            tpl["relation_kind"] = spec.name
-            tpl["relation_pid"] = spec.pid
-            default_pred = spec.default_predicate() or tpl.get("predicate", "")
-            normalized_pred = _normalize_relation_predicate(default_pred) or default_pred
-            tpl["predicate"] = normalized_pred
-
-        return tpl
 
     def _relation_facet_builder(
         self,
@@ -906,8 +739,6 @@ class FacetMiner:
             }
 
         tpl = dict(template or {})
-        if normalize:
-            tpl = self._normalize_relation_schema(tpl)
 
         subject_str = str(tpl.get("subject", ""))
         object_str = str(tpl.get("object", ""))
@@ -915,23 +746,25 @@ class FacetMiner:
             return None
 
         subj = subject_str.strip().lower()
-        is_wh_subject = subj in {
-            "who",
-            "what",
-            "where",
-            "when",
-            "which",
-            "whom",
-            "whose",
-            "why",
-            "how",
-        }
-
         meta = dict(metadata or {})
-        meta["is_wh_subject"] = is_wh_subject
+        is_wh_subject = meta.get("is_wh_subject")
+        if is_wh_subject is None:
+            is_wh_subject = subj in {
+                "who",
+                "what",
+                "where",
+                "when",
+                "which",
+                "whom",
+                "whose",
+                "why",
+                "how",
+            }
+
+        meta["is_wh_subject"] = bool(is_wh_subject)
         if text:
             meta.setdefault("debug_text", text)
-        if is_wh_subject:
+        if meta["is_wh_subject"]:
             tpl["anchor_policy"] = "ANY"
 
         return Facet(
@@ -963,36 +796,17 @@ class FacetMiner:
             normalize=normalize,
         )
 
-    def apply_llm_relation_plan(self, relation_templates: List[Dict[str, Any]]) -> List[Facet]:
-        """Convert LLM-produced relation templates into normalized facets."""
-
-        facets: List[Facet] = []
-        for idx, tpl in enumerate(relation_templates or []):
-            normalized_tpl = self._normalize_relation_schema(tpl)
-            facet = self._build_relation_facet(
-                f"llm_rel_{idx}",
-                normalized_tpl,
-                weight=1.0,
-                metadata={"llm_planned": True, "schema_normalized": True},
-            )
-            if facet is not None:
-                facets.append(facet)
-
-        return facets
-
-    def extract_facets(self, query: str, supporting_facts: Optional[List[Tuple[str, int]]] = None) -> List[Facet]:
+    def extract_facets(
+        self,
+        query: str,
+        supporting_facts: Optional[List[Tuple[str, int]]] = None,
+        question_plan: Optional[Dict[str, Any]] = None,
+    ) -> List[Facet]:
         query = _clean_text(query)
-
-        if self._facet_plan_enabled():
-            planned = self._extract_facets_from_llm_plan(query)
-            if planned:
-                return planned
-            # If planning fails, return empty and let the pipeline abstain cleanly.
-            return []
 
         facets: List[Facet] = []
         facets.extend(self._extract_entity_facets(query))
-        facets.extend(self._extract_relation_facets(query))
+        facets.extend(self._extract_relation_facets(query, question_plan=question_plan))
         facets.extend(self._extract_temporal_facets(query))
         facets.extend(self._extract_numeric_facets(query))
         facets.extend(self._extract_comparison_facets(query))
@@ -1036,8 +850,51 @@ class FacetMiner:
         mentions = [m for m in _dedupe_entities_by_longest_span(mentions) if not _looks_like_junk_entity(m)]
         return [Facet(facet_id=f"entity_{i}", facet_type=FacetType.ENTITY, template={"mention": _safe_phrase(m)}) for i, m in enumerate(mentions)]
 
-    # ---- relation (FIXED) ----
-    def _extract_relation_facets(self, query: str) -> List[Facet]:
+    # ---- relation (planned or heuristic) ----
+    def _extract_relation_facets(self, query: str, question_plan: Optional[Dict[str, Any]] = None) -> List[Facet]:
+        if question_plan and isinstance(question_plan, dict):
+            req = question_plan.get("required_facts", [])
+            if isinstance(req, list) and req:
+                facets: List[Facet] = []
+                for i, r in enumerate(req[:3]):
+                    if not isinstance(r, dict):
+                        continue
+                    slot = str(r.get("slot", "")).strip().lower()
+                    ent = _clean_text(str(r.get("entity", "")).strip())
+                    if not slot or not ent:
+                        continue
+                    spec = RELATION_SLOT_TO_TEMPLATE.get(slot)
+                    if not spec:
+                        continue
+
+                    hyp = spec["hypothesis"].format(entity=ent)
+                    tpl = {
+                        "subject": "",
+                        "predicate": spec["predicate"],
+                        "object": ent,
+                        "relation_kind": spec["relation_kind"],
+                        "answer_role": spec.get("answer_role", "object"),
+                        "anchor_policy": spec.get("anchor_policy", "ANY"),
+                        "custom_hypothesis": hyp,
+                        "is_wh_subject": True,
+                    }
+
+                    facets.append(
+                        Facet(
+                            facet_id=f"plan_rel_{i}",
+                            facet_type=FacetType.RELATION,
+                            template=tpl,
+                            weight=1.0,
+                            metadata={"planned": True, "slot": slot, "is_wh_subject": True},
+                            required=True,
+                        )
+                    )
+                if facets:
+                    return facets
+
+        return self._extract_relation_facets_heuristic(query)
+
+    def _extract_relation_facets_heuristic(self, query: str) -> List[Facet]:
         facets: List[Facet] = []
         patterns = [
             (r"(.+?)\s+(?:is|was|were|are)\s+(?:founded|created|written|directed|produced)\s+by\s+(.+?)(?:\?|$)", "created"),
@@ -1055,7 +912,8 @@ class FacetMiner:
                     clean = re.sub(r"^(which|what|who|where|when|why|how)\s+(?:of\s+the\s+following\s+)?", "", clean, flags=re.IGNORECASE).strip()
                     g.append(clean)
 
-                if len(g) < 2 or not g[0] or not g[-1]: continue
+                if len(g) < 2 or not g[0] or not g[-1]:
+                    continue
                 facet = self._build_relation_facet(
                     f"relation_{len(facets)}",
                     {"subject": g[0], "predicate": rel_type, "object": g[-1]},
@@ -1369,13 +1227,6 @@ class FacetMiner:
             relation_kind = "SPOUSE"
 
         # Canonicalize against public schema if present
-        if self.relation_registry is not None:
-            try:
-                relation_kind = self.relation_registry.lookup(relation_kind)
-                raw_pred = self.relation_registry.default_predicate(relation_kind) or raw_pred
-            except Exception:
-                pass
-
         for ent_text, hop in supporting_facts:
             if hop != 1:
                 continue
@@ -1391,12 +1242,10 @@ class FacetMiner:
                 "relation_kind": relation_kind,
                 "answer_role": "object",
             }
-            template = self._normalize_relation_schema(template)
             facet = self._build_relation_facet(
                 fid,
                 template,
                 text=f"[BRIDGE] {relation_kind} of {ent}",
-                metadata={"schema_normalized": True},
             )
             if facet is not None:
                 facets.append(facet)
