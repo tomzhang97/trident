@@ -281,11 +281,11 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         s_raw = str(tpl.get("subject", ""))
         o_raw = str(tpl.get("object", ""))
         predicate = str(tpl.get("predicate", ""))
-        relation_pid = str(tpl.get("relation_pid", "") or "") or None
 
-        # If the facet uses a WH-variable as subject (e.g., "Who"), do NOT require
-        # literal subject anchoring; the object/predicate must still anchor.
+        # WH-subject handling (Who / What / Where)
         is_wh_subject = bool(meta.get("is_wh_subject")) or s_raw.strip().lower() in _WH_WORDS
+
+        relation_pid = str(tpl.get("relation_pid", "") or "") or None
 
         relation_kind = (
             tpl.get("scoring_relation_kind")
@@ -296,12 +296,15 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         # Anchor constraint: require at least one grounded endpoint
         s_clean = _clean_relation_endpoint(s_raw)
         o_clean = _clean_relation_endpoint(o_raw)
-        has_anchor = bool(s_clean or o_clean)
+        if is_wh_subject:
+            has_anchor = bool(o_clean)
+        else:
+            has_anchor = bool(s_clean or o_clean)
 
         # Reject global probes or placeholder-only facets
         # WH-subject facets intentionally drop the subject endpoint from normalization,
-        # so allow them to route as long as there's an object anchor.
-        if not has_anchor and not is_wh_subject:
+        # but still require an object anchor.
+        if not has_anchor:
             _record_failure("no_anchor")
             return False
 
@@ -313,9 +316,8 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         s_match = _fuzzy_phrase_match(s_clean, passage_norm, passage_tokens) if s_clean else False
         o_match = _fuzzy_phrase_match(o_clean, passage_norm, passage_tokens) if o_clean else False
 
-        if is_wh_subject and not s_clean:
-            # WH subjects are intentionally dropped from normalization; don't penalize routing.
-            # Still require object+predicate downstream.
+        # WH subjects are intentionally abstract; don't require subject grounding.
+        if is_wh_subject:
             s_match = True
 
         anchor_policy = str(tpl.get("anchor_policy") or "ANY").upper()
@@ -323,16 +325,14 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
             anchor_policy = "ANY"
 
         anchor_ok = False
-        if is_wh_subject and not s_clean:
+        if is_wh_subject:
             anchor_ok = bool(o_match)
         elif anchor_policy == "ALL":
             anchor_ok = bool(s_match and o_match)
         else:
             anchor_ok = bool(s_match or o_match)
 
-        # For WH-subject facets we already enforce object anchoring above; do not
-        # fail solely due to missing subject surface-form.
-        if not anchor_ok and not is_wh_subject:
+        if not anchor_ok:
             _record_failure("anchor_not_found")
             return False
 
