@@ -1,42 +1,9 @@
 from __future__ import annotations
 
-import json
-import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-_JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-
-def _extract_first_json_object(text: str) -> str:
-    s = (text or "").strip()
-    m = _JSON_OBJ_RE.search(s)
-    if not m:
-        raise ValueError("No JSON object found")
-    # Balanced brace extraction (more robust than regex for nested JSON)
-    start = s.find("{", m.start())
-    depth = 0
-    for i in range(start, len(s)):
-        if s[i] == "{":
-            depth += 1
-        elif s[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return s[start : i + 1]
-    raise ValueError("Unbalanced JSON braces")
-
-
-def strict_json_call(llm, prompt: str, max_new_tokens: int = 200):
-    guard = "Return ONLY a single JSON object. No extra text. No markdown."
-    wrapped = f"{guard}\n{prompt.strip()}\n{guard}"
-    out = llm.generate(
-        wrapped,
-        temperature=0.0,
-        max_new_tokens=max_new_tokens,
-    )
-    raw = out.text if hasattr(out, "text") else str(out)
-    obj = json.loads(_extract_first_json_object(raw))
-    return obj, raw
+from .chain_builder import strict_json_call
 
 
 @dataclass

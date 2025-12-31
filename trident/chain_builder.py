@@ -5,6 +5,7 @@ ensuring that the answer is grounded in the actual passages selected.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import string
@@ -36,6 +37,13 @@ MONTHS = frozenset([
 # CERTIFIED-ONLY HELPER FUNCTIONS
 # =============================================================================
 
+def _normalize_pid_value(pid: str) -> str:
+    """Normalize passage ids for consistent comparisons."""
+    if not pid:
+        return ""
+    return pid.strip().strip("[]").strip()
+
+
 def _cert_pid(certificates: List[Dict[str, Any]]) -> Set[str]:
     """
     Extract certified passage IDs from certificates.
@@ -43,7 +51,11 @@ def _cert_pid(certificates: List[Dict[str, Any]]) -> Set[str]:
     Returns:
         Set of passage IDs that have at least one valid certificate.
     """
-    return {c.get("passage_id", "") for c in certificates if c.get("passage_id")}
+    return {
+        _normalize_pid_value(c.get("passage_id", ""))
+        for c in certificates
+        if c.get("passage_id")
+    }
 
 
 def _norm_ws(s: str) -> str:
@@ -1315,15 +1327,18 @@ def _find_exact_substring(haystack: str, needle: str) -> Optional[Tuple[int, int
     return None
 
 
+def _strip_code_fences(text: str) -> str:
+    """Remove Markdown code fences while preserving inner content."""
+    return re.sub(r"```[a-zA-Z0-9]*\n?(.*?)```", r"\1", text, flags=re.DOTALL)
+
+
 def _extract_first_json_object(text: str) -> str:
-    stripped = text.strip()
+    cleaned = _strip_code_fences(text or "")
+    cleaned = re.sub(r"^\s*//.*$", "", cleaned, flags=re.MULTILINE)
+    stripped = cleaned.strip()
     start = stripped.find("{")
     if start == -1:
         raise ValueError("No JSON object found in text")
-
-    # reject code fences before the JSON
-    if "```" in stripped[:start]:
-        raise ValueError("Code fences found before JSON")
 
     depth = 0
     end_idx = -1
@@ -1338,7 +1353,21 @@ def _extract_first_json_object(text: str) -> str:
                 break
 
     if depth != 0 or end_idx == -1:
-        raise ValueError("Unbalanced JSON braces in text")
+        brace_span = re.search(r"\{[^{}]*\}", stripped, flags=re.DOTALL)
+        if brace_span:
+            return brace_span.group(0)
+        last = stripped.rfind("}")
+        if last > start:
+            end_idx = last
+        else:
+            salvage: Dict[str, Any] = {}
+            for key in ["answer", "candidate_index", "confidence", "explanation"]:
+                m = re.search(rf"{key}\s*[:=]\s*['\"]?([^'\"\n\}}]+)", stripped, flags=re.IGNORECASE)
+                if m:
+                    salvage[key] = m.group(1).strip().strip(",")
+            if salvage:
+                return json.dumps(salvage)
+            raise ValueError("Unbalanced JSON braces in text")
 
     return stripped[start:end_idx + 1]
 
@@ -1347,8 +1376,10 @@ def strict_json_call(llm, prompt: str, max_new_tokens: int = 160, temperature: f
     """Run an LLM call that must return exactly one JSON object.
 
     This helper centralizes the JSON-only contract so downstream callers do not
-    attempt their own permissive parsing. Any deviation (extra text, code
-    fences, multiple objects) raises a ValueError to keep behavior fail-closed.
+    attempt their own permissive parsing. It extracts the first balanced JSON
+    object (even inside fences or with surrounding chatter) and ignores any
+    trailing text, while still rejecting unbalanced braces to avoid ambiguous
+    parses.
 
     Returns:
         tuple(parsed_json, raw_output)
@@ -1362,7 +1393,23 @@ def strict_json_call(llm, prompt: str, max_new_tokens: int = 160, temperature: f
         max_new_tokens=max_new_tokens,
     )
     raw_text = raw.text if hasattr(raw, "text") else str(raw)
-    parsed = json.loads(_extract_first_json_object(raw_text))
+    try:
+        extracted = _extract_first_json_object(raw_text)
+    except Exception:
+        first = raw_text.find("{")
+        last = raw_text.rfind("}")
+        if first == -1 or last == -1 or last <= first:
+            raise
+        extracted = raw_text[first:last + 1]
+    try:
+        parsed = json.loads(extracted)
+    except Exception:
+        # Best-effort fallback for single-quoted dicts
+        try:
+            parsed = ast.literal_eval(extracted)
+        except Exception as exc:
+            raise ValueError(f"Failed to parse JSON: {exc}")
+
     return parsed, raw
 
 
@@ -1407,6 +1454,45 @@ def _find_fuzzy_substring(haystack: str, needle: str, max_distance: int = 2) -> 
             return (start_pos, start_pos + len(matched_text), matched_text)
 
     return None
+
+
+def _coerce_json_object(text: str) -> Optional[dict]:
+    """Best-effort JSON coercion for CSS outputs.
+
+    Tries strict extraction first; if that fails, performs minimal repairs for
+    common model issues (unquoted keys, single quotes). Returns None on failure.
+    """
+    import json as json_module
+    try:
+        candidate = _extract_first_json_object(text)
+    except Exception:
+        first = text.find("{")
+        last = text.rfind("}")
+        if first == -1 or last == -1 or last <= first:
+            return None
+        candidate = text[first:last + 1]
+
+    # Attempt strict parse first
+    try:
+        return json_module.loads(candidate)
+    except Exception:
+        pass
+
+    try:
+        return ast.literal_eval(candidate)
+    except Exception:
+        pass
+
+    # Minimal, targeted repairs only for the expected schema
+    fixed = candidate
+    fixed = re.sub(r"\b(pid|answer|confidence)\b", r'"\\1"', fixed)
+    if "'" in fixed:
+        fixed = fixed.replace("'", '"')
+
+    try:
+        return json_module.loads(fixed)
+    except Exception:
+        return None
 
 
 def certified_span_select(
@@ -1467,13 +1553,22 @@ Evidence:
 
 JSON:"""
 
+    raw = llm.generate(prompt, temperature=0.0, max_new_tokens=160)
+    raw_text = raw.text if hasattr(raw, 'text') else str(raw)
+
+    out: Optional[Dict[str, Any]] = None
     try:
-        out, raw = strict_json_call(llm, prompt, max_new_tokens=160, temperature=0.0)
-        raw_text = raw.text if hasattr(raw, 'text') else str(raw)
+        out = json.loads(_extract_first_json_object(raw_text))
     except Exception as e:
         if debug:
-            print(f"[CSS] JSON parse failed: {e}")
-        return CSSResult(abstain=True, answer="", passage_id="", reason="PARSE_ERROR")
+            print(f"[CSS] JSON parse failed (strict): {e}")
+
+    if out is None:
+        out = _coerce_json_object(raw_text)
+        if out is None:
+            if debug:
+                print(f"[CSS] JSON parse failed (coerce): raw='{raw_text[:200]}'")
+            return CSSResult(abstain=True, answer="", passage_id="", reason="PARSE_ERROR")
 
     if debug:
         print(f"[CSS] Raw LLM output: {raw_text[:200]}...")
@@ -1490,6 +1585,7 @@ JSON:"""
             prompt_tokens = prompt_tokens
 
     pid = (out.get("pid") or "").strip()
+    pid_norm = _normalize_pid_value(pid)
     answer = (out.get("answer") or "").strip()
     confidence = float(out.get("confidence", 0))
 
@@ -1509,9 +1605,9 @@ JSON:"""
             completion_tokens=completion_tokens,
         )
 
-    # Verify passage ID is in winners
-    passage_map = {p.get("pid", ""): p for p in winner_passages}
-    if pid not in passage_map:
+    # Verify passage ID is in winners (normalized to avoid bracket/whitespace mismatches)
+    passage_map = {_normalize_pid_value(p.get("pid", "")): p for p in winner_passages}
+    if pid_norm not in passage_map:
         if debug:
             print(f"[CSS] PID {pid} not in winners: {list(passage_map.keys())}")
         return CSSResult(
@@ -1526,7 +1622,8 @@ JSON:"""
         )
 
     # Verify exact grounding
-    passage_text = passage_map[pid].get("text", "")
+    passage = passage_map[pid_norm]
+    passage_text = passage.get("text", "")
 
     # Try exact match first
     match = _find_exact_substring(passage_text, answer)
@@ -2005,13 +2102,13 @@ def get_answer_facet_passages(
     # -----------------------------
     # 1) Certified-only PID scope
     # -----------------------------
-    certified_pids = _cert_pid(certificates)
+    certified_pids = {_normalize_pid_value(pid) for pid in _cert_pid(certificates)}
 
     # Build passage lookup from certified-only pool
     pid_to_passage = {
-        p.get("pid"): p
+        _normalize_pid_value(p.get("pid")): p
         for p in all_passages
-        if p.get("pid") in certified_pids
+        if _normalize_pid_value(p.get("pid")) in certified_pids
     }
 
     # -----------------------------
@@ -2105,8 +2202,12 @@ def constrained_span_select(
         )
 
     if certificates:
-        certified_pids = _cert_pid(certificates)
-        winner_passages = [p for p in winner_passages if p.get("pid") in certified_pids]
+        certified_pids = {_normalize_pid_value(pid) for pid in _cert_pid(certificates)}
+        winner_passages = [
+            p
+            for p in winner_passages
+            if _normalize_pid_value(p.get("pid")) in certified_pids
+        ]
         if not winner_passages:
             return ConstrainedSelectionResult(
                 answer="",
@@ -2246,8 +2347,10 @@ def bind_entity_via_css(
         return None
 
     if certificates:
-        certified_pids = _cert_pid(certificates)
-        hop1_passages = [p for p in hop1_passages if p.get("pid") in certified_pids]
+        certified_pids = {_normalize_pid_value(pid) for pid in _cert_pid(certificates)}
+        hop1_passages = [
+            p for p in hop1_passages if _normalize_pid_value(p.get("pid")) in certified_pids
+        ]
         if not hop1_passages:
             return None
 
@@ -2315,17 +2418,36 @@ Rules:
 
 JSON:"""
 
+    # Build lookup maps for post-hoc normalization
+    pid_to_idx = {
+        _normalize_pid_value(pid): idx for idx, (_, pid) in enumerate(candidate_list) if pid
+    }
+    text_to_idx = {
+        _normalize_text_unicode(text): idx for idx, (text, _) in enumerate(candidate_list)
+    }
+
     try:
         resp = llm.generate(prompt, temperature=0.0)
         raw = resp.text if hasattr(resp, "text") else str(resp)
-        s = raw.find("{")
-        e = raw.rfind("}")
-        if s == -1 or e == -1:
-            return None
-        data = json.loads(raw[s:e+1])
+        extracted = _extract_first_json_object(raw)
+        data = json.loads(extracted)
 
-        idx = int(data.get("index", -1))
-        conf = float(data.get("confidence", 0.0))
+        idx = data.get("index")
+        conf = float(data.get("confidence", data.get("score", 0.0) or 0.0))
+
+        if idx is None:
+            pid_resp = _normalize_pid_value(str(data.get("pid", "")).strip())
+            if pid_resp and pid_resp in pid_to_idx:
+                idx = pid_to_idx[pid_resp]
+            else:
+                ans_resp = _normalize_text_unicode(str(data.get("answer", "")).strip())
+                if ans_resp and ans_resp in text_to_idx:
+                    idx = text_to_idx[ans_resp]
+
+        if idx is None:
+            idx = -1
+
+        idx = int(idx)
 
         if conf < min_confidence:
             return None
@@ -2395,12 +2517,12 @@ def get_winner_passages_only(
         return []
 
     # CERTIFIED-ONLY: Get set of certified passage IDs
-    certified_pids = _cert_pid(certificates)
+    certified_pids = {_normalize_pid_value(pid) for pid in _cert_pid(certificates)}
 
     # Build passage lookup (only certified passages, excluding deny-listed)
     pid_to_passage = {}
     for p in passages:
-        pid = p.get("pid", "")
+        pid = _normalize_pid_value(p.get("pid", ""))
         if pid and pid in certified_pids:
             title = p.get("title", "")
             if not _is_deny_title(title):
@@ -2414,7 +2536,7 @@ def get_winner_passages_only(
     winners = []
 
     for cert in sorted_certs:
-        pid = cert.get("passage_id", "")
+        pid = _normalize_pid_value(cert.get("passage_id", ""))
         # CERTIFIED-ONLY: Must be in pid_to_passage (certified and not deny-listed)
         if pid and pid not in seen_pids and pid in pid_to_passage:
             seen_pids.add(pid)
