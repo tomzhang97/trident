@@ -2880,19 +2880,66 @@ def extract_answer_from_certified_facet(
     # 6. Verify extracted span appears in winning passage (provenance check)
     if extracted:
         # Normalize for verification (handle Unicode, punctuation variations)
-        extracted_norm = extracted.strip().lower()
-        passage_norm = passage_text.lower()
+        # CRITICAL: Use robust normalization to avoid rejecting correct answers
+        import unicodedata
+        import string
 
-        if extracted_norm not in passage_norm:
+        def normalize_for_verification(text: str) -> str:
+            """
+            Robust normalization for span verification.
+
+            Steps:
+            1. Unicode normalize (NFKC) - handles diacritics, combining chars
+            2. Lowercase
+            3. Strip surrounding punctuation
+            4. Collapse whitespace
+
+            This prevents false rejections like:
+            - "Małgorzata Braunek" vs "Małgorzata Braunek,"
+            - "D'Arcy" vs "D'Arcy"
+            - "1985  " vs "1985"
+            """
+            if not text:
+                return ""
+
+            # 1. Unicode normalize (NFKC)
+            text = unicodedata.normalize('NFKC', text)
+
+            # 2. Lowercase
+            text = text.lower()
+
+            # 3. Strip surrounding punctuation and whitespace
+            text = text.strip()
+            text = text.strip(string.punctuation)
+            text = text.strip()
+
+            # 4. Collapse whitespace
+            text = ' '.join(text.split())
+
+            return text
+
+        extracted_norm = normalize_for_verification(extracted)
+        passage_norm = normalize_for_verification(passage_text)
+
+        # Primary check: normalized match
+        if extracted_norm in passage_norm:
             if debug:
-                print(f"  ✗ Extracted '{extracted}' not found in passage (provenance check failed)")
-            return None
+                print(f"  ✓ Provenance verified (normalized): '{extracted}' found in passage")
+                print(f"  Method: {extraction_method}")
+            return extracted
 
+        # Fallback check: raw substring match (in case normalization was too aggressive)
+        if extracted.strip() in passage_text:
+            if debug:
+                print(f"  ✓ Provenance verified (raw): '{extracted}' found in passage")
+                print(f"  Method: {extraction_method}")
+            return extracted
+
+        # Failed both checks
         if debug:
-            print(f"  ✓ Provenance verified: '{extracted}' found in passage")
-            print(f"  Method: {extraction_method}")
-
-        return extracted
+            print(f"  ✗ Extracted '{extracted}' not found in passage (provenance check failed)")
+            print(f"    Normalized: '{extracted_norm}' not in passage")
+        return None
 
     if debug:
         print(f"  ✗ No extraction succeeded")
