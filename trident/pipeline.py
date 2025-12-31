@@ -86,6 +86,41 @@ def _is_abstain_answer(text: str) -> bool:
     return any(p in text_lower for p in ABSTAIN_PATTERNS)
 
 
+def _finalize_abstain(result: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    """
+    CRITICAL (Change 9): Single abstention finalization to ensure correctness.
+
+    When abstained=True, the contract is:
+    - abstained = True
+    - answer = "ABSTAIN"
+    - confidence = 0.0
+    - No extraction runs
+    - Immediate return
+
+    This prevents the cascade: ENTITY-ONLY ABSTAIN → EMPTY ANSWER DEBUG
+
+    Args:
+        result: Existing result dict (may be empty)
+        reason: Reason for abstention (stored in metrics)
+
+    Returns:
+        Result dict with abstention contract enforced
+    """
+    result = dict(result) if result else {}
+    result["abstained"] = True
+    result["abstention_reason"] = reason
+
+    # Ensure no extraction artifacts
+    if "answer" not in result or not result["answer"]:
+        result["answer"] = "ABSTAIN"
+
+    if "metrics" not in result:
+        result["metrics"] = {}
+    result["metrics"]["abstention_reason"] = reason
+
+    return result
+
+
 def _normalize_for_filter(text: str) -> str:
     """Helper function to normalize text for filtering."""
     t = text.lower().strip()
@@ -632,16 +667,60 @@ class TridentPipeline:
                             print(f"  Cannot answer {q_category} question with ENTITY-only certification")
                             print(f"  ABSTAINING to avoid confident-but-wrong answer")
 
-                        # Override result to abstain
-                        result = dict(result)
-                        result['abstained'] = True
-                        result['abstention_reason'] = 'ENTITY_ONLY_INSUFFICIENT'
-                        if 'metrics' not in result:
-                            result['metrics'] = {}
-                        result['metrics']['abstention_reason'] = 'entity_only_for_relational_question'
-                        # Skip all downstream extraction
-                        answer = ""
-                        is_grounded = False
+                        # CRITICAL (Change 9): Use _finalize_abstain() and return immediately
+                        # This prevents extraction from running after abstention
+                        result = _finalize_abstain(result, 'entity_only_for_relational_question')
+
+                        # Skip to final output generation (no extraction)
+                        answer = "ABSTAIN"
+                        total_tokens = 0
+                        prompt_tokens = 0
+                        completion_tokens = 0
+                        prompt_type = "none"
+
+                        # Jump to output preparation
+                        latency_ms = (time.time() - start_time) * 1000
+                        final_abstained = True
+
+                        metrics = result.get('metrics', {})
+                        evidence_tokens = result.get('evidence_tokens', 0)
+                        certificates = result.get('certificates') or []
+                        certified_facet_ids = set(c.get("facet_id") for c in certificates if c.get("facet_id"))
+
+                        metrics.update({
+                            'evidence_tokens': evidence_tokens,
+                            'prompt_tokens': 0,
+                            'completion_tokens': 0,
+                            'total_tokens': 0,
+                            'overhead_tokens': 0,
+                            'model_abstained': False,
+                            'prompt_type': 'none',
+                            'used_constrained': False,
+                            'constrained_reason': None,
+                            'constrained_confidence': None,
+                            'constrained_candidate_index': None,
+                            'constrained_num_candidates': 0,
+                            'constrained_passage_id': None,
+                            'answer_facet_ids': [],
+                            'answer_selection_reason': '',
+                            'num_certificates': len(certificates),
+                            'num_certified_facets': len(certified_facet_ids),
+                            'certified_facet_ids': list(certified_facet_ids),
+                            'answer_grounded': False,
+                        })
+
+                        return PipelineOutput(
+                            answer="ABSTAIN",
+                            selected_passages=result['selected_passages'],
+                            certificates=result.get('certificates'),
+                            abstained=True,
+                            tokens_used=0,
+                            latency_ms=latency_ms,
+                            metrics=metrics,
+                            mode=mode,
+                            facets=[f.to_dict() for f in facets],
+                            trace=self.telemetry.get_trace()
+                        )
 
                 # Only proceed with extraction if we haven't abstained
                 if not result.get('abstained', False):
@@ -1524,14 +1603,14 @@ class TridentPipeline:
         if not bound_entity:
             if debug:
                 print(f"  Failed to bind entity from hop-1 - ABSTAIN (required hop-2 cannot be certified)")
-            # IMPORTANT: Do NOT return hop-1-only answers for compositional questions.
-            # If we cannot bind the bridge entity, hop-2 facets cannot be instantiated/certified,
-            # so we must abstain to avoid confident-but-wrong outputs.
-            hop1_result = dict(hop1_result)  # shallow copy
-            hop1_result['abstained'] = True
-            hop1_result['abstention_reason'] = 'BINDING_FAILED'
+            # CRITICAL (Change 9): Use _finalize_abstain() for binding failure
+            # This enforces the abstention contract and prevents partial answers
+            hop1_result = _finalize_abstain(
+                hop1_result,
+                reason='binding_failed_compositional_question'
+            )
             hop1_result['binding_source'] = binding_source  # Track why binding failed
-            # ensure no downstream answer extraction uses partial evidence
+            # Preserve passages and certificates for debugging
             hop1_result['selected_passages'] = hop1_result.get('selected_passages', [])
             hop1_result['certificates'] = hop1_result.get('certificates', [])
             return hop1_result
