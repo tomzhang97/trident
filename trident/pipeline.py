@@ -674,24 +674,25 @@ class TridentPipeline:
                     for c in certificates
                 )
 
-                # CRITICAL FIX: ENTITY-only certification cannot answer comparison/temporal/relational questions
+                # STEP 4 FIX: Don't classify "what" as unanswerable by default
                 # If the question requires specific relations/comparisons/times and only ENTITY facets certified,
-                # we must ABSTAIN to avoid confident-but-wrong answers.
+                # we now route to LLM Answer Certificate instead of abstaining immediately.
+                # This handles questions like "what year", "what country", "who is the", etc.
                 if not has_answer_facet_certified:
                     # Detect question type
                     q_type = detect_question_type(query)
                     q_category = getattr(q_type, 'category', None)
                     q_lower = query.lower()
 
-                    # Check if this is a comparison, temporal, or relational question
+                    # STEP 4: Allow LLM cert to handle most question types
+                    # Only abstain on truly unanswerable types (none currently)
+                    # Questions like "what", "who", "when", "where", "compare", "yesno" should try LLM cert
+                    should_skip_to_llm_cert = q_category in {"what", "who", "when", "where", "comparison", "yesno", "temporal", "relational"}
+
+                    # Old strict check (now more permissive)
                     requires_non_entity = (
-                        q_category in {"comparison", "temporal", "relational"} or
-                        any(kw in q_lower for kw in [
-                            "which film came out", "which came first", "which was released",
-                            "when did", "what year", "what date",
-                            "who is the", "who was the", "what is the", "what was the",
-                            "are they in the same", "do they share", "were they both"
-                        ])
+                        q_category in {"comparison", "temporal", "relational"} and
+                        not should_skip_to_llm_cert  # Always False now, but kept for clarity
                     )
 
                     if requires_non_entity:
