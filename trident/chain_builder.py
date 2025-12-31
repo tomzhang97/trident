@@ -1009,6 +1009,65 @@ def bind_entity_from_hop1_winner(
         if m:
             return m.group(1).strip()
 
+    elif relation_type == "MOTHER":
+        # Pattern: "son of Name" or "daughter of Name"
+        if "son of" in t_lower or "daughter of" in t_lower or "child of" in t_lower:
+            m = re.search(r"(?i)\b(?:son|daughter|child)\s+of\s+(?:actress\s+)?([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})", t)
+            if m:
+                return m.group(1).strip()
+
+        # Pattern: "mother is Name" or "mother was Name"
+        if "mother" in t_lower:
+            m = re.search(r"(?i)\bmother\s+(?:is|was)\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})", t)
+            if m:
+                return m.group(1).strip()
+
+    elif relation_type == "FATHER":
+        # Pattern: "son of Name" or "daughter of Name"
+        if "son of" in t_lower or "daughter of" in t_lower or "child of" in t_lower:
+            m = re.search(r"(?i)\b(?:son|daughter|child)\s+of\s+(?:actor\s+)?([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})", t)
+            if m:
+                return m.group(1).strip()
+
+        # Pattern: "father is Name" or "father was Name"
+        if "father" in t_lower:
+            m = re.search(r"(?i)\bfather\s+(?:is|was)\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})", t)
+            if m:
+                return m.group(1).strip()
+
+    elif relation_type == "PARENT":
+        # Generic parent extraction - try both mother and father patterns
+        if "son of" in t_lower or "daughter of" in t_lower or "child of" in t_lower:
+            m = re.search(r"(?i)\b(?:son|daughter|child)\s+of\s+(?:actress?|actor)?\s*([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})", t)
+            if m:
+                return m.group(1).strip()
+
+        # Pattern: "parent is Name" or "parents are Name and ..."
+        if "parent" in t_lower:
+            m = re.search(r"(?i)\bparents?\s+(?:is|was|are|were)\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})", t)
+            if m:
+                return m.group(1).strip()
+
+    elif relation_type == "SPOUSE":
+        # Pattern: "married Name" or "married to Name"
+        if "married" in t_lower:
+            m = re.search(r"(?i)\bmarried\s+(?:to\s+)?([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|in\s|$)", t)
+            if m:
+                return m.group(1).strip()
+
+        # Pattern: "spouse is Name" or "wife/husband is Name"
+        if "spouse" in t_lower or "wife" in t_lower or "husband" in t_lower:
+            m = re.search(r"(?i)\b(?:spouse|wife|husband)\s+(?:is|was)\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})", t)
+            if m:
+                return m.group(1).strip()
+
+    elif relation_type == "CHILD":
+        # Pattern: "Name is the son/daughter of" (extract Name before "is")
+        if "son" in t_lower or "daughter" in t_lower or "child" in t_lower:
+            m = re.search(r"(?i)([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})\s+(?:is|was)\s+(?:the\s+)?(?:son|daughter|child)", t)
+            if m:
+                return m.group(1).strip()
+
     return None
 
 
@@ -1316,14 +1375,41 @@ def _find_exact_substring(haystack: str, needle: str) -> Optional[Tuple[int, int
 
 
 def _extract_first_json_object(text: str) -> str:
+    """
+    Extract the first valid JSON object from text.
+
+    Robust strategy:
+    1. First, look for content inside code fences (```json ... ``` or ``` ... ```)
+    2. If found, extract JSON from inside the fences
+    3. Otherwise, extract from the full text
+    4. Returns the first balanced { ... } substring
+
+    This handles LLM outputs that wrap JSON in markdown code blocks.
+    """
     stripped = text.strip()
+
+    # Strategy 1: Try to extract from inside code fences first
+    # Match: ```json\n{...}\n``` or ```\n{...}\n```
+    fence_patterns = [
+        r"```json\s*(\{[\s\S]*?\})\s*```",  # ```json { ... } ```
+        r"```\s*(\{[\s\S]*?\})\s*```",       # ``` { ... } ```
+    ]
+
+    for pattern in fence_patterns:
+        match = re.search(pattern, stripped)
+        if match:
+            candidate = match.group(1).strip()
+            # Validate it's a balanced JSON object
+            try:
+                if _is_balanced_json(candidate):
+                    return candidate
+            except:
+                continue
+
+    # Strategy 2: Extract first balanced { ... } from full text
     start = stripped.find("{")
     if start == -1:
         raise ValueError("No JSON object found in text")
-
-    # reject code fences before the JSON
-    if "```" in stripped[:start]:
-        raise ValueError("Code fences found before JSON")
 
     depth = 0
     end_idx = -1
@@ -1341,6 +1427,19 @@ def _extract_first_json_object(text: str) -> str:
         raise ValueError("Unbalanced JSON braces in text")
 
     return stripped[start:end_idx + 1]
+
+
+def _is_balanced_json(text: str) -> bool:
+    """Check if text has balanced braces (simple validator)."""
+    depth = 0
+    for ch in text:
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
 
 
 def strict_json_call(llm, prompt: str, max_new_tokens: int = 160, temperature: float = 0.0):
@@ -2156,11 +2255,16 @@ JSON:"""
     try:
         resp = llm.generate(span_prompt, temperature=0.0)
         raw = resp.text if hasattr(resp, "text") else str(resp)
-        s = raw.find("{")
-        e = raw.rfind("}")
-        if s != -1 and e != -1:
-            data = json.loads(raw[s:e+1])
 
+        # Use robust JSON extraction with code fence handling
+        try:
+            json_str = _extract_first_json_object(raw)
+            data = json.loads(json_str)
+        except Exception as parse_err:
+            if debug:
+                print(f"[FROZEN-SPAN] JSON extraction failed: {parse_err}")
+            # Fall through to return NO_VERIFIED_SPAN
+        else:
             span = data.get("answer_span")
             pid = data.get("pid")
             start_char = data.get("start_char")
@@ -2319,31 +2423,15 @@ JSON:"""
     try:
         resp = llm.generate(prompt, temperature=0.0)
         raw = resp.text if hasattr(resp, "text") else str(resp)
-        # --- robust JSON extraction (fail-closed) ---
-        def _first_json_obj(text: str) -> Optional[Dict[str, Any]]:
-            """Parse the *first* JSON object from model output.
-            Accepts extra commentary / code fences / multiple JSON blocks."""
-            # Strip code fences (best-effort)
-            cleaned = re.sub(r"```[\s\S]*?```", " ", text).strip()
-            s0 = cleaned.find("{")
-            if s0 == -1:
-                return None
-            try:
-                dec = json.JSONDecoder()
-                obj, _ = dec.raw_decode(cleaned[s0:])
-                return obj if isinstance(obj, dict) else None
-            except Exception:
-                # Fallback: first non-greedy {...}
-                m = re.search(r"\{[\s\S]*?\}", cleaned)
-                if not m:
-                    return None
-                try:
-                    obj = json.loads(m.group(0))
-                    return obj if isinstance(obj, dict) else None
-                except Exception:
-                    return None
 
-        data = _first_json_obj(raw)
+        # Use robust JSON extraction with code fence handling
+        try:
+            json_str = _extract_first_json_object(raw)
+            data = json.loads(json_str)
+        except Exception as parse_err:
+            if debug:
+                print(f"[CSS-BIND] JSON extraction failed: {parse_err}")
+            data = None
         if not data:
             if debug:
                 print(f"[CSS-BIND] Failed: could not parse JSON from: {raw[:120]!r}")
@@ -2402,6 +2490,44 @@ def build_inner_question_from_facet(facet: Dict[str, Any]) -> str:
     subject = template.get("subject", "Who")
     predicate = template.get("predicate", "")
     obj = template.get("object", "")
+
+    # Normalize subject if it's placeholder/empty/WH-like
+    # This improves CSS binding signal by ensuring valid WH-words
+    if not subject or subject.strip() in ("?", ""):
+        # Determine if answer is PERSON or THING based on facet metadata
+        facet_type = facet.get("facet_type", "")
+        inner_relation_type = template.get("inner_relation_type", "")
+
+        # PERSON-type relations
+        person_relations = {"DIRECTOR", "AUTHOR", "CREATOR", "COMPOSER", "PERFORMER",
+                          "MOTHER", "FATHER", "PARENT", "SPOUSE", "CHILD"}
+
+        if inner_relation_type in person_relations or "PERSON" in facet_type:
+            subject = "Who"
+        else:
+            subject = "What"
+
+    # Normalize WH-like placeholders
+    subject_lower = subject.strip().lower()
+    if subject_lower in ("who", "what", "where", "when", "which", "whose"):
+        subject = subject.capitalize()
+
+    # Add predicate fallback if empty
+    # Use schema-based predicates for common relation types
+    if not predicate or not predicate.strip():
+        inner_relation_type = template.get("inner_relation_type", "")
+        predicate_map = {
+            "DIRECTOR": "directed",
+            "AUTHOR": "wrote",
+            "CREATOR": "created",
+            "COMPOSER": "composed",
+            "PERFORMER": "performed in",
+            "MOTHER": "is the mother of",
+            "FATHER": "is the father of",
+            "PARENT": "is the parent of",
+            "SPOUSE": "is married to",
+        }
+        predicate = predicate_map.get(inner_relation_type, "is related to")
 
     # Build natural question
     question = f"{subject} {predicate} {obj}".strip()

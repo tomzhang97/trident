@@ -313,6 +313,15 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
 
         placeholder_re = re.compile(r"\[[A-Z0-9_]+_RESULT\]")
         if (s_clean and placeholder_re.search(s_raw)) or (o_clean and placeholder_re.search(o_raw)):
+            # CRITICAL: Uninstantiated facets (still have placeholders) should fail fast
+            # with a clear debug message rather than silently gating everything to 0.0
+            import os
+            if os.environ.get("TRIDENT_DEBUG_GATE", "0") == "1":
+                placeholder_match = placeholder_re.search(s_raw) or placeholder_re.search(o_raw)
+                print(f"[GATE] UNINSTANTIATED FACET: {placeholder_match.group(0) if placeholder_match else 'unknown'}")
+                print(f"[GATE]   subject: {s_raw}")
+                print(f"[GATE]   object: {o_raw}")
+                print(f"[GATE]   facet_id: {facet.facet_id if hasattr(facet, 'facet_id') else 'unknown'}")
             _record_failure("placeholder_anchor")
             return False
 
@@ -323,11 +332,33 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
 
         # If WH subject ("Who/What/..."), relax object anchoring:
         # allow partial token overlap instead of full token subset.
+        # For bound entities (multi-token names), require strong token match + relation keyword.
         if is_wh_subject and o_clean and not o_match:
             overlap = o_tokens.intersection(passage_tokens)
-            # require at least 2 tokens overlap OR 1 token if object is short
-            if len(overlap) >= 2 or (len(o_tokens) <= 2 and len(overlap) >= 1):
-                o_match = True
+
+            # Check if object is a bound entity (multi-token name from facet instantiation)
+            is_bound_entity = len(o_tokens) >= 2 and len(overlap) >= 1
+
+            if is_bound_entity:
+                # For bound entities, require at least one strong token match
+                # (not just stopwords) + relation keyword presence
+                strong_tokens = {t for t in overlap if len(t) > 3}
+                has_strong_match = len(strong_tokens) >= 1
+
+                # Check for relation keyword if relation_kind is available
+                has_relation_keyword = False
+                if relation_kind:
+                    has_relation_keyword = _check_relation_keywords(
+                        relation_kind, passage_norm, passage_tokens, relation_pid=relation_pid
+                    )
+
+                if has_strong_match and (has_relation_keyword or not relation_kind):
+                    o_match = True
+            else:
+                # Original logic for non-bound entities
+                # require at least 2 tokens overlap OR 1 token if object is short
+                if len(overlap) >= 2 or (len(o_tokens) <= 2 and len(overlap) >= 1):
+                    o_match = True
 
         anchor_policy = str(tpl.get("anchor_policy") or "ANY").upper()
         if anchor_policy not in {"ANY", "ALL"}:

@@ -1392,21 +1392,33 @@ class TridentPipeline:
                 print(f"  Bound entity (CSS): {bound_entity}")
 
         # ================================================================
-        # ABORT IF CSS BINDING FAILS - DON'T USE GARBAGE FALLBACK
+        # FALLBACK BINDING: Use deterministic regex if CSS fails
         # ================================================================
-        # The regex-based fallback (bind_entity_from_hop1_winner) can produce
-        # garbage like "Polish film" which poisons hop-2 retrieval.
-        # Better to abort hop-2 and return hop-1 result than continue with garbage.
-        #
-        # If CSS binding fails, it means either:
-        # 1. The LLM couldn't extract a valid person name from the passage
-        # 2. The extracted name isn't a verbatim substring (hallucination)
-        # 3. The extracted name failed type validation (not PERSON-like)
-        #
-        # In all cases, proceeding with hop-2 would produce wrong answers.
+        # If CSS binding fails (LLM parsing issues, no verbatim match, etc.),
+        # fall back to deterministic regex extraction from the binding passage.
+        # This ensures hop-2 facets always get instantiated.
+        if not bound_entity and inner_relation_type and binding_passages:
+            if debug:
+                print(f"  CSS binding failed - attempting regex fallback for {inner_relation_type}")
+
+            # Try regex extraction from the binding passage text
+            for p in binding_passages:
+                passage_text = p.get('text', '')
+                if passage_text:
+                    fallback_entity = bind_entity_from_hop1_winner(
+                        inner_relation_type,
+                        passage_text
+                    )
+                    if fallback_entity:
+                        bound_entity = fallback_entity
+                        if debug:
+                            print(f"  Bound entity (regex fallback): {bound_entity}")
+                        break
+
+        # Only abort if both CSS and fallback failed
         if not bound_entity:
             if debug:
-                print(f"  Failed to bind entity from hop-1 - ABSTAIN (required hop-2 cannot be certified)")
+                print(f"  Failed to bind entity from hop-1 (CSS and regex both failed) - ABSTAIN")
             # IMPORTANT: Do NOT return hop-1-only answers for compositional questions.
             # If we cannot bind the bridge entity, hop-2 facets cannot be instantiated/certified,
             # so we must abstain to avoid confident-but-wrong outputs.
