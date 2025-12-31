@@ -23,6 +23,23 @@ import numpy as np
 from .candidates import Passage
 from .facets import Facet, FacetType
 from .config import SafeCoverConfig
+from . import nli_scorer
+
+
+def tf_for(ft_enum: FacetType, ft_str: str) -> int:
+    """
+    Get T_f for a facet type. MUST be consistent with pipeline.py.
+
+    Used for:
+    - Shortlist size in pipeline
+    - Bonferroni threshold α_bar = α_f / T_f
+    - Coverage set building in safe_cover
+    """
+    if ft_enum == FacetType.ENTITY:
+        return 5
+    if ft_enum == FacetType.RELATION or "BRIDGE" in ft_str:
+        return 10
+    return 5
 
 
 class AbstentionReason(Enum):
@@ -32,6 +49,7 @@ class AbstentionReason(Enum):
     INFEASIBILITY_PROVEN = "infeasibility_proven"  # LB_dual > B_ctx - cost_ctx
     BUDGET_EXHAUSTED = "budget_exhausted"  # No candidates fit within remaining budget
     PVALUE_INFEASIBLE_SMALL_BIN = "pvalue_infeasible_small_bin"  # α_bar_f < 1/(n_b+1) and cannot resolve
+    INFEASIBLE_MISSING_FACETS = "infeasible_missing_facets"  # U monotonic: required facets not coverable
 
 
 @dataclass
@@ -121,6 +139,9 @@ class EpisodeKnobs:
     retriever_version: str
     shortlister_version: str = ""  # Hash of shortlister for selection-conditional calibration
     pvalue_mode: str = "deterministic"  # "deterministic" or "randomized"
+    gate_version: str = ""  # Tested-Set gate definition version
+    normalize_version: str = ""  # Text normalization version used in gating
+    relation_keywords_hash: str = ""  # Hash of RELATION_KEYWORDS used in gating
     frozen_at: float = field(default_factory=time.time)
 
     def get_alpha_bar(self, facet_id: str) -> float:
@@ -155,6 +176,7 @@ class SafeCoverResult:
             'abstention_reason': self.abstention_reason.value,
             'total_cost': self.total_cost,
             'infeasible': self.infeasible,
+            'episode_knobs': self.episode_knobs.__dict__ if self.episode_knobs else None,
         }
 
 
@@ -196,6 +218,11 @@ class SafeCoverAlgorithm:
         if hasattr(self.pvalue_mode, 'value'):
             self.pvalue_mode = self.pvalue_mode.value
 
+        # Tested-Set definition metadata
+        self.gate_version = nli_scorer.GATE_VERSION
+        self.normalize_version = nli_scorer.NORMALIZE_VERSION
+        self.relation_keyword_hash = nli_scorer.RELATION_KEYWORDS_HASH
+
     def _get_budget_cap(self) -> Optional[int]:
         """Get the effective budget cap, preferring max_evidence_tokens over token_cap."""
         return (
@@ -207,6 +234,7 @@ class SafeCoverAlgorithm:
     def _freeze_episode_knobs(
         self,
         facets: List[Facet],
+        passages: Optional[List[Passage]] = None,
         alpha_query: Optional[float] = None
     ) -> EpisodeKnobs:
         """
@@ -214,28 +242,59 @@ class SafeCoverAlgorithm:
 
         Per query, freeze: T_f, α_query, α_f, ᾱ_f, calibrator version, coverage sets.
         No mid-episode adaptation.
+
+        CRITICAL FIX:
+        - per_facet_alpha IS the per-facet budget (don't divide by |F|)
+        - max_tests from config is the T_f (don't hardcode 10)
+        - EXHAUSTIVE PROBING: When pool ≤ 10, probe ALL passages to prevent STAGE-1 MISS
         """
-        alpha_query = alpha_query or self.config.per_facet_alpha
+        import os
+        debug = os.environ.get("TRIDENT_DEBUG_PVALUE", "0") == "1"
+
+        # per_facet_alpha is ALREADY the per-facet budget α_f
+        per_facet_alpha = alpha_query or self.config.per_facet_alpha
         n_facets = len(facets)
 
-        # Per-facet configs
-        t_f = 10  # Default max tests per facet
+        # EXHAUSTIVE PROBING: When pool is small, use pool_n as T_f
+        pool_n = len(passages) if passages else 10
+        exhaustive = (
+            getattr(self.config, "exhaustive_pool", True)
+            and pool_n <= getattr(self.config, "exhaustive_pool_max_n", 10)
+        )
+
+        # Get max_tests from config (T_f for Bonferroni) - was hardcoded to 10!
+        t_f = pool_n if exhaustive else getattr(self.config, 'max_tests', 3)
         alpha_f = {}
         alpha_bar_f = {}
 
+        if debug:
+            print(f"[CERT DEBUG] pool_n={pool_n} exhaustive={exhaustive}")
+
         for facet in facets:
+            ft = facet.facet_type
+
             # Get facet-specific config if available
             if facet.facet_id in self.config.per_facet_configs:
                 facet_config = self.config.per_facet_configs[facet.facet_id]
                 facet_t_f = facet_config.max_tests
                 facet_alpha = facet_config.alpha
             else:
-                facet_t_f = t_f
-                # Bonferroni allocation: α_f = α_query / |F(q)|
-                facet_alpha = alpha_query / max(n_facets, 1)
+                # per_facet_alpha IS the per-facet budget (no division by |F|)
+                facet_alpha = per_facet_alpha
 
-            # ᾱ_f = α_f / T_f
+                # Use exhaustive T_f if applicable, otherwise facet-type T_f
+                if exhaustive:
+                    facet_t_f = pool_n
+                else:
+                    ft_str = ft.value if hasattr(ft, 'value') else str(ft)
+                    facet_t_f = tf_for(ft, ft_str)
+
+            # ᾱ_f = α_f / T_f (Bonferroni over tests within facet)
             facet_alpha_bar = facet_alpha / max(facet_t_f, 1)
+
+            if debug:
+                ft_str = facet.facet_type.value if hasattr(facet.facet_type, 'value') else str(facet.facet_type)
+                print(f"[CERT DEBUG] facet={ft_str} alpha_f={facet_alpha:.4f} T_f={facet_t_f} alpha_bar_f={facet_alpha_bar:.4f} exhaustive={exhaustive}")
 
             # Apply fallback if active
             if self.fallback_active:
@@ -246,7 +305,7 @@ class SafeCoverAlgorithm:
 
         return EpisodeKnobs(
             t_f=t_f,
-            alpha_query=alpha_query,
+            alpha_query=per_facet_alpha,  # Use resolved value, not the possibly-None parameter
             alpha_f=alpha_f,
             alpha_bar_f=alpha_bar_f,
             calibrator_version=getattr(self.calibrator, 'version', 'v1.0'),
@@ -254,6 +313,9 @@ class SafeCoverAlgorithm:
             retriever_version=self.retriever_version,
             shortlister_version=self.shortlister_version,
             pvalue_mode=self.pvalue_mode,
+            gate_version=self.gate_version,
+            normalize_version=self.normalize_version,
+            relation_keywords_hash=self.relation_keyword_hash,
         )
 
     def run(
@@ -262,7 +324,8 @@ class SafeCoverAlgorithm:
         passages: List[Passage],
         p_values: Dict[Tuple[str, str], float],
         scores: Optional[Dict[Tuple[str, str], float]] = None,
-        bins: Optional[Dict[Tuple[str, str], str]] = None
+        bins: Optional[Dict[Tuple[str, str], str]] = None,
+        uncoverable_facet_ids: Optional[Set[str]] = None,
     ) -> SafeCoverResult:
         """
         Run RC-MCFC algorithm with certificates.
@@ -275,24 +338,12 @@ class SafeCoverAlgorithm:
         5. Generate certificates for covered facets
         """
         # Step 1: Freeze episode knobs (Section 4.1)
-        knobs = self._freeze_episode_knobs(facets)
+        knobs = self._freeze_episode_knobs(facets, passages)
 
         # Step 2: Build fixed coverage sets (Section 4.2)
         coverage_sets, coverage_info = self._build_coverage_sets(
-            facets, passages, p_values, knobs, scores, bins
+            facets, passages, p_values, knobs, scores, bins, uncoverable_facet_ids
         )
-
-        # Check for uncoverable facets before greedy
-        uncoverable = self._find_uncoverable_facets(facets, coverage_sets)
-        if uncoverable:
-            return self._create_abstain_result(
-                facets=facets,
-                passages=[],
-                reason=AbstentionReason.NO_COVERING_PASSAGES,
-                uncovered=uncoverable,
-                knobs=knobs,
-                coverage_map={}
-            )
 
         # Step 3: Compute initial dual lower bound (Section 4.6)
         initial_dual_lb = self._compute_dual_lower_bound(
@@ -355,7 +406,8 @@ class SafeCoverAlgorithm:
         p_values: Dict[Tuple[str, str], float],
         knobs: EpisodeKnobs,
         scores: Optional[Dict[Tuple[str, str], float]] = None,
-        bins: Optional[Dict[Tuple[str, str], str]] = None
+        bins: Optional[Dict[Tuple[str, str], str]] = None,
+        uncoverable_facet_ids: Optional[Set[str]] = None,
     ) -> Tuple[Dict[str, Set[str]], Dict[Tuple[str, str], Dict[str, Any]]]:
         """
         Build fixed coverage sets using Bonferroni thresholds.
@@ -365,20 +417,43 @@ class SafeCoverAlgorithm:
         """
         coverage_sets = {p.pid: set() for p in passages}
         coverage_info = {}  # (pid, fid) -> {p_value, alpha_bar, bin, ...}
+        blocked_facets = set(uncoverable_facet_ids or [])
+
+        import os
+        debug = os.environ.get("TRIDENT_DEBUG_PVALUE", "0") == "1"
+
+        # EXHAUSTIVE PROBING: When pool is small, use all passages
+        pool_n = len(passages)
+        exhaustive = (
+            getattr(self.config, "exhaustive_pool", True)
+            and pool_n <= getattr(self.config, "exhaustive_pool_max_n", 10)
+        )
 
         for facet in facets:
+            ft = facet.facet_type
             alpha_bar = knobs.get_alpha_bar(facet.facet_id)
+
+            if facet.facet_id in blocked_facets:
+                continue
 
             # Get per-facet test limit
             if facet.facet_id in self.config.per_facet_configs:
                 max_tests = self.config.per_facet_configs[facet.facet_id].max_tests
+            elif exhaustive:
+                # Probe ALL passages to prevent STAGE-1 MISS
+                max_tests = pool_n
             else:
-                max_tests = knobs.t_f
+                # Use shared tf_for function (MUST match pipeline.py)
+                ft_str = ft.value if hasattr(ft, 'value') else str(ft)
+                max_tests = tf_for(ft, ft_str)
 
             # Shortlist passages for this facet (Section 4.4)
             shortlist = self._shortlist_for_facet(
                 passages, facet, p_values, scores, max_tests
             )
+
+            # Track best p-value for this facet (for debugging)
+            facet_p_values = []
 
             # Test coverage for each shortlisted passage
             for entry in shortlist:
@@ -386,6 +461,7 @@ class SafeCoverAlgorithm:
 
                 if key in p_values:
                     pv = p_values[key]
+                    facet_p_values.append(pv)
 
                     if pv <= alpha_bar:
                         coverage_sets[entry.passage.pid].add(facet.facet_id)
@@ -397,8 +473,15 @@ class SafeCoverAlgorithm:
                         'alpha_facet': knobs.alpha_f.get(facet.facet_id, knobs.alpha_query),
                         'bin': bins.get(key, 'default') if bins else entry.bin_key,
                         'score': scores.get(key, 0.0) if scores else entry.score,
-                        'facet_type': facet.facet_type.value if isinstance(facet.facet_type, FacetType) else str(facet.facet_type),
+                        'facet_type': ft.value if isinstance(ft, FacetType) else str(ft),
                     }
+
+            # Log best p-value per facet for debugging
+            if debug:
+                best_p = min(facet_p_values) if facet_p_values else 1.0
+                ft_str = ft.value if hasattr(ft, 'value') else str(ft)
+                passes = best_p <= alpha_bar
+                print(f"[COVER DEBUG] facet={ft_str} best_p={best_p:.4g} alpha_bar={alpha_bar:.4g} pass={passes}")
 
         return coverage_sets, coverage_info
 
@@ -478,7 +561,6 @@ class SafeCoverAlgorithm:
         Per Section 4.7: Emit certificates for facets as they enter Cov.
         """
         selected_passages = []
-        certificates = []
         coverage_map = {}
 
         uncovered = {f.facet_id for f in facets}
@@ -487,7 +569,6 @@ class SafeCoverAlgorithm:
         total_cost = 0
 
         while uncovered and remaining_passages and len(selected_passages) < max_units:
-            # Find most cost-effective passage
             best_passage = None
             best_score = (-float('inf'), float('inf'), float('inf'), "")
 
@@ -497,72 +578,78 @@ class SafeCoverAlgorithm:
                 if not newly_covered:
                     continue
 
-                # Check budget constraint
                 if budget_cap is not None and self.config.stop_on_budget:
                     if total_cost + passage.cost > budget_cap:
                         continue
 
-                # Cost-effectiveness ratio (Section 4.5)
                 effectiveness = len(newly_covered) / max(passage.cost, 1)
-
-                # Mean p-value for tie-breaking
                 mean_p = np.mean([
                     p_values.get((pid, fid), 1.0)
                     for fid in newly_covered
                 ])
-
-                # Score tuple: (effectiveness↑, cost↓, mean_p↓, pid for determinism)
                 score = (effectiveness, -passage.cost, -mean_p, pid)
 
                 if score > best_score:
                     best_score = score
                     best_passage = passage
 
-            # No more passages can cover uncovered facets
             if best_passage is None:
                 break
 
-            # Add best passage to selection
             selected_passages.append(best_passage)
             total_cost += best_passage.cost
-            newly_covered = coverage_sets[best_passage.pid] & uncovered
-            coverage_map[best_passage.pid] = list(newly_covered)
-
-            # Generate certificates for newly covered facets (Section 4.7)
-            for facet_id in newly_covered:
-                key = (best_passage.pid, facet_id)
-                info = coverage_info.get(key, {})
-
-                # Get bin size from calibrator if available
-                bin_key = info.get('bin', 'default')
-                bin_size = 0
-                if hasattr(self.calibrator, 'bins') and bin_key in self.calibrator.bins:
-                    bin_size = self.calibrator.bins[bin_key].n_negatives
-
-                certificate = CoverageCertificate(
-                    facet_id=facet_id,
-                    facet_type=info.get('facet_type', 'unknown'),
-                    passage_id=best_passage.pid,
-                    p_value=info.get('p_value', p_values.get(key, 0.0)),
-                    threshold=info.get('alpha_bar', knobs.get_alpha_bar(facet_id)),
-                    alpha_facet=info.get('alpha_facet', knobs.alpha_f.get(facet_id, knobs.alpha_query)),
-                    alpha_query=knobs.alpha_query,
-                    t_f=knobs.t_f,
-                    bin=bin_key,
-                    bin_size=bin_size,
-                    pvalue_mode=knobs.pvalue_mode,
-                    calibrator_version=knobs.calibrator_version,
-                    verifier_version=knobs.verifier_version,
-                    shortlister_version=knobs.shortlister_version,
-                    retriever_version=knobs.retriever_version,
-                )
-                certificates.append(certificate)
-
-            # Update uncovered set
-            uncovered -= newly_covered
-
-            # Remove selected passage from remaining
+            uncovered -= coverage_sets[best_passage.pid] & uncovered
             del remaining_passages[best_passage.pid]
+
+        certificates = []
+        winner_by_facet: Dict[str, str] = {}
+        winner_info: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+        for facet in facets:
+            best_pid = None
+            best_info = None
+
+            for passage in selected_passages:
+                if facet.facet_id not in coverage_sets.get(passage.pid, set()):
+                    continue
+                key = (passage.pid, facet.facet_id)
+                info = coverage_info.get(key, {})
+                if best_info is None or info.get('p_value', 1.0) < best_info.get('p_value', 1.0):
+                    best_pid = passage.pid
+                    best_info = info
+
+            if best_pid and best_info is not None:
+                winner_by_facet[facet.facet_id] = best_pid
+                winner_info[(best_pid, facet.facet_id)] = best_info
+
+        for (pid, fid), info in winner_info.items():
+            coverage_map.setdefault(pid, []).append(fid)
+
+            bin_key = info.get('bin', 'default')
+            bin_size = 0
+            if hasattr(self.calibrator, 'bins') and bin_key in self.calibrator.bins:
+                bin_size = self.calibrator.bins[bin_key].n_negatives
+
+            certificate = CoverageCertificate(
+                facet_id=fid,
+                facet_type=info.get('facet_type', 'unknown'),
+                passage_id=pid,
+                p_value=info.get('p_value', p_values.get((pid, fid), 0.0)),
+                threshold=info.get('alpha_bar', knobs.get_alpha_bar(fid)),
+                alpha_facet=info.get('alpha_facet', knobs.alpha_f.get(fid, knobs.alpha_query)),
+                alpha_query=knobs.alpha_query,
+                t_f=knobs.t_f,
+                bin=bin_key,
+                bin_size=bin_size,
+                pvalue_mode=knobs.pvalue_mode,
+                calibrator_version=knobs.calibrator_version,
+                verifier_version=knobs.verifier_version,
+                shortlister_version=knobs.shortlister_version,
+                retriever_version=knobs.retriever_version,
+            )
+            certificates.append(certificate)
+
+        uncovered = {f.facet_id for f in facets if f.facet_id not in winner_by_facet}
 
         return selected_passages, certificates, coverage_map, list(uncovered)
 
@@ -669,7 +756,7 @@ class SafeCoverAlgorithm:
         """
         # Check for uncovered facets
         if uncovered_facets and not selected:
-            return True, AbstentionReason.NO_COVERING_PASSAGES
+            return True, AbstentionReason.INFEASIBLE_MISSING_FACETS
 
         # Check dual lower bound
         if budget_cap is not None:
@@ -683,7 +770,7 @@ class SafeCoverAlgorithm:
             if self.config.abstain_on_infeasible:
                 # Determine the specific reason
                 if dual_lb == float('inf'):
-                    return True, AbstentionReason.NO_COVERING_PASSAGES
+                    return True, AbstentionReason.INFEASIBLE_MISSING_FACETS
                 else:
                     return True, AbstentionReason.BUDGET_EXHAUSTED
 

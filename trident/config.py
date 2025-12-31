@@ -36,6 +36,18 @@ class RetrievalConfig:
 
 
 @dataclass
+class FacetMinerConfig:
+    """Configuration for facet mining behavior."""
+
+    # Toggle LLM-driven facet planning (experimental)
+    use_llm_facet_plan: bool = False
+    # Public normalized relation schema JSON (optional)
+    relation_schema_json_path: str | None = None
+    # Option B: single-call LLM to choose relation from schema
+    use_llm_relation_plan: bool = False
+
+
+@dataclass
 class FacetConfig:
     """
     Per-facet statistical controls.
@@ -44,9 +56,13 @@ class FacetConfig:
     - alpha: Per-facet error budget (α_f)
     - max_tests: T_f, max passages tested per facet for Bonferroni
     - alpha_bar is computed as: α_f / T_f
+
+    NOTE: max_tests=3 is the new default (was 10). Lower T_f means less
+    Bonferroni penalty, making certification more feasible. With T_f=10
+    and |F|=3, threshold was ~0.001; with T_f=3, it's ~0.02.
     """
     alpha: float = 0.01  # α_f: Per-facet Type I error level
-    max_tests: int = 10  # T_f: Max passages tested per facet (Bonferroni budget)
+    max_tests: int = 3  # T_f: Max passages tested per facet (reduced from 10)
     prefilter_tests: int = 3  # Tests for spurious facet filtering
     fallback_scale: float = 0.5  # ρ: Conservative threshold multiplier on drift (0.5-0.9)
     weight: float = 1.0  # w_f: Facet weight for utility computation
@@ -169,22 +185,21 @@ class CalibrationConfig:
     - Typical grid: 6 × 3 × 3 = 54 bins
     """
     method: str = "conformal"  # "conformal", "isotonic", "platt", "beta"
-    version: str = "v1.0"
+    version: str = "v2.2"
 
     # Mondrian Bin Configuration (Section 3.3)
     use_mondrian: bool = True
-    n_min: int = 50  # Minimum per-bin negatives before merging
+    n_min: int = 25  # Minimum per-bin negatives before merging
 
-    # Bin Specification (6 × 3 × 3 = 54 bins)
+    # Bin Specification - use canonical types only
     facet_types: List[str] = field(default_factory=lambda: [
-        "ENTITY", "RELATION", "TEMPORAL", "NUMERIC", "BRIDGE_HOP1", "BRIDGE_HOP2"
+        "ENTITY", "RELATION", "TEMPORAL", "NUMERIC", "BRIDGE_HOP"
     ])
-    length_buckets: List[Tuple[int, int]] = field(default_factory=lambda: [
-        (0, 50), (50, 150), (150, 10000)  # short, medium, long
-    ])
-    retriever_score_buckets: List[Tuple[float, float]] = field(default_factory=lambda: [
-        (0.0, 0.33), (0.33, 0.67), (0.67, 1.0)  # low, medium, high
-    ])
+    # BOTH DISABLED by default - bucket conditioning can cause lookup misses
+    # if calibrator was trained without bucketing or with "all" bucket.
+    # Re-enable after confirming certificates work with unconditioned lookup.
+    length_buckets: Optional[List[Tuple[int, int]]] = None
+    retriever_score_buckets: Optional[List[Tuple[float, float]]] = None
 
     # Legacy fields
     facet_bins: Dict[str, List[float]] = field(default_factory=dict)
@@ -268,11 +283,14 @@ class BaselineConfig:
 class TridentConfig:
     """Complete TRIDENT system configuration."""
     mode: str = "safe_cover"  # safe_cover, pareto, both
+    use_llm_question_planner: bool = False
+    llm_planner_max_new_tokens: int = 160
     safe_cover: SafeCoverConfig = field(default_factory=SafeCoverConfig)
     pareto: ParetoConfig = field(default_factory=ParetoConfig)
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
+    facet_miner: FacetMinerConfig = field(default_factory=FacetMinerConfig)
     nli: NLIConfig = field(default_factory=NLIConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
@@ -286,6 +304,7 @@ class TridentConfig:
         calibration = CalibrationConfig(**config_dict.get("calibration", {}))
         llm = LLMConfig(**config_dict.get("llm", {}))
         retrieval = RetrievalConfig(**config_dict.get("retrieval", {}))
+        facet_miner = FacetMinerConfig(**config_dict.get("facet_miner", {}))
         nli = NLIConfig(**config_dict.get("nli", {}))
         evaluation = EvaluationConfig(**config_dict.get("evaluation", {}))
         telemetry = TelemetryConfig(**config_dict.get("telemetry", {}))
@@ -297,11 +316,14 @@ class TridentConfig:
 
         return cls(
             mode=config_dict.get("mode", "safe_cover"),
+            use_llm_question_planner=config_dict.get("use_llm_question_planner", False),
+            llm_planner_max_new_tokens=config_dict.get("llm_planner_max_new_tokens", 160),
             safe_cover=safe_cover,
             pareto=pareto,
             calibration=calibration,
             llm=llm,
             retrieval=retrieval,
+            facet_miner=facet_miner,
             nli=nli,
             evaluation=evaluation,
             telemetry=telemetry,

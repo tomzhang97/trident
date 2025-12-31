@@ -1,5 +1,4 @@
 """Multi-hop chain builder for extracting answers from certified passages.
-
 This module builds explicit reasoning chains from certified evidence,
 ensuring that the answer is grounded in the actual passages selected.
 """
@@ -75,8 +74,8 @@ def _normalize_text_unicode(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
 
     # Curly quotes -> straight
-    text = text.replace(""", '"').replace(""", '"')
-    text = text.replace("'", "'").replace("'", "'")
+    text = text.replace("“", '"').replace("”", '"')
+    text = text.replace("’", "'").replace("‘", "'")
 
     # Dashes -> hyphen
     text = text.replace("–", "-").replace("—", "-")
@@ -93,6 +92,162 @@ def _is_deny_title(title: str) -> bool:
         return False
     t_lower = title.lower()
     return any(deny in t_lower for deny in DENY_TITLES)
+
+
+# Relation triggers for different relation kinds (used as fallback when LLM router unavailable)
+REL_TRIGGERS = {
+    "DIRECTOR": ["directed by", "director", "film directed by", "directed", "filmmaker"],
+    "BORN": ["was born", "born in", "birthplace", "native of", "born on"],
+    "AWARD": ["won", "award", "nominated", "prize", "received", "honored"],
+    "CREATED": ["created", "founded", "wrote", "written by", "author", "composed"],
+    "LOCATION": ["located in", "capital of", "situated", "based in", "headquarters"],
+    "MARRIAGE": ["married", "spouse", "wife", "husband", "wed"],
+    "MOTHER": ["mother", "mom", "son of", "daughter of", "child of"],
+    "FATHER": ["father", "dad", "son of", "daughter of", "child of"],
+    "PARENT": ["parent", "mother", "father", "son of", "daughter of", "child of"],
+    "SPOUSE": ["married", "spouse", "wife", "husband", "wed", "partner"],
+    "NATIONALITY": ["nationality", "citizen", "national of", "from"],
+    "BIRTHPLACE": ["born in", "birthplace", "native of", "birth place"],
+}
+
+# All known relation types for LLM router
+KNOWN_RELATION_TYPES = [
+    "DIRECTOR", "PRODUCER", "CREATOR", "AUTHOR", "COMPOSER", "PERFORMER",
+    "MOTHER", "FATHER", "PARENT", "CHILD", "SPOUSE", "SIBLING",
+    "BIRTHPLACE", "BIRTHDATE", "NATIONALITY", "OCCUPATION",
+    "AWARD", "LOCATION", "CAPITAL", "HEADQUARTERS",
+    "OTHER"
+]
+
+
+def llm_route_relation(
+    llm,
+    question: str,
+    available_types: Optional[List[str]] = None
+) -> Tuple[str, float]:
+    """
+    Use LLM to determine the primary relation type being asked about.
+
+    This replaces keyword-based relation detection with semantic understanding.
+
+    Args:
+        llm: LLM interface with generate() method
+        question: The question to analyze
+        available_types: Optional list of relation types to choose from
+
+    Returns:
+        Tuple of (relation_type, confidence)
+    """
+    import json as json_module
+    import os
+
+    debug = os.environ.get("TRIDENT_DEBUG_ROUTER", "0") == "1"
+
+    if available_types is None:
+        available_types = KNOWN_RELATION_TYPES
+
+    types_str = ", ".join(available_types)
+
+    prompt = f"""Identify the relation type being asked about in this question.
+
+Question: {question}
+
+Available relation types: {types_str}
+
+Rules:
+1. Pick the SINGLE most specific relation type
+2. For "who is the mother of X" -> MOTHER (not PARENT)
+3. For "where was X born" -> BIRTHPLACE
+4. For "who directed X" -> DIRECTOR
+5. Return JSON: {{"relation": "TYPE", "confidence": 0.9}}
+
+JSON:"""
+
+    try:
+        raw = llm.generate(prompt, temperature=0.0, max_new_tokens=96)
+        raw_text = raw.text if hasattr(raw, 'text') else str(raw)
+    except Exception as e:
+        if debug:
+            print(f"[LLM-ROUTER] Error: {e}")
+        return keyword_route_relation(question), 0.5
+
+    if debug:
+        print(f"[LLM-ROUTER] Raw output: {raw_text[:100]}...")
+
+    # Parse JSON response
+    try:
+        out = json_module.loads(_extract_first_json_object(raw_text))
+    except Exception as e:
+        if debug:
+            print(f"[LLM-ROUTER] Parse error: {e}")
+        return keyword_route_relation(question), 0.5
+
+    relation = (out.get("relation") or "").upper().strip()
+    confidence = float(out.get("confidence", 0.7))
+
+    # Validate relation type
+    if relation not in available_types and relation != "OTHER":
+        # Try to find closest match
+        for t in available_types:
+            if t in relation or relation in t:
+                relation = t
+                break
+        else:
+            # Fallback to keyword-based
+            if debug:
+                print(f"[LLM-ROUTER] Unknown relation '{relation}', falling back to keywords")
+            return keyword_route_relation(question), 0.5
+
+    if debug:
+        print(f"[LLM-ROUTER] Result: {relation} (confidence={confidence})")
+
+    return relation, confidence
+
+
+def keyword_route_relation(question: str) -> str:
+    """
+    Fallback keyword-based relation routing.
+
+    Used when LLM router is unavailable or fails.
+    """
+    q_lower = question.lower()
+
+    # Check each relation type's triggers
+    for relation_type, triggers in REL_TRIGGERS.items():
+        for trigger in triggers:
+            if trigger in q_lower:
+                return relation_type
+
+    return "OTHER"
+
+
+def route_relation(
+    question: str,
+    llm: Optional[Any] = None,
+    use_llm: bool = True
+) -> Tuple[str, float, str]:
+    """
+    Route question to relation type using LLM (if available) or keywords.
+
+    Args:
+        question: The question to analyze
+        llm: Optional LLM interface
+        use_llm: Whether to use LLM routing (default True)
+
+    Returns:
+        Tuple of (relation_type, confidence, method)
+        method is "llm" or "keyword"
+    """
+    if use_llm and llm is not None:
+        try:
+            relation, confidence = llm_route_relation(llm, question)
+            return relation, confidence, "llm"
+        except Exception:
+            pass
+
+    # Fallback to keyword routing
+    relation = keyword_route_relation(question)
+    return relation, 0.5, "keyword"
 
 
 def _looks_like_person(name: str) -> bool:
@@ -146,880 +301,612 @@ def _looks_like_person(name: str) -> bool:
 
 
 @dataclass
-class QuestionType:
-    """Detected question type for constraining candidates."""
-    category: str  # "either_or", "who", "what", "where", "when", "how_many", "yes_no", "other"
-    expected_type: str  # "PERSON", "PLACE", "DATE", "NUMBER", "BINARY", "ENTITY", "OTHER"
-    options: Optional[List[str]] = None  # For either/or questions
+class ChainHop:
+    """A single hop in the reasoning chain."""
+    passage_id: str
+    passage_text: str
+    passage_title: Optional[str]
+    entities: Set[str]
+    relation_kinds: Set[str]
+    hop_number: int  # 1 for hop1, 2 for hop2
 
 
 @dataclass
-class ConstrainedSelectionResult:
-    """Result from constrained candidate selection."""
-    answer: str
-    candidate_index: int
-    confidence: float
-    passage_id: str
-    candidates: List[str]
-    support_scores: List[float]
-    reason: str  # OK, NO_PASSAGES, NO_VERIFIED_SPAN, etc.
-    tokens_used: int = 0
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
+class ReasoningChain:
+    """A complete multi-hop reasoning chain."""
+    hop1: ChainHop
+    bridge_entity: Optional[str]
+    hop2: ChainHop
+    score: float
+
+    def get_ordered_passages(self) -> List[Dict[str, Any]]:
+        """Return passages in hop order for prompt building."""
+        return [
+            {
+                'pid': self.hop1.passage_id,
+                'text': self.hop1.passage_text,
+                'title': self.hop1.passage_title,
+                'hop': 1,
+                'bridge_entity': self.bridge_entity,
+            },
+            {
+                'pid': self.hop2.passage_id,
+                'text': self.hop2.passage_text,
+                'title': self.hop2.passage_title,
+                'hop': 2,
+                'bridge_entity': self.bridge_entity,
+            }
+        ]
 
 
-def _find_exact_substring(haystack: str, needle: str) -> Optional[Tuple[int, int]]:
-    """Find exact substring match (case-sensitive first, then case-insensitive)."""
-    if not needle or not haystack:
+def extract_entities(text: str, doc_title: Optional[str] = None) -> Set[str]:
+    """Extract entity mentions from text.
+
+    Uses Title Case spans and optionally includes document title.
+    """
+    ents = set(ENTITY_RE.findall(text))
+    if doc_title:
+        ents.add(doc_title)
+        # Also add normalized version
+        ents.add(doc_title.strip())
+    return ents
+
+
+def extract_relation_kinds(text: str) -> Set[str]:
+    """Identify which relation kinds are mentioned in the passage."""
+    t = text.lower()
+    hits = set()
+    for kind, triggers in REL_TRIGGERS.items():
+        if any(trigger in t for trigger in triggers):
+            hits.add(kind)
+    return hits
+
+
+def get_question_entities(question: str, facets: List[Dict[str, Any]]) -> Set[str]:
+    """Extract entities from question and facets.
+
+    Uses ENTITY facets if available, otherwise falls back to regex.
+    """
+    q_ents = set()
+
+    # Extract from ENTITY facets
+    for facet in facets:
+        if facet.get('facet_type') == 'ENTITY':
+            template = facet.get('template', {})
+            mention = template.get('mention', '')
+            if mention:
+                q_ents.add(mention)
+
+    # Also extract from RELATION facets
+    for facet in facets:
+        if facet.get('facet_type') == 'RELATION':
+            template = facet.get('template', {})
+            subj = template.get('subject', '')
+            obj = template.get('object', '')
+            # Clean WH-words
+            if subj and subj.lower() not in {'who', 'what', 'where', 'when', 'which'}:
+                q_ents.add(subj)
+            if obj:
+                # Extract entity from object like "director of film Polish-Russian War"
+                obj_ents = extract_entities(obj)
+                q_ents.update(obj_ents)
+
+    # Fallback: regex on question
+    q_ents.update(extract_entities(question))
+
+    return q_ents
+
+
+def get_required_relation_kinds(facets: List[Dict[str, Any]]) -> Set[str]:
+    """Get required relation kinds from facets."""
+    required = set()
+
+    for facet in facets:
+        if facet.get('facet_type') == 'RELATION':
+            template = facet.get('template', {})
+            # Check predicate and full facet text
+            predicate = template.get('predicate', '').lower()
+            facet_text = f"{template.get('subject', '')} {template.get('object', '')} {predicate}".lower()
+
+            for kind, triggers in REL_TRIGGERS.items():
+                if any(t in facet_text for t in triggers):
+                    required.add(kind)
+
+    return required
+
+
+def build_chain_from_certified(
+    certified_passages: List[Dict[str, Any]],
+    question: str,
+    facets: List[Dict[str, Any]],
+    certificates: Optional[List[Dict[str, Any]]] = None
+) -> Optional[ReasoningChain]:
+    """Build a multi-hop reasoning chain from certified passages.
+
+    Args:
+        certified_passages: Passages that have been certified by Safe-Cover
+        question: The original question
+        facets: List of facet dicts
+        certificates: Optional certificate info for filtering
+
+    Returns:
+        ReasoningChain if a valid chain is found, None otherwise
+    """
+    if len(certified_passages) < 2:
+        # Need at least 2 passages for a 2-hop chain
+        # If only 1 passage, return it as a single-hop chain (no bridge required)
+        if len(certified_passages) == 1:
+            p = certified_passages[0]
+            ents = extract_entities(p.get('text', ''), p.get('title'))
+            kinds = extract_relation_kinds(p.get('text', ''))
+            hop = ChainHop(
+                passage_id=p.get('pid', ''),
+                passage_text=p.get('text', ''),
+                passage_title=p.get('title'),
+                entities=ents,
+                relation_kinds=kinds,
+                hop_number=1
+            )
+            # Single passage chain - explicit None for bridge
+            return ReasoningChain(hop1=hop, bridge_entity=None, hop2=hop, score=0.5)
         return None
 
-    # Try case-sensitive first
-    i = haystack.find(needle)
-    if i >= 0:
-        return (i, i + len(needle))
+    # Get question entities and required relation kinds
+    q_ents = get_question_entities(question, facets)
+    required_kinds = get_required_relation_kinds(facets)
 
-    # Try case-insensitive
-    i = haystack.lower().find(needle.lower())
-    if i >= 0:
-        return (i, i + len(needle))
+    # Build hop info for each passage
+    hops = []
+    for p in certified_passages:
+        text = p.get('text', '')
+        title = p.get('title')
+        ents = extract_entities(text, title)
+        kinds = extract_relation_kinds(text)
+        hops.append(ChainHop(
+            passage_id=p.get('pid', ''),
+            passage_text=text,
+            passage_title=title,
+            entities=ents,
+            relation_kinds=kinds,
+            hop_number=0  # Will be set later
+        ))
 
-    # Normalized unicode fallback (handles dash/quote variants)
-    hay_norm = _normalize_text_unicode(haystack)
-    needle_norm = _normalize_text_unicode(needle)
-    if needle_norm:
-        j = hay_norm.find(needle_norm)
-        if j >= 0:
-            return (j, j + len(needle_norm))
+    # Index entities to passages
+    ent2hop = defaultdict(list)
+    for i, hop in enumerate(hops):
+        for ent in hop.entities:
+            ent2hop[ent].append(i)
 
-    return None
+    # Find bridge entities (appear in >= 2 passages)
+    bridges = [ent for ent, idxs in ent2hop.items() if len(set(idxs)) >= 2]
 
+    # Score candidate chains
+    best_chain = None
+    best_score = -1
 
-def _extract_first_json_object(text: str) -> str:
-    """Extract the first JSON object from text, ignoring trailing chatter."""
-    stripped = text.strip()
-    start = stripped.find("{")
-    if start == -1:
-        raise ValueError("No JSON object found in text")
+    for bridge in bridges:
+        passage_indices = list(set(ent2hop[bridge]))
 
-    # reject code fences before the JSON
-    if "```" in stripped[:start]:
-        raise ValueError("Code fences found before JSON")
-
-    depth = 0
-    end_idx = -1
-    for idx in range(start, len(stripped)):
-        ch = stripped[idx]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                end_idx = idx
-                break
-
-    if depth != 0 or end_idx == -1:
-        raise ValueError("Unbalanced JSON braces in text")
-
-    return stripped[start:end_idx + 1]
-
-
-def strict_json_call(llm, prompt: str, max_new_tokens: int = 160, temperature: float = 0.0):
-    """Run an LLM call that must return exactly one JSON object.
-
-    This helper centralizes the JSON-only contract so downstream callers do not
-    attempt their own permissive parsing. It extracts the first balanced JSON
-    object and ignores any trailing text, while still rejecting code fences or
-    unbalanced braces to avoid ambiguous parses.
-
-    Returns:
-        tuple(parsed_json, raw_output)
-    """
-
-    guard = "Return ONLY JSON. No extra keys. No commentary."
-    wrapped_prompt = f"{guard}\n{prompt.strip()}\n{guard}"
-    raw = llm.generate(
-        wrapped_prompt,
-        temperature=temperature,
-        max_new_tokens=max_new_tokens,
-    )
-    raw_text = raw.text if hasattr(raw, "text") else str(raw)
-    parsed = json.loads(_extract_first_json_object(raw_text))
-    return parsed, raw
-
-
-def detect_question_type(question: str) -> QuestionType:
-    """
-    Detect question type to constrain candidate extraction.
-
-    Returns:
-        QuestionType with category, expected_type, and options (for either/or)
-    """
-    q = question.strip()
-    q_lower = q.lower()
-
-    # Either/or questions: "X or Y?" pattern
-    # Match patterns like "was it A or B", "is this X or Y", "A or B?"
-    either_or_match = re.search(
-        r'\b(is|was|are|were|did|does|do|can|could|would|should|will)\s+.{1,50}?\s+(\w+(?:\s+\w+){0,3})\s+or\s+(\w+(?:\s+\w+){0,3})\s*\??$',
-        q_lower
-    )
-    if either_or_match:
-        opt1 = either_or_match.group(2).strip()
-        opt2 = either_or_match.group(3).strip("?. ")
-        return QuestionType(
-            category="either_or",
-            expected_type="BINARY_CHOICE",
-            options=[opt1, opt2]
-        )
-
-    # Simple "A or B?" at end
-    simple_or = re.search(r'(\w+(?:\s+\w+){0,4})\s+or\s+(\w+(?:\s+\w+){0,4})\s*\??$', q_lower)
-    if simple_or:
-        opt1 = simple_or.group(1).strip()
-        opt2 = simple_or.group(2).strip("?. ")
-        # Make sure these look like answer options (not "this or that")
-        if opt1.lower() not in {'this', 'that', 'it', 'he', 'she', 'they'}:
-            return QuestionType(
-                category="either_or",
-                expected_type="BINARY_CHOICE",
-                options=[opt1, opt2]
-            )
-
-    # Yes/No questions
-    if q_lower.startswith(('is ', 'are ', 'was ', 'were ', 'do ', 'does ', 'did ',
-                           'can ', 'could ', 'should ', 'would ', 'has ', 'have ', 'had ')):
-        return QuestionType(category="yes_no", expected_type="BINARY", options=["yes", "no"])
-
-    # Who questions -> PERSON
-    if q_lower.startswith('who ') or ' who ' in q_lower[:30]:
-        return QuestionType(category="who", expected_type="PERSON")
-
-    # Where questions -> PLACE
-    if q_lower.startswith('where ') or ' where ' in q_lower[:30]:
-        return QuestionType(category="where", expected_type="PLACE")
-
-    # When questions -> DATE
-    if q_lower.startswith('when ') or ' when ' in q_lower[:30]:
-        return QuestionType(category="when", expected_type="DATE")
-
-    # How many/much -> NUMBER
-    if q_lower.startswith('how many ') or q_lower.startswith('how much '):
-        return QuestionType(category="how_many", expected_type="NUMBER")
-
-    # What questions -> ENTITY (generic)
-    if q_lower.startswith('what ') or ' what ' in q_lower[:30]:
-        # Check for more specific "what [type]" patterns
-        what_person = re.match(r'what\s+(person|actor|actress|director|author|singer|player)', q_lower)
-        if what_person:
-            return QuestionType(category="what", expected_type="PERSON")
-        what_place = re.match(r'what\s+(city|country|place|location|state|region)', q_lower)
-        if what_place:
-            return QuestionType(category="what", expected_type="PLACE")
-        what_date = re.match(r'what\s+(year|date|time|day|month)', q_lower)
-        if what_date:
-            return QuestionType(category="what", expected_type="DATE")
-        return QuestionType(category="what", expected_type="ENTITY")
-
-    # Default: other
-    return QuestionType(category="other", expected_type="OTHER")
-
-
-def _normalize_for_dedup(s: str) -> str:
-    """
-    Normalize string for substring deduplication.
-
-    Handles punctuation variations so "D'Arcy Coulson" and "Darcy Coulson" compare correctly.
-    """
-    # Replace apostrophes, quotes, hyphens, periods with space
-    s = re.sub(r"[\s''\.\-]+", " ", s.strip().lower())
-    # Collapse multiple spaces
-    s = re.sub(r"\s+", " ", s)
-    return s.strip()
-
-
-def extract_candidates(
-    winner_passages: List[Dict[str, Any]],
-    question_type: QuestionType,
-    max_candidates: int = 10
-) -> List[Tuple[str, float, str]]:
-    """
-    Extract candidate answers from winner passages based on question type.
-
-    Returns:
-        List of (candidate_text, support_score, source_pid) tuples,
-        sorted by support_score descending.
-    """
-    candidates: Dict[str, Tuple[float, str]] = {}  # text -> (score, pid)
-
-    # For either/or questions, use the provided options
-    if question_type.category == "either_or" and question_type.options:
-        for opt in question_type.options:
-            # Find which passage(s) support this option
-            support = 0.0
-            source_pid = ""
-            for p in winner_passages:
-                text_lower = (p.get("text") or "").lower()
-                if opt.lower() in text_lower:
-                    support += 1.0
-                    if not source_pid:
-                        source_pid = p.get("pid", "")
-            if source_pid:
-                candidates[opt] = (support, source_pid)
-        # Return sorted by support
-        return sorted(
-            [(text, score, pid) for text, (score, pid) in candidates.items() if pid],
-            key=lambda x: x[1],
-            reverse=True
-        )[:max_candidates]
-
-    # For yes/no questions
-    if question_type.category == "yes_no":
-        # Count evidence for yes vs no
-        yes_support = 0.0
-        no_support = 0.0
-        yes_pid = ""
-        no_pid = ""
-
-        for p in winner_passages:
-            text = (p.get("text") or "").lower()
-            pid = p.get("pid", "")
-            # Look for affirmative/negative language
-            if any(w in text for w in ['is a', 'was a', 'are the', 'were the', 'did ', 'does ', 'has ', 'had ']):
-                yes_support += 0.5
-                if not yes_pid:
-                    yes_pid = pid
-            if any(w in text for w in ['not ', "n't ", 'never ', 'no ', 'none ']):
-                no_support += 0.5
-                if not no_pid:
-                    no_pid = pid
-
-        if not yes_pid and winner_passages:
-            yes_pid = winner_passages[0].get("pid", "")
-        if not no_pid and winner_passages:
-            no_pid = winner_passages[0].get("pid", "")
-
-        return [
-            ("yes", yes_support, yes_pid),
-            ("no", no_support, no_pid)
-        ]
-
-    # For PERSON questions
-    if question_type.expected_type == "PERSON":
-        # Punctuation-aware pattern for apostrophes, initials, etc.
-        person_pattern = re.compile(
-            r"\b([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+(?:de|van|von|la|el|al|bin|ibn)?[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,5})\b"
-        )
-        for p in winner_passages:
-            text = p.get("text") or ""
-            pid = p.get("pid", "")
-            for match in person_pattern.finditer(text):
-                name = match.group(1).strip()
-                # Validate: looks like a person name
-                if _looks_like_person(name):
-                    # Compute support: count occurrences across all passages
-                    support = sum(
-                        1 for pp in winner_passages
-                        if name.lower() in (pp.get("text") or "").lower()
-                    )
-                    # MULTI-TOKEN BONUS: Prefer longer spans (more specific)
-                    token_count = len(name.split())
-                    length_bonus = 0.5 * (token_count - 1)
-                    adjusted_support = support + length_bonus
-                    if name not in candidates or adjusted_support > candidates[name][0]:
-                        candidates[name] = (adjusted_support, pid)
-
-        # SUBSTRING DEDUPLICATION: Remove single-token candidates that are
-        # substrings of higher-scoring multi-token candidates
-        if len(candidates) > 1:
-            to_remove = set()
-            sorted_cands = sorted(candidates.items(), key=lambda x: x[1][0], reverse=True)
-            for i, (name1, _) in enumerate(sorted_cands):
-                name1_norm = _normalize_for_dedup(name1)
-                for name2, _ in sorted_cands[i+1:]:
-                    name2_norm = _normalize_for_dedup(name2)
-                    # If shorter name is a substring of longer name, mark for removal
-                    if len(name2_norm) < len(name1_norm) and name2_norm in name1_norm:
-                        to_remove.add(name2)
-            for name in to_remove:
-                if name in candidates:
-                    del candidates[name]
-
-    # For PLACE questions
-    elif question_type.expected_type == "PLACE":
-        place_pattern = re.compile(
-            r'\b([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})\b'
-        )
-        for p in winner_passages:
-            text = p.get("text") or ""
-            pid = p.get("pid", "")
-            for match in place_pattern.finditer(text):
-                place = match.group(1).strip()
-                # Filter out obvious non-places
-                if len(place) >= 2 and place.lower() not in {
-                    'the', 'a', 'an', 'he', 'she', 'they', 'it', 'his', 'her',
-                    'their', 'was', 'were', 'is', 'are', 'has', 'had', 'have'
-                }:
-                    support = sum(
-                        1 for pp in winner_passages
-                        if place.lower() in (pp.get("text") or "").lower()
-                    )
-                    if place not in candidates or support > candidates[place][0]:
-                        candidates[place] = (support, pid)
-
-    # For DATE questions
-    elif question_type.expected_type == "DATE":
-        date_patterns = [
-            re.compile(r'\b(1[0-9]{3}|20[0-2][0-9])\b'),  # Year only
-            re.compile(r'\b([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})\b'),  # Month Day, Year
-            re.compile(r'\b(\d{1,2}\s+[A-Z][a-z]+\s+\d{4})\b'),  # Day Month Year
-            re.compile(r'\b([A-Z][a-z]+\s+\d{4})\b'),  # Month Year
-        ]
-        for p in winner_passages:
-            text = p.get("text") or ""
-            pid = p.get("pid", "")
-            for pattern in date_patterns:
-                for match in pattern.finditer(text):
-                    date_str = match.group(1).strip()
-                    support = sum(
-                        1 for pp in winner_passages
-                        if date_str in (pp.get("text") or "")
-                    )
-                    if date_str not in candidates or support > candidates[date_str][0]:
-                        candidates[date_str] = (support, pid)
-
-    # For NUMBER questions
-    elif question_type.expected_type == "NUMBER":
-        number_pattern = re.compile(r'\b(\d+(?:,\d{3})*(?:\.\d+)?)\b')
-        for p in winner_passages:
-            text = p.get("text") or ""
-            pid = p.get("pid", "")
-            for match in number_pattern.finditer(text):
-                num = match.group(1).strip()
-                support = sum(
-                    1 for pp in winner_passages
-                    if num in (pp.get("text") or "")
-                )
-                if num not in candidates or support > candidates[num][0]:
-                    candidates[num] = (support, pid)
-
-    # For ENTITY or OTHER: extract all capitalized spans
-    else:
-        entity_pattern = re.compile(
-            r"\b([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,6})\b"
-        )
-        stop_words = {'The', 'A', 'An', 'He', 'She', 'They', 'It', 'His', 'Her',
-                      'Their', 'Was', 'Were', 'Is', 'Are', 'Has', 'Had', 'Have',
-                      'This', 'That', 'These', 'Those', 'In', 'On', 'At', 'By'}
-        for p in winner_passages:
-            text = p.get("text") or ""
-            pid = p.get("pid", "")
-            for match in entity_pattern.finditer(text):
-                entity = match.group(1).strip()
-                if entity in stop_words:
+        # Try all pairs of passages containing the bridge
+        for i in passage_indices:
+            for j in passage_indices:
+                if i == j:
                     continue
-                if len(entity) >= 2:
-                    support = sum(
-                        1 for pp in winner_passages
-                        if entity.lower() in (pp.get("text") or "").lower()
+
+                hop1 = hops[i]
+                hop2 = hops[j]
+
+                # Score this chain
+                score = 0.0
+
+                # Hop1 should connect to question entities
+                if hop1.entities & q_ents:
+                    score += 2.0
+
+                # Hop2 should have required relation kind
+                if required_kinds and (hop2.relation_kinds & required_kinds):
+                    score += 2.0
+                elif not required_kinds:
+                    score += 1.0  # No specific requirement
+
+                # Bonus for distinct passages
+                score += 1.0
+
+                # Bonus if bridge entity is in the question
+                if bridge in q_ents:
+                    score += 0.5
+
+                if score > best_score:
+                    best_score = score
+                    hop1_copy = ChainHop(
+                        passage_id=hop1.passage_id,
+                        passage_text=hop1.passage_text,
+                        passage_title=hop1.passage_title,
+                        entities=hop1.entities,
+                        relation_kinds=hop1.relation_kinds,
+                        hop_number=1
                     )
-                    token_count = len(entity.split())
-                    length_bonus = 0.5 * (token_count - 1)
-                    adjusted_support = support + length_bonus
-                    if entity not in candidates or adjusted_support > candidates[entity][0]:
-                        candidates[entity] = (adjusted_support, pid)
+                    hop2_copy = ChainHop(
+                        passage_id=hop2.passage_id,
+                        passage_text=hop2.passage_text,
+                        passage_title=hop2.passage_title,
+                        entities=hop2.entities,
+                        relation_kinds=hop2.relation_kinds,
+                        hop_number=2
+                    )
+                    best_chain = ReasoningChain(
+                        hop1=hop1_copy,
+                        bridge_entity=bridge,
+                        hop2=hop2_copy,
+                        score=best_score
+                    )
 
-        # SUBSTRING DEDUPLICATION
-        if len(candidates) > 1:
-            to_remove = set()
-            sorted_cands = sorted(candidates.items(), key=lambda x: x[1][0], reverse=True)
-            for i, (name1, _) in enumerate(sorted_cands):
-                name1_norm = _normalize_for_dedup(name1)
-                for name2, _ in sorted_cands[i+1:]:
-                    name2_norm = _normalize_for_dedup(name2)
-                    if len(name2_norm) < len(name1_norm) and name2_norm in name1_norm:
-                        to_remove.add(name2)
-            for name in to_remove:
-                if name in candidates:
-                    del candidates[name]
+    # If no bridge found, fall back to ordering by question entity overlap
+    if best_chain is None and len(hops) >= 2:
+        # Order by overlap with question entities (descending)
+        hops_sorted = sorted(
+            enumerate(hops),
+            key=lambda x: len(x[1].entities & q_ents),
+            reverse=True
+        )
+        idx1, hop1 = hops_sorted[0]
+        idx2, hop2 = hops_sorted[1] if len(hops_sorted) > 1 else hops_sorted[0]
 
-    # Sort by support score and return top candidates
-    sorted_candidates = sorted(
-        [
-            (text, score, pid)
-            for text, (score, pid) in candidates.items()
-            if pid
-        ],
-        key=lambda x: x[1],
-        reverse=True
-    )
+        # Find a common entity as bridge
+        common = hop1.entities & hop2.entities
+        # Use None if no common bridge exists to avoid prompt hallucinations
+        bridge = next(iter(common), None)
 
-    # Check for low-quality candidates and return empty to trigger fallback
-    if question_type.expected_type in ("PERSON", "ENTITY"):
-        if sorted_candidates:
-            max_token_count = max(len(c[0].split()) for c in sorted_candidates)
-            if max_token_count < 2:
-                import os
-                debug = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
-                if debug:
-                    print(f"[EXTRACT] Low-quality candidates: all single-token, returning empty")
-                return []
+        hop1_copy = ChainHop(
+            passage_id=hop1.passage_id,
+            passage_text=hop1.passage_text,
+            passage_title=hop1.passage_title,
+            entities=hop1.entities,
+            relation_kinds=hop1.relation_kinds,
+            hop_number=1
+        )
+        hop2_copy = ChainHop(
+            passage_id=hop2.passage_id,
+            passage_text=hop2.passage_text,
+            passage_title=hop2.passage_title,
+            entities=hop2.entities,
+            relation_kinds=hop2.relation_kinds,
+            hop_number=2
+        )
+        best_chain = ReasoningChain(
+            hop1=hop1_copy,
+            bridge_entity=bridge,
+            hop2=hop2_copy,
+            score=0.0
+        )
 
-    return sorted_candidates[:max_candidates]
+    return best_chain
 
 
-def compute_support_score(
-    candidate: str,
-    passages: List[Dict[str, Any]]
-) -> float:
+def extract_grounded_answer(
+    llm_answer: str,
+    hop2_text: str,
+    min_overlap_ratio: float = 0.5
+) -> Tuple[str, bool]:
+    """Extract answer that is grounded in hop2 passage.
+
+    Args:
+        llm_answer: Raw answer from LLM
+        hop2_text: Text of the hop2 passage
+        min_overlap_ratio: Minimum token overlap for grounding
+
+    Returns:
+        Tuple of (grounded_answer, is_grounded)
     """
-    Compute deterministic support score for a candidate.
+    if not llm_answer or not hop2_text:
+        return llm_answer, False
 
-    Score = count of passages mentioning candidate, weighted by passage rank.
+    # Helper for normalization
+    def norm(s):
+        s = s.lower().strip()
+        # Remove punctuation
+        s = s.translate(str.maketrans("", "", string.punctuation))
+        # Normalize whitespace
+        s = " ".join(s.split())
+        return s
+
+    # 1. Exact substring check (original)
+    answer_lower = llm_answer.lower().strip()
+    hop2_lower = hop2_text.lower()
+
+    if answer_lower in hop2_lower:
+        return llm_answer.strip(), True
+
+    # 2. Normalized substring check (punctuation agnostic)
+    norm_answer = norm(llm_answer)
+    norm_hop2 = norm(hop2_text)
+
+    if norm_answer and norm_answer in norm_hop2:
+        return llm_answer.strip(), True
+
+    # 3. Sliding window token overlap (fallback)
+    # Try to find the best matching substring
+    answer_tokens = answer_lower.split()
+    if not answer_tokens:
+        return llm_answer, False
+
+    # Sliding window to find best match
+    hop2_tokens = hop2_lower.split()
+    best_match = None
+    best_overlap = 0
+
+    for window_size in range(len(answer_tokens), 0, -1):
+        for start in range(len(hop2_tokens) - window_size + 1):
+            window = hop2_tokens[start:start + window_size]
+            overlap = len(set(answer_tokens) & set(window))
+            overlap_ratio = overlap / len(answer_tokens)
+
+            if overlap_ratio >= min_overlap_ratio and overlap > best_overlap:
+                best_overlap = overlap
+                best_match = ' '.join(hop2_text.split()[start:start + window_size])
+
+    if best_match:
+        return best_match, True
+
+    # Fall back to original answer with grounding flag
+    return llm_answer.strip(), False
+
+
+def build_single_hop_prompt(question: str, chain: ReasoningChain) -> str:
+    """Build a simplified prompt for single-passage questions."""
+    prompt_parts = []
+    prompt_parts.append("Answer the following question using ONLY the provided evidence passage.")
+    prompt_parts.append("")
+    prompt_parts.append(f"Question: {question}")
+    prompt_parts.append("")
+    prompt_parts.append("=== Evidence ===")
+    if chain.hop1.passage_title:
+        prompt_parts.append(f"[{chain.hop1.passage_title}]")
+    prompt_parts.append(chain.hop1.passage_text)
+    prompt_parts.append("")
+    prompt_parts.append("Instructions:")
+    prompt_parts.append("1. The answer must be found in the Evidence passage")
+    prompt_parts.append("2. Extract the exact answer span")
+    prompt_parts.append("3. If the answer cannot be found, respond with: I cannot answer based on the given context.")
+    prompt_parts.append("")
+    prompt_parts.append("Answer:")
+    return "\n".join(prompt_parts)
+
+
+def build_chain_prompt(
+    question: str,
+    chain: ReasoningChain,
+    facets: Optional[List[Dict[str, Any]]] = None
+) -> str:
+    """Build a prompt that uses the reasoning chain structure.
+
+    This prompt explicitly shows the hop structure and asks the LLM
+    to extract an answer that is grounded in the evidence.
     """
-    if not candidate or not passages:
-        return 0.0
+    # Use simplified prompt for single-hop cases (Hop1 == Hop2)
+    if chain.hop1.passage_id == chain.hop2.passage_id:
+        return build_single_hop_prompt(question, chain)
 
-    candidate_lower = candidate.lower()
-    score = 0.0
+    prompt_parts = []
+    prompt_parts.append("Answer the following question using ONLY the provided evidence passages.")
+    prompt_parts.append("The passages are ordered as a reasoning chain: Hop 1 introduces context, Hop 2 contains the answer.")
+    prompt_parts.append("")
+    prompt_parts.append(f"Question: {question}")
+    prompt_parts.append("")
 
-    for i, p in enumerate(passages):
-        text_lower = (p.get("text") or "").lower()
-        title_lower = (p.get("title") or "").lower()
+    # Only include Bridge Entity if it exists (multi-hop with overlap)
+    if chain.bridge_entity:
+        prompt_parts.append(f"Bridge Entity: {chain.bridge_entity}")
+        prompt_parts.append("")
+        
+    prompt_parts.append("=== HOP 1 (Context) ===")
+    if chain.hop1.passage_title:
+        prompt_parts.append(f"[{chain.hop1.passage_title}]")
+    prompt_parts.append(chain.hop1.passage_text)
+    prompt_parts.append("")
+    prompt_parts.append("=== HOP 2 (Answer Source) ===")
+    if chain.hop2.passage_title:
+        prompt_parts.append(f"[{chain.hop2.passage_title}]")
+    prompt_parts.append(chain.hop2.passage_text)
+    prompt_parts.append("")
+    prompt_parts.append("Instructions:")
+    prompt_parts.append("1. If the answer is stated verbatim in the evidence, extract the EXACT span (copy it exactly).")
+    prompt_parts.append("2. Return ONLY the answer - no explanation, no extra words.")
+    prompt_parts.append("3. Preserve accents and special characters exactly as written.")
+    prompt_parts.append("4. If the answer is not stated in the evidence, respond exactly: I cannot answer based on the given context.")
+    prompt_parts.append("")
+    prompt_parts.append("Answer:")
 
-        # Check if candidate appears
-        if candidate_lower in text_lower or candidate_lower in title_lower:
-            # Weight by rank (earlier passages = higher weight)
-            weight = 1.0 / (1 + i * 0.1)
-            score += weight
-
-    return score
+    return "\n".join(prompt_parts)
 
 
-def get_answer_facet_passages(
+def get_winning_passages_from_certificates(
+    certificates: List[Dict[str, Any]],
+    passages: List[Dict[str, Any]],
+    facets: List[Dict[str, Any]]
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
+    """
+    Map facet_id -> winning passage, plus facet_type -> [winning passages].
+
+    CRITICAL: Maps by facet_id to preserve all facets (a query can have multiple
+    RELATION or ENTITY facets). Also provides a grouped view by facet_type.
+
+    Returns:
+        Tuple of:
+        - facet_id_map: Dict[facet_id -> {'passage', 'facet', 'p_value', 'passage_id', 'facet_id'}]
+        - facet_type_map: Dict[facet_type -> List[winning info dicts]] (stable order by p_value)
+    """
+    if not certificates:
+        return {}, {}
+
+    # Build passage lookup by pid
+    pid_to_passage = {p.get('pid', ''): p for p in passages}
+
+    # Build facet lookup by facet_id
+    fid_to_facet = {f.get('facet_id', ''): f for f in facets}
+
+    # Primary map: facet_id -> winning info
+    facet_id_map: Dict[str, Dict[str, Any]] = {}
+
+    for cert in certificates:
+        fid = cert.get('facet_id', '')
+        pid = cert.get('passage_id', '')
+        p_val = cert.get('p_value', 1.0)
+
+        facet = fid_to_facet.get(fid, {})
+        passage = pid_to_passage.get(pid, {})
+
+        if not facet or not passage:
+            continue
+
+        ftype = facet.get('facet_type', '')
+
+        # Only keep best certificate per facet_id (in case of duplicates)
+        if fid not in facet_id_map or p_val < facet_id_map[fid]['p_value']:
+            facet_id_map[fid] = {
+                'passage': passage,
+                'facet': facet,
+                'p_value': p_val,
+                'passage_id': pid,
+                'facet_id': fid,
+                'facet_type': ftype
+            }
+
+    # Derived map: facet_type -> [winning info dicts] (sorted by p_value)
+    facet_type_map: Dict[str, List[Dict[str, Any]]] = {}
+    for info in facet_id_map.values():
+        ftype = info['facet_type']
+        if ftype not in facet_type_map:
+            facet_type_map[ftype] = []
+        facet_type_map[ftype].append(info)
+
+    # Sort each list by p_value (best first)
+    for ftype in facet_type_map:
+        facet_type_map[ftype].sort(key=lambda x: x['p_value'])
+
+    return facet_id_map, facet_type_map
+
+
+def build_certificate_aware_prompt(
     question: str,
     certificates: List[Dict[str, Any]],
-    all_passages: List[Dict[str, Any]],
-    facets: Optional[List[Dict[str, Any]]] = None,
-    max_answer_facets: int = 3,
-    max_answer_passages: int = 5,
-) -> Tuple[List[Dict[str, Any]], List[str], str]:
+    passages: List[Dict[str, Any]],
+    facets: List[Dict[str, Any]]
+) -> Tuple[str, Optional[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     """
-    Select passages corresponding to the *answer-determining* facets.
+    Build a prompt using the certificate-winning passages.
 
-    Certified-only, fail-closed properties:
-    - Only passages whose PID appears in certificates are eligible.
-    - For each facet, only the best (lowest p-value) certificate is used to fetch evidence.
+    CRITICAL: Uses the passages that actually certified each facet,
+    not arbitrary chain hops based on entity overlap. Includes ALL
+    winning passages (not just one per facet type).
+
+    Returns:
+        Tuple of:
+        - prompt_string: The constructed prompt
+        - relation_winning_info: The best RELATION facet winner (for typed extraction)
+        - facet_id_map: Complete facet_id -> winning info map (for debugging/validation)
     """
-    import os
-
-    debug = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
-
-    if not certificates:
-        return [], [], "NO_CERTIFICATES"
-
-    # Certified-only PID scope
-    certified_pids = _cert_pid(certificates)
-
-    # Build passage lookup from certified-only pool
-    pid_to_passage = {
-        p.get("pid"): p
-        for p in all_passages
-        if p.get("pid") in certified_pids
-    }
-
-    # Best cert per facet (lowest p-value)
-    facet_to_certs: Dict[str, List[Dict[str, Any]]] = {}
-    for cert in certificates:
-        fid = cert.get("facet_id") or ""
-        pid = cert.get("passage_id") or cert.get("pid") or ""
-        if fid and pid and pid in pid_to_passage:
-            facet_to_certs.setdefault(fid, []).append(cert)
-
-    if not facet_to_certs:
-        return [], [], "NO_CERT_MAPPABLE_PASSAGES"
-
-    best_cert_by_fid: Dict[str, Dict[str, Any]] = {}
-    for fid, certs in facet_to_certs.items():
-        best_cert_by_fid[fid] = min(certs, key=lambda c: float(c.get("p_value", 1.0)))
-
-    certified_facet_ids = list(best_cert_by_fid.keys())
-
-    # Choose answer facets deterministically
-    selected_facet_ids = [
-        fid for fid, _ in sorted(
-            ((fid, cert.get("p_value", 1.0)) for fid, cert in best_cert_by_fid.items()),
-            key=lambda x: float(x[1])
-        )
-    ][:max_answer_facets]
-    selection_reason = "TOP_PVALUE"
-
-    if not selected_facet_ids:
-        selected_facet_ids = certified_facet_ids[:max_answer_facets]
-        selection_reason = f"HEURISTIC:{','.join(selected_facet_ids)}"
-
-    # Fetch winning passages from best certs (strict provenance)
-    target_certs = [best_cert_by_fid[fid] for fid in selected_facet_ids if fid in best_cert_by_fid]
-    target_certs.sort(key=lambda c: float(c.get("p_value", 1.0)))
-
-    answer_passages: List[Dict[str, Any]] = []
-    seen = set()
-    for cert in target_certs:
-        pid = cert.get("passage_id") or cert.get("pid") or ""
-        if not pid or pid in seen:
-            continue
-        if pid in pid_to_passage:
-            seen.add(pid)
-            answer_passages.append(pid_to_passage[pid])
-        if len(answer_passages) >= max_answer_passages:
-            break
-
-    if debug:
-        apids = [p.get("pid") for p in answer_passages]
-        print(f"[ANSWER-FACET] reason={selection_reason} facets={selected_facet_ids} pids={apids}")
-
-    return answer_passages, selected_facet_ids, selection_reason
-
-
-def constrained_span_select(
-    llm,
-    question: str,
-    winner_passages: List[Dict[str, Any]],
-    max_candidates: int = 10,
-    max_chars_per_passage: int = 600,
-    certificates: Optional[List[Dict[str, Any]]] = None,
-) -> ConstrainedSelectionResult:
-    """
-    FIX A: Frozen span extraction with robust JSON parsing.
-
-    Primary: Extract answer as exact substring with offsets (certified-only).
-    Secondary: Candidate-index selection (legacy) but still certified-only if certificates provided.
-
-    Fail-closed: returns empty answer if nothing can be machine-verified.
-    """
-    import os
-
-    debug = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
-
-    if not winner_passages:
-        return ConstrainedSelectionResult(
-            answer="",
-            candidate_index=-1,
-            confidence=0.0,
-            passage_id="",
-            candidates=[],
-            support_scores=[],
-            reason="NO_PASSAGES"
-        )
-
-    if certificates:
-        certified_pids = _cert_pid(certificates)
-        winner_passages = [p for p in winner_passages if p.get("pid") in certified_pids]
-        if not winner_passages:
-            return ConstrainedSelectionResult(
-                answer="",
-                candidate_index=-1,
-                confidence=0.0,
-                passage_id="",
-                candidates=[],
-                support_scores=[],
-                reason="NO_CERTIFIED_PASSAGES"
-            )
-
-    # Frozen span extraction prompt
-    snippet_map: Dict[str, str] = {}
-    evidence_parts = []
-    for p in winner_passages:
-        pid = p.get("pid")
-        if not pid:
-            continue
-        snip = (p.get("text") or "")[:max_chars_per_passage]
-        snippet_map[pid] = snip
-        evidence_parts.append(f"[{pid}] {snip}")
-
-    evidence_text = "\n\n".join(evidence_parts)
-
-    span_prompt = f"""Extract the answer as an EXACT substring from the evidence.
-
-Question: {question}
-
-Evidence:
-{evidence_text}
-
-Rules:
-1. The answer_span must be copied VERBATIM from the evidence.
-2. Provide start_char and end_char offsets relative to the snippet shown for that pid.
-3. Return JSON in ONE of these formats:
-   Format 1 (preferred): {{ "pid": "...", "start_char": 0, "end_char": 0, "answer_span": "...", "confidence": 0.0 }}
-   Format 2 (alternate): {{ "pid": "...", "answer": "...", "confidence": 0.0 }}
-4. If not found, return {{ "answer_span": null }}
-
-JSON:"""
-
-    def _norm_ws(s: str) -> str:
-        return " ".join((s or "").split())
-
-    try:
-        resp = llm.generate(span_prompt, temperature=0.0)
-        raw = resp.text if hasattr(resp, "text") else str(resp)
-
-        # FIX A: Parse only the first JSON object (ignore trailing chatter / code fences)
-        try:
-            data = json.loads(_extract_first_json_object(raw))
-        except Exception as parse_error:
-            if debug:
-                print(f"[FROZEN-SPAN] JSON parse failed: {parse_error}")
-                print(f"[FROZEN-SPAN] Raw output: {raw[:200]}")
-            return ConstrainedSelectionResult(
-                answer="",
-                candidate_index=-1,
-                confidence=0.0,
-                passage_id="",
-                candidates=[],
-                support_scores=[],
-                reason="PARSE_ERROR"
-            )
-
-        # FIX A: Accept either schema
-        # Schema 1: {pid, start_char, end_char, answer_span, confidence}
-        # Schema 2: {pid, answer, confidence}
-
-        span = data.get("answer_span") or data.get("answer")
-        pid = data.get("pid") or ""
-
-        # Normalize pid: "[context_4]" → "context_4"
-        if pid.startswith("[") and pid.endswith("]"):
-            pid = pid[1:-1]
-
-        start_char = data.get("start_char")
-        end_char = data.get("end_char")
-        conf = float(data.get("confidence", 0.0))
-
-        if span and pid in snippet_map:
-            snippet = snippet_map[pid]
-
-            # Try to verify with offsets if provided
-            match = False
-            if isinstance(start_char, int) and isinstance(end_char, int):
-                if 0 <= start_char < end_char <= len(snippet):
-                    sliced = snippet[start_char:end_char]
-                    if _norm_ws(sliced) == _norm_ws(span):
-                        match = True
-
-            # Deterministic repair: exact find in original snippet if offsets wrong
-            if not match:
-                idx = snippet.find(span)
-                if idx != -1:
-                    start_char, end_char = idx, idx + len(span)
-                    if _norm_ws(snippet[start_char:end_char]) == _norm_ws(span):
-                        match = True
-
-            if match:
-                # Type sanity checks (lightweight)
-                q_type = detect_question_type(question)
-                ok = True
-                if getattr(q_type, "expected_type", None) == "NUMBER":
-                    ok = bool(re.search(r"\d", span)) and len(span) <= 50
-                elif getattr(q_type, "expected_type", None) == "DATE":
-                    ok = bool(re.search(r"\d{4}", span) or re.search(r"\d", span))
-                elif getattr(q_type, "category", None) == "yes_no":
-                    ok = _norm_ws(span).lower() in {"yes", "no"}
-
-                if ok:
-                    if debug:
-                        print(f"[FROZEN-SPAN] pid={pid} span='{span}' [{start_char}:{end_char}] conf={conf:.2f}")
-                    return ConstrainedSelectionResult(
-                        answer=span,
-                        candidate_index=0,
-                        confidence=conf,
-                        passage_id=pid,
-                        candidates=[span],
-                        support_scores=[1.0],
-                        reason="OK_FROZEN_SPAN"
-                    )
-    except Exception as ex:
-        if debug:
-            print(f"[FROZEN-SPAN] Failed: {ex}")
-
-    return ConstrainedSelectionResult(
-        answer="",
-        candidate_index=-1,
-        confidence=0.0,
-        passage_id="",
-        candidates=[],
-        support_scores=[],
-        reason="NO_VERIFIED_SPAN"
+    facet_id_map, facet_type_map = get_winning_passages_from_certificates(
+        certificates, passages, facets
     )
 
+    if not facet_id_map:
+        # Fallback: no certificates, can't build certificate-aware prompt
+        return "", None, {}
 
-def bind_entity_via_css(
-    llm,
-    inner_question: str,
-    hop1_passages: List[Dict[str, Any]],
-    max_chars: int = 600,
-    min_confidence: float = 0.55,
-    certificates: Optional[List[Dict[str, Any]]] = None,
-) -> Optional[str]:
-    """
-    FIX A: Canonical entity binder with robust JSON parsing.
+    # Get ALL RELATION-winning passages (sorted by p_value, best first)
+    relation_winners = facet_type_map.get('RELATION', [])
+    entity_winners = facet_type_map.get('ENTITY', [])
 
-    Accepts either:
-    - {index, confidence}
-    - {pid, answer, confidence}
+    # Also check for BRIDGE_HOP types
+    bridge_winners = []
+    for ftype in ['BRIDGE_HOP', 'BRIDGE_HOP1', 'BRIDGE_HOP2']:
+        if ftype in facet_type_map:
+            bridge_winners.extend(facet_type_map[ftype])
 
-    Certified-only option:
-    - If certificates provided, restrict hop1_passages to certified PIDs.
-    Fail-closed:
-    - If parsing fails, index out of bounds, or confidence < threshold => None.
-    """
-    import os
+    # The best RELATION winner (lowest p-value) is the primary answer source
+    best_relation_info = relation_winners[0] if relation_winners else None
 
-    debug = os.environ.get("TRIDENT_DEBUG_CSS", "0") == "1"
+    prompt_parts = []
+    prompt_parts.append("Answer the following question using ONLY the provided certified evidence.")
+    prompt_parts.append("These passages have been verified to contain the information needed to answer.")
+    prompt_parts.append("")
+    prompt_parts.append(f"Question: {question}")
+    prompt_parts.append("")
 
-    if not hop1_passages:
-        return None
+    # Include ALL winning passages (deduplicated by pid)
+    seen_pids = set()
+    passage_num = 1
 
-    if certificates:
-        certified_pids = _cert_pid(certificates)
-        hop1_passages = [p for p in hop1_passages if p.get("pid") in certified_pids]
-        if not hop1_passages:
-            return None
+    # ENTITY passages first (context)
+    for info in entity_winners:
+        p = info['passage']
+        pid = p.get('pid', '')
+        if pid and pid not in seen_pids:
+            seen_pids.add(pid)
+            title = p.get('title', '')
+            text = p.get('text', '')
+            prompt_parts.append(f"=== Evidence {passage_num} (Context) ===")
+            if title:
+                prompt_parts.append(f"[{title}]")
+            prompt_parts.append(text)
+            prompt_parts.append("")
+            passage_num += 1
 
-    # Candidate enumeration
-    q_type = detect_question_type(inner_question)
-    raw_candidates = extract_candidates(hop1_passages, q_type, max_candidates=20)
+    # BRIDGE passages (if different from ENTITY)
+    for info in bridge_winners:
+        p = info['passage']
+        pid = p.get('pid', '')
+        if pid and pid not in seen_pids:
+            seen_pids.add(pid)
+            title = p.get('title', '')
+            text = p.get('text', '')
+            prompt_parts.append(f"=== Evidence {passage_num} (Bridge) ===")
+            if title:
+                prompt_parts.append(f"[{title}]")
+            prompt_parts.append(text)
+            prompt_parts.append("")
+            passage_num += 1
 
-    # Build normalized -> (display_text, source_pid)
-    cand_map: Dict[str, Tuple[str, str]] = {}
-    for text, score, pid in raw_candidates:
-        if not text or not pid:
-            continue
-        toks = text.split()
-        ok = False
-        if len(toks) >= 2:
-            ok = True
-        elif len(toks) == 1:
-            t = toks[0]
-            if len(t) >= 4 and t.lower() not in {"this", "that", "film", "movie", "city"}:
-                ok = True
-        if not ok:
-            continue
-        norm = _normalize_text_unicode(text)
-        if norm and norm not in cand_map:
-            cand_map[norm] = (text, pid)
+    # RELATION passages (answer sources - MOST IMPORTANT!)
+    for i, info in enumerate(relation_winners):
+        p = info['passage']
+        pid = p.get('pid', '')
+        if pid and pid not in seen_pids:
+            seen_pids.add(pid)
+            title = p.get('title', '')
+            text = p.get('text', '')
+            label = "Answer Source" if i == 0 else f"Answer Source {i + 1}"
+            prompt_parts.append(f"=== Evidence {passage_num} ({label}) ===")
+            if title:
+                prompt_parts.append(f"[{title}]")
+            prompt_parts.append(text)
+            prompt_parts.append("")
+            passage_num += 1
+        elif passage_num == 1 and i == 0:
+            # RELATION is the only passage - still show it
+            title = p.get('title', '')
+            text = p.get('text', '')
+            prompt_parts.append("=== Certified Evidence ===")
+            if title:
+                prompt_parts.append(f"[{title}]")
+            prompt_parts.append(text)
+            prompt_parts.append("")
+            passage_num += 1
 
-    cand_items = list(cand_map.values())
-    cand_items.sort(key=lambda x: (-(len(x[0].split())), x[0].lower(), x[1]))
-    candidate_list = cand_items[:8]
+    # If no passages were added, bail
+    if passage_num == 1:
+        return "", None, facet_id_map
 
-    if not candidate_list:
-        if debug:
-            print("[CSS-BIND] No candidates after filtering.")
-        return None
+    prompt_parts.append("Instructions:")
+    prompt_parts.append("1. If the answer is stated verbatim in the evidence, extract the EXACT span (copy it exactly).")
+    prompt_parts.append("2. Return ONLY the answer - no explanation, no extra words.")
+    prompt_parts.append("3. Preserve accents and special characters exactly as written.")
+    prompt_parts.append("4. If the answer is not stated in the evidence, respond exactly: I cannot answer based on the given context.")
+    prompt_parts.append("")
+    prompt_parts.append("Answer:")
 
-    # Build evidence snippets
-    relevant_pids = {pid for _, pid in candidate_list}
-    snippet_map: Dict[str, str] = {}
-    evidence_parts = []
-    for p in hop1_passages:
-        pid = p.get("pid")
-        if pid in relevant_pids:
-            snip = (p.get("text") or "")[:max_chars]
-            snippet_map[pid] = snip
-            evidence_parts.append(f"[{pid}] {snip}")
-
-    candidates_formatted = "\n".join([f"{i}: {c[0]}" for i, c in enumerate(candidate_list)])
-    evidence_text = "\n".join(evidence_parts)
-
-    prompt = f"""Identify the entity that answers the question.
-Select ONE candidate from the list by index.
-
-Question: {inner_question}
-
-Candidates:
-{candidates_formatted}
-
-Evidence:
-{evidence_text}
-
-Rules:
-1. Return JSON in ONE of these formats:
-   Format 1 (preferred): {{ "index": int, "confidence": float }}
-   Format 2 (alternate): {{ "pid": "...", "answer": "...", "confidence": float }}
-2. If none match, return {{ "index": -1 }}
-
-JSON:"""
-
-    try:
-        resp = llm.generate(prompt, temperature=0.0)
-        raw = resp.text if hasattr(resp, "text") else str(resp)
-
-        # FIX A: Robust JSON extraction
-        def _first_json_obj(text: str) -> Optional[Dict[str, Any]]:
-            """Parse the *first* JSON object from model output."""
-            cleaned = re.sub(r"```[\s\S]*?```", " ", text).strip()
-            s0 = cleaned.find("{")
-            if s0 == -1:
-                return None
-            try:
-                dec = json.JSONDecoder()
-                obj, _ = dec.raw_decode(cleaned[s0:])
-                return obj if isinstance(obj, dict) else None
-            except Exception:
-                m = re.search(r"\{[\s\S]*?\}", cleaned)
-                if not m:
-                    return None
-                try:
-                    obj = json.loads(m.group(0))
-                    return obj if isinstance(obj, dict) else None
-                except Exception:
-                    return None
-
-        data = _first_json_obj(raw)
-        if not data:
-            if debug:
-                print(f"[CSS-BIND] Failed: could not parse JSON from: {raw[:120]!r}")
-            return None
-
-        idx = int(data.get("index", -1)) if "index" in data and str(data.get("index")).strip() != "" else -1
-        conf = float(data.get("confidence", 0.0) or 0.0)
-
-        # FIX A: Accept alternate schema: {"pid": "...", "answer": "..."}
-        if idx < 0:
-            pid_raw = str(data.get("pid", "") or "").strip().strip("[]")
-            ans_raw = str(data.get("answer", "") or "").strip()
-
-            # FIX A: Map pid or answer back to a candidate index
-            if pid_raw:
-                for j, (_txt, _pid) in enumerate(candidate_list):
-                    if (_pid or "") == pid_raw:
-                        idx = j
-                        break
-            if idx < 0 and ans_raw:
-                norm_ans = _normalize_text_unicode(ans_raw)
-                for j, (_txt, _pid) in enumerate(candidate_list):
-                    if _normalize_text_unicode(_txt) == norm_ans:
-                        idx = j
-                        break
-
-        if conf < min_confidence:
-            return None
-        if not (0 <= idx < len(candidate_list)):
-            return None
-
-        chosen_text, source_pid = candidate_list[idx]
-        snippet = snippet_map.get(source_pid, "")
-
-        # Provenance check (normalization-consistent containment)
-        if _normalize_text_unicode(chosen_text) in _normalize_text_unicode(snippet):
-            if debug:
-                print(f"[CSS-BIND] idx={idx} conf={conf:.2f} -> {chosen_text} (pid={source_pid})")
-            return chosen_text
-
-    except Exception as ex:
-        if debug:
-            print(f"[CSS-BIND] Failed: {ex}")
-
-    return None
+    return "\n".join(prompt_parts), best_relation_info, facet_id_map
 
 
 def bind_entity_from_hop1_winner(
@@ -1031,9 +918,6 @@ def bind_entity_from_hop1_winner(
 
     This is NOT answer extraction - it's binding a variable for hop-2.
     Much easier because we're extracting a named entity from one known relation.
-
-    NOTE: This function is superseded by bind_entity_via_css() which is more general
-    and relation-agnostic. Kept for backwards compatibility.
 
     Args:
         relation_type: The inner relation type (DIRECTOR, AUTHOR, etc.)
@@ -1128,6 +1012,1382 @@ def bind_entity_from_hop1_winner(
     return None
 
 
+def typed_extract_from_winning_passage(
+    question: str,
+    relation_info: Dict[str, Any]
+) -> Optional[str]:
+    """
+    Facet-ID–aware typed extraction from the RELATION-winning passage.
+
+    CRITICAL FIXES:
+    1. Uses facet template (subject/object/predicate) to constrain extraction
+    2. Checks semantic presence before extracting (abort if answer type absent)
+    3. Anchors on known entity spans from the facet template
+    4. Returns None to allow controlled abstention rather than garbage
+
+    Args:
+        question: The original question
+        relation_info: Dict with 'passage', 'facet', 'p_value', etc.
+
+    Returns:
+        Extracted answer string, or None if extraction not possible
+    """
+    if not relation_info:
+        return None
+
+    passage = relation_info.get('passage', {})
+    facet = relation_info.get('facet', {})
+    text = passage.get('text', '')
+
+    if not text:
+        return None
+
+    # Get facet template - this is the key to facet-ID awareness
+    template = facet.get('template', {})
+    subject = template.get('subject', '').strip()
+    obj = template.get('object', '').strip()
+    predicate = template.get('predicate', '').strip()
+
+    # Build context for relation kind detection
+    facet_text = f"{subject} {obj} {predicate}".lower()
+
+    # Determine relation kind from facet template
+    relation_kind = None
+    for kind, triggers in REL_TRIGGERS.items():
+        if any(t in facet_text for t in triggers):
+            relation_kind = kind
+            break
+
+    # Fallback: infer from question (less reliable)
+    if not relation_kind:
+        q = question.lower()
+        if "director" in q or "directed" in q:
+            relation_kind = "DIRECTOR"
+        elif "born" in q or "birth" in q:
+            relation_kind = "BORN"
+        elif "award" in q or "won" in q or "prize" in q:
+            relation_kind = "AWARD"
+        elif "located" in q or "capital" in q:
+            relation_kind = "LOCATION"
+        elif "married" in q or "spouse" in q or "wife" in q or "husband" in q:
+            relation_kind = "MARRIAGE"
+
+    if not relation_kind:
+        return None
+
+    t = text
+    t_lower = t.lower()
+    q = question.lower()
+
+    # ==== SEMANTIC PRESENCE CHECKS ====
+    # Abort extraction if the answer type is not present in the passage
+
+    if relation_kind == "DIRECTOR":
+        # Must have "directed" or "director" to extract a director name
+        if "directed" not in t_lower and "director" not in t_lower:
+            return None
+
+        # Extract PERSON name after "directed by" (most reliable pattern)
+        m = re.search(r"(?i)\bdirected\s+by\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$|\s+(?:is|was|and|who))", t)
+        if m:
+            name = m.group(1).strip()
+            # Validate: should be 2-4 words, not start with common non-name words
+            words = name.split()
+            if 1 <= len(words) <= 4 and words[0].lower() not in {'the', 'a', 'an', 'this', 'that', 'film', 'movie', 'polish', 'australian'}:
+                return name
+
+        # Pattern: "Name directed the film" or "Name, who directed"
+        m = re.search(r"(?i)([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})\s+(?:,\s*who\s+)?directed\b", t)
+        if m:
+            name = m.group(1).strip()
+            words = name.split()
+            if 1 <= len(words) <= 4 and words[0].lower() not in {'the', 'a', 'an', 'this', 'that', 'film', 'movie'}:
+                return name
+
+        # Pattern: "director Name" (less common but valid)
+        m = re.search(r"(?i)\bdirector\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$)", t)
+        if m:
+            name = m.group(1).strip()
+            words = name.split()
+            if 1 <= len(words) <= 4 and words[0].lower() not in {'of', 'the', 'a', 'an', 'is', 'was'}:
+                return name
+
+    elif relation_kind == "BORN":
+        if "where" in q or "place" in q:
+            # Birthplace - must have "born" to extract
+            if "born" not in t_lower:
+                return None
+            # Pattern: "born in Location"
+            m = re.search(r"(?i)\bborn\s+in\s+([A-Z][a-zA-ZÀ-ÿ\s\-]+?)(?:\s*[,\.\(\)]|on\s|$)", t)
+            if m:
+                loc = m.group(1).strip().rstrip(",")
+                # Validate: should be 1-4 words, look like a place
+                if 1 <= len(loc.split()) <= 4:
+                    return loc
+        else:
+            # Birth date - must have "born" and a year
+            if "born" not in t_lower or not re.search(r'\d{4}', t):
+                return None
+            # Pattern: "born on/in Month Day, Year" or "born on Day Month Year"
+            m = re.search(r"(?i)\bborn\s+(?:on\s+)?([A-Z]?[a-zA-Z]+\s+\d{1,2},?\s+\d{4})", t)
+            if m:
+                return m.group(1).strip()
+            m = re.search(r"(?i)\bborn\s+(?:on\s+)?(\d{1,2}\s+[A-Z]?[a-zA-Z]+\s+\d{4})", t)
+            if m:
+                return m.group(1).strip()
+
+    elif relation_kind == "AWARD":
+        # CRITICAL: Must have award-related words to extract an award
+        award_indicators = ['award', 'prize', 'medal', 'oscar', 'emmy', 'grammy', 'trophy', 'won', 'awarded', 'received']
+        if not any(ind in t_lower for ind in award_indicators):
+            return None  # Don't extract - passage doesn't contain award info
+
+        # Pattern: "won the X Award/Prize"
+        m = re.search(r"(?i)\bwon\s+(?:the\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-]+?(?:Award|Prize|Medal|Oscar|Emmy|Grammy|Trophy))", t)
+        if m:
+            return m.group(1).strip()
+        # Pattern: "received the X Award"
+        m = re.search(r"(?i)\breceived\s+(?:the\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-]+?(?:Award|Prize|Medal))", t)
+        if m:
+            return m.group(1).strip()
+        # Pattern: "awarded the X"
+        m = re.search(r"(?i)\bawarded\s+(?:the\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-]+?(?:Award|Prize|Medal))", t)
+        if m:
+            return m.group(1).strip()
+
+    elif relation_kind == "LOCATION":
+        # Must have location-related words
+        loc_indicators = ['located', 'capital', 'headquarters', 'based', 'situated']
+        if not any(ind in t_lower for ind in loc_indicators):
+            return None
+
+        m = re.search(r"(?i)\blocated\s+in\s+([A-Z][a-zA-ZÀ-ÿ\s\-\,]+?)(?:\s*[,\.\(\)]|$)", t)
+        if m:
+            return m.group(1).strip().rstrip(",")
+        m = re.search(r"(?i)\bcapital\s+(?:city\s+)?(?:is|of)\s+([A-Z][a-zA-ZÀ-ÿ\s\-]+?)(?:\s*[,\.\(\)]|$)", t)
+        if m:
+            return m.group(1).strip()
+        m = re.search(r"(?i)\bheadquarters\s+(?:is|are)\s+(?:in\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-\,]+?)(?:\s*[,\.\(\)]|$)", t)
+        if m:
+            return m.group(1).strip().rstrip(",")
+
+    elif relation_kind == "MARRIAGE":
+        # Must have marriage-related words
+        if "married" not in t_lower and "spouse" not in t_lower and "wife" not in t_lower and "husband" not in t_lower:
+            return None
+
+        m = re.search(r"(?i)\bmarried\s+(?:to\s+)?([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|in\s|$)", t)
+        if m:
+            return m.group(1).strip()
+        m = re.search(r"(?i)\bspouse\s+(?:is\s+)?([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$)", t)
+        if m:
+            return m.group(1).strip()
+
+    # No valid extraction possible - return None for controlled abstention
+    return None
+
+
+def regex_extract_answer_from_hop2(
+    question: str,
+    facets: List[Dict[str, Any]],
+    hop2_text: str
+) -> Optional[str]:
+    """
+    DEPRECATED: Use typed_extract_from_winning_passage instead.
+
+    This function extracts from arbitrary hop2_text, which may NOT be
+    the passage that certified the RELATION facet. It can produce
+    garbage like "of film and TV" from unrelated passages.
+
+    Kept for backwards compatibility but should be replaced.
+    """
+    if not hop2_text:
+        return None
+
+    t = hop2_text
+    q = question.lower()
+
+    # Check if we have RELATION facets
+    has_relation = any(f.get("facet_type") == "RELATION" for f in facets)
+
+    if has_relation:
+        # DIRECTOR: "directed by X" or "X directed"
+        if "director" in q or "directed" in q or "direct" in q:
+            # Pattern: "directed by Name"
+            m = re.search(r"(?i)\bdirected\s+by\s+([A-Z][a-zA-ZÀ-ÿ\s\-\.]+?)(?:\s*[,\.\(\)]|$)", t)
+            if m:
+                return m.group(1).strip()
+            # Pattern: "director Name"
+            m = re.search(r"(?i)\bdirector\s+([A-Z][a-zA-ZÀ-ÿ\s\-\.]+?)(?:\s*[,\.\(\)]|$)", t)
+            if m:
+                return m.group(1).strip()
+            # Pattern: "film by Name"
+            m = re.search(r"(?i)\bfilm\s+by\s+([A-Z][a-zA-ZÀ-ÿ\s\-\.]+?)(?:\s*[,\.\(\)]|$)", t)
+            if m:
+                return m.group(1).strip()
+
+        # BORN: "born in X" or "was born on X"
+        if "born" in q or "birth" in q:
+            # Birthplace
+            if "where" in q or "place" in q:
+                m = re.search(r"(?i)\bborn\s+in\s+([A-Z][a-zA-ZÀ-ÿ\s\-\,]+?)(?:\s*[,\.\(\)]|on\s|$)", t)
+                if m:
+                    return m.group(1).strip().rstrip(",")
+            # Birth date
+            else:
+                m = re.search(r"(?i)\bborn\s+(?:on\s+)?([A-Z]?[a-zA-Z0-9\s\,]+\d{4})", t)
+                if m:
+                    return m.group(1).strip()
+
+        # AWARD: "won X" or "received X award"
+        if "award" in q or "won" in q or "prize" in q:
+            m = re.search(r"(?i)\bwon\s+(?:the\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-]+?(?:Award|Prize|Medal|Oscar|Emmy|Grammy))", t)
+            if m:
+                return m.group(1).strip()
+            m = re.search(r"(?i)\breceived\s+(?:the\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-]+?(?:Award|Prize|Medal))", t)
+            if m:
+                return m.group(1).strip()
+
+        # LOCATION: "located in X" or "capital of X is Y"
+        if "located" in q or "capital" in q or "headquarters" in q:
+            m = re.search(r"(?i)\blocated\s+in\s+([A-Z][a-zA-ZÀ-ÿ\s\-\,]+?)(?:\s*[,\.\(\)]|$)", t)
+            if m:
+                return m.group(1).strip().rstrip(",")
+            m = re.search(r"(?i)\bcapital\s+(?:is|of)\s+([A-Z][a-zA-ZÀ-ÿ\s\-]+?)(?:\s*[,\.\(\)]|$)", t)
+            if m:
+                return m.group(1).strip()
+            m = re.search(r"(?i)\bheadquarters\s+(?:is|are)\s+(?:in\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-\,]+?)(?:\s*[,\.\(\)]|$)", t)
+            if m:
+                return m.group(1).strip().rstrip(",")
+
+        # MARRIAGE: "married X" or "spouse X"
+        if "married" in q or "spouse" in q or "wife" in q or "husband" in q:
+            m = re.search(r"(?i)\bmarried\s+(?:to\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-\.]+?)(?:\s*[,\.\(\)]|in\s|$)", t)
+            if m:
+                return m.group(1).strip()
+
+    return None
+
+
+# ==============================================================================
+# CERTIFIED SPAN SELECTION (CSS)
+# ==============================================================================
+# General, relation-agnostic answer extraction that requires exact substring
+# grounding in certified evidence. No per-relation regex patterns.
+# ==============================================================================
+
+@dataclass
+class CSSResult:
+    """Result from Certified Span Selection."""
+    abstain: bool
+    answer: str
+    passage_id: str
+    reason: str  # OK, NO_SPAN, SPAN_NOT_VERBATIM, PID_NOT_IN_WINNERS, PARSE_ERROR
+    confidence: float = 0.0
+    tokens_used: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
+def _find_exact_substring(haystack: str, needle: str) -> Optional[Tuple[int, int]]:
+    """Find exact substring match (case-sensitive first, then case-insensitive)."""
+    if not needle or not haystack:
+        return None
+
+    # Try case-sensitive first
+    i = haystack.find(needle)
+    if i >= 0:
+        return (i, i + len(needle))
+
+    # Try case-insensitive
+    i = haystack.lower().find(needle.lower())
+    if i >= 0:
+        return (i, i + len(needle))
+
+    # Normalized unicode fallback (handles dash/quote variants)
+    hay_norm = _normalize_text_unicode(haystack)
+    needle_norm = _normalize_text_unicode(needle)
+    if needle_norm:
+        j = hay_norm.find(needle_norm)
+        if j >= 0:
+            return (j, j + len(needle_norm))
+
+    return None
+
+
+def _extract_first_json_object(text: str) -> str:
+    stripped = text.strip()
+    start = stripped.find("{")
+    if start == -1:
+        raise ValueError("No JSON object found in text")
+
+    # reject code fences before the JSON
+    if "```" in stripped[:start]:
+        raise ValueError("Code fences found before JSON")
+
+    depth = 0
+    end_idx = -1
+    for idx in range(start, len(stripped)):
+        ch = stripped[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end_idx = idx
+                break
+
+    if depth != 0 or end_idx == -1:
+        raise ValueError("Unbalanced JSON braces in text")
+
+    return stripped[start:end_idx + 1]
+
+
+def strict_json_call(llm, prompt: str, max_new_tokens: int = 160, temperature: float = 0.0):
+    """Run an LLM call that must return exactly one JSON object.
+
+    This helper centralizes the JSON-only contract so downstream callers do not
+    attempt their own permissive parsing. It extracts the first balanced JSON
+    object and ignores any trailing text, while still rejecting code fences or
+    unbalanced braces to avoid ambiguous parses.
+
+    Returns:
+        tuple(parsed_json, raw_output)
+    """
+
+    guard = "Return ONLY JSON. No extra keys. No commentary."
+    wrapped_prompt = f"{guard}\n{prompt.strip()}\n{guard}"
+    raw = llm.generate(
+        wrapped_prompt,
+        temperature=temperature,
+        max_new_tokens=max_new_tokens,
+    )
+    raw_text = raw.text if hasattr(raw, "text") else str(raw)
+    parsed = json.loads(_extract_first_json_object(raw_text))
+    return parsed, raw
+
+
+def _find_fuzzy_substring(haystack: str, needle: str, max_distance: int = 2) -> Optional[Tuple[int, int, str]]:
+    """
+    Find fuzzy substring match allowing for minor differences.
+
+    Returns (start, end, matched_text) or None.
+    Used as fallback when exact match fails due to punctuation/whitespace differences.
+    """
+    if not needle or not haystack:
+        return None
+
+    # Normalize both strings
+    def normalize(s: str) -> str:
+        s = s.lower().strip()
+        s = re.sub(r'[^\w\s]', '', s)  # Remove punctuation
+        s = ' '.join(s.split())  # Normalize whitespace
+        return s
+
+    needle_norm = normalize(needle)
+    if not needle_norm:
+        return None
+
+    # Sliding window search
+    words = haystack.split()
+    needle_words = needle_norm.split()
+
+    if not needle_words:
+        return None
+
+    for i in range(len(words) - len(needle_words) + 1):
+        window = words[i:i + len(needle_words)]
+        window_norm = [normalize(w) for w in window]
+
+        # Check if normalized words match
+        if window_norm == needle_words:
+            # Find the actual span in the original text
+            start_word = ' '.join(words[:i])
+            matched_text = ' '.join(window)
+            start_pos = len(start_word) + (1 if start_word else 0)
+            return (start_pos, start_pos + len(matched_text), matched_text)
+
+    return None
+
+
+def certified_span_select(
+    llm,
+    question: str,
+    winner_passages: List[Dict[str, Any]],
+    max_chars_per_passage: int = 800
+) -> CSSResult:
+    """
+    Certified Span Selection: Extract answer as exact substring from evidence.
+
+    This is relation-agnostic and requires verbatim grounding.
+
+    Args:
+        llm: LLM interface with generate() method
+        question: The question to answer
+        winner_passages: List of certificate-winning passages [{pid, text, title}, ...]
+        max_chars_per_passage: Max chars to include per passage (for context limits)
+
+    Returns:
+        CSSResult with answer span and verification status
+    """
+    import json as json_module
+    import os
+
+    debug = os.environ.get("TRIDENT_DEBUG_CSS", "0") == "1"
+
+    if not winner_passages:
+        return CSSResult(abstain=True, answer="", passage_id="", reason="NO_PASSAGES")
+
+    # Build compact evidence
+    evidence_parts = []
+    for p in winner_passages:
+        pid = p.get("pid", "")
+        title = p.get("title", "")
+        text = (p.get("text") or "")[:max_chars_per_passage]
+        evidence_parts.append(f"[{pid}] {title}\n{text}")
+
+    evidence_text = "\n\n".join(evidence_parts)
+
+    prompt = f"""You must answer ONLY using the Evidence below.
+Return exactly ONE JSON object with keys:
+  "pid": string, the evidence passage id you copied from
+  "answer": string, an EXACT substring copied verbatim from that passage
+  "confidence": number between 0 and 1
+
+Rules (hard constraints):
+1) Output must be JSON ONLY. Do NOT include code fences, commentary, or extra text.
+1b) The first character of your reply must be '{' and you must end immediately after the closing '}'.
+2) The answer MUST be copied exactly from the evidence text (verbatim).
+3) Copy the shortest complete answer span - usually a name, place, date, or short phrase.
+4) If you cannot find an exact answer substring, output: {{"pid": "", "answer": "", "confidence": 0}}
+
+Question: {question}
+
+Evidence:
+{evidence_text}
+
+JSON:"""
+
+    try:
+        out, raw = strict_json_call(llm, prompt, max_new_tokens=160, temperature=0.0)
+        raw_text = raw.text if hasattr(raw, 'text') else str(raw)
+    except Exception as e:
+        if debug:
+            print(f"[CSS] JSON parse failed: {e}")
+        return CSSResult(abstain=True, answer="", passage_id="", reason="PARSE_ERROR")
+
+    if debug:
+        print(f"[CSS] Raw LLM output: {raw_text[:200]}...")
+
+    prompt_tokens = getattr(raw, "prompt_tokens", 0) or 0
+    completion_tokens = getattr(raw, "completion_tokens", 0) or 0
+    tokens_used = getattr(raw, "tokens_used", 0) or (prompt_tokens + completion_tokens)
+
+    if not prompt_tokens and hasattr(llm, "compute_token_cost"):
+        try:
+            prompt_tokens = llm.compute_token_cost(prompt)
+            tokens_used = tokens_used or prompt_tokens + completion_tokens
+        except Exception:
+            prompt_tokens = prompt_tokens
+
+    pid = (out.get("pid") or "").strip()
+    answer = (out.get("answer") or "").strip()
+    confidence = float(out.get("confidence", 0))
+
+    if debug:
+        print(f"[CSS] Parsed: pid={pid}, answer={answer[:50]}..., conf={confidence}")
+
+    # Check for empty response (LLM abstention)
+    if not pid or not answer:
+        return CSSResult(
+            abstain=True,
+            answer="",
+            passage_id=pid,
+            reason="NO_SPAN",
+            confidence=confidence,
+            tokens_used=tokens_used,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+
+    # Verify passage ID is in winners
+    passage_map = {p.get("pid", ""): p for p in winner_passages}
+    if pid not in passage_map:
+        if debug:
+            print(f"[CSS] PID {pid} not in winners: {list(passage_map.keys())}")
+        return CSSResult(
+            abstain=True,
+            answer=answer,
+            passage_id=pid,
+            reason="PID_NOT_IN_WINNERS",
+            confidence=confidence,
+            tokens_used=tokens_used,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+
+    # Verify exact grounding
+    passage_text = passage_map[pid].get("text", "")
+
+    # Try exact match first
+    match = _find_exact_substring(passage_text, answer)
+    if match is not None:
+        if debug:
+            print(f"[CSS] Exact match found at {match}")
+        return CSSResult(
+            abstain=False,
+            answer=answer,
+            passage_id=pid,
+            reason="OK",
+            confidence=confidence,
+            tokens_used=tokens_used,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+
+    # Try fuzzy match as fallback
+    fuzzy = _find_fuzzy_substring(passage_text, answer)
+    if fuzzy is not None:
+        start, end, matched_text = fuzzy
+        if debug:
+            print(f"[CSS] Fuzzy match: '{answer}' -> '{matched_text}'")
+        # Return the actual text from passage (properly grounded)
+        return CSSResult(
+            abstain=False,
+            answer=matched_text,
+            passage_id=pid,
+            reason="OK_FUZZY",
+            confidence=confidence,
+            tokens_used=tokens_used,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+
+    if debug:
+        print(f"[CSS] No match found for '{answer}' in passage")
+    return CSSResult(
+        abstain=True,
+        answer=answer,
+        passage_id=pid,
+        reason="SPAN_NOT_VERBATIM",
+        confidence=confidence,
+        tokens_used=tokens_used,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
+
+
+# ==============================================================================
+# CONSTRAINED CANDIDATE SELECTION
+# ==============================================================================
+# Instead of free-form extraction, build a candidate set and have LLM pick by
+# index. This ensures verbatim answers and enables support-based ranking.
+# ==============================================================================
+
+@dataclass
+class QuestionType:
+    """Detected question type for constraining candidates."""
+    category: str  # "either_or", "who", "what", "where", "when", "how_many", "yes_no", "other"
+    expected_type: str  # "PERSON", "PLACE", "DATE", "NUMBER", "BINARY", "ENTITY", "OTHER"
+    options: Optional[List[str]] = None  # For either/or questions
+
+
+@dataclass
+class ConstrainedSelectionResult:
+    """Result from constrained candidate selection."""
+    answer: str
+    candidate_index: int
+    confidence: float
+    passage_id: str
+    candidates: List[str]
+    support_scores: List[float]
+    reason: str  # OK, NO_PASSAGES, NO_VERIFIED_SPAN, etc.
+    tokens_used: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
+def detect_question_type(question: str) -> QuestionType:
+    """
+    Detect question type to constrain candidate extraction.
+
+    Returns:
+        QuestionType with category, expected_type, and options (for either/or)
+    """
+    q = question.strip()
+    q_lower = q.lower()
+
+    # Either/or questions: "X or Y?" pattern
+    # Match patterns like "was it A or B", "is this X or Y", "A or B?"
+    either_or_match = re.search(
+        r'\b(is|was|are|were|did|does|do|can|could|would|should|will)\s+.{1,50}?\s+(\w+(?:\s+\w+){0,3})\s+or\s+(\w+(?:\s+\w+){0,3})\s*\??$',
+        q_lower
+    )
+    if either_or_match:
+        opt1 = either_or_match.group(2).strip()
+        opt2 = either_or_match.group(3).strip("?. ")
+        return QuestionType(
+            category="either_or",
+            expected_type="BINARY_CHOICE",
+            options=[opt1, opt2]
+        )
+
+    # Simple "A or B?" at end
+    simple_or = re.search(r'(\w+(?:\s+\w+){0,4})\s+or\s+(\w+(?:\s+\w+){0,4})\s*\??$', q_lower)
+    if simple_or:
+        opt1 = simple_or.group(1).strip()
+        opt2 = simple_or.group(2).strip("?. ")
+        # Make sure these look like answer options (not "this or that")
+        if opt1.lower() not in {'this', 'that', 'it', 'he', 'she', 'they'}:
+            return QuestionType(
+                category="either_or",
+                expected_type="BINARY_CHOICE",
+                options=[opt1, opt2]
+            )
+
+    # Yes/No questions
+    if q_lower.startswith(('is ', 'are ', 'was ', 'were ', 'do ', 'does ', 'did ',
+                           'can ', 'could ', 'should ', 'would ', 'has ', 'have ', 'had ')):
+        return QuestionType(category="yes_no", expected_type="BINARY", options=["yes", "no"])
+
+    # Who questions -> PERSON
+    if q_lower.startswith('who ') or ' who ' in q_lower[:30]:
+        return QuestionType(category="who", expected_type="PERSON")
+
+    # Where questions -> PLACE
+    if q_lower.startswith('where ') or ' where ' in q_lower[:30]:
+        return QuestionType(category="where", expected_type="PLACE")
+
+    # When questions -> DATE
+    if q_lower.startswith('when ') or ' when ' in q_lower[:30]:
+        return QuestionType(category="when", expected_type="DATE")
+
+    # How many/much -> NUMBER
+    if q_lower.startswith('how many ') or q_lower.startswith('how much '):
+        return QuestionType(category="how_many", expected_type="NUMBER")
+
+    # What questions -> ENTITY (generic)
+    if q_lower.startswith('what ') or ' what ' in q_lower[:30]:
+        # Check for more specific "what [type]" patterns
+        what_person = re.match(r'what\s+(person|actor|actress|director|author|singer|player)', q_lower)
+        if what_person:
+            return QuestionType(category="what", expected_type="PERSON")
+        what_place = re.match(r'what\s+(city|country|place|location|state|region)', q_lower)
+        if what_place:
+            return QuestionType(category="what", expected_type="PLACE")
+        what_date = re.match(r'what\s+(year|date|time|day|month)', q_lower)
+        if what_date:
+            return QuestionType(category="what", expected_type="DATE")
+        return QuestionType(category="what", expected_type="ENTITY")
+
+    # Default: other
+    return QuestionType(category="other", expected_type="OTHER")
+
+
+def _normalize_for_dedup(s: str) -> str:
+    """
+    E2 FIX: Normalize string for substring deduplication.
+
+    Handles punctuation variations so "D'Arcy Coulson" and "Darcy Coulson" compare correctly.
+    """
+    import re
+    # Replace apostrophes, quotes, hyphens, periods with space
+    s = re.sub(r"[\s''\.\-]+", " ", s.strip().lower())
+    # Collapse multiple spaces
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def extract_candidates(
+    winner_passages: List[Dict[str, Any]],
+    question_type: QuestionType,
+    max_candidates: int = 10
+) -> List[Tuple[str, float, str]]:
+    """
+    Extract candidate answers from winner passages based on question type.
+
+    Returns:
+        List of (candidate_text, support_score, source_pid) tuples,
+        sorted by support_score descending.
+    """
+    candidates: Dict[str, Tuple[float, str]] = {}  # text -> (score, pid)
+
+    # For either/or questions, use the provided options
+    if question_type.category == "either_or" and question_type.options:
+        for opt in question_type.options:
+            # Find which passage(s) support this option
+            support = 0.0
+            source_pid = ""
+            for p in winner_passages:
+                text_lower = (p.get("text") or "").lower()
+                if opt.lower() in text_lower:
+                    support += 1.0
+                    if not source_pid:
+                        source_pid = p.get("pid", "")
+            if source_pid:
+                candidates[opt] = (support, source_pid)
+        # Return sorted by support
+        return sorted(
+            [(text, score, pid) for text, (score, pid) in candidates.items() if pid],
+            key=lambda x: x[1],
+            reverse=True
+        )[:max_candidates]
+
+    # For yes/no questions
+    if question_type.category == "yes_no":
+        # Count evidence for yes vs no
+        yes_support = 0.0
+        no_support = 0.0
+        yes_pid = ""
+        no_pid = ""
+
+        for p in winner_passages:
+            text = (p.get("text") or "").lower()
+            pid = p.get("pid", "")
+            # Look for affirmative/negative language
+            if any(w in text for w in ['is a', 'was a', 'are the', 'were the', 'did ', 'does ', 'has ', 'had ']):
+                yes_support += 0.5
+                if not yes_pid:
+                    yes_pid = pid
+            if any(w in text for w in ['not ', "n't ", 'never ', 'no ', 'none ']):
+                no_support += 0.5
+                if not no_pid:
+                    no_pid = pid
+
+        if not yes_pid and winner_passages:
+            yes_pid = winner_passages[0].get("pid", "")
+        if not no_pid and winner_passages:
+            no_pid = winner_passages[0].get("pid", "")
+
+        return [
+            ("yes", yes_support, yes_pid),
+            ("no", no_support, no_pid)
+        ]
+
+    # For PERSON questions
+    if question_type.expected_type == "PERSON":
+        # E1 FIX: Punctuation-aware pattern for apostrophes, initials, etc.
+        # Handles: D'Arcy, O'Connor, J.K. Rowling
+        # Includes common name prefixes: de, van, von, la, el, al, bin, ibn
+        person_pattern = re.compile(
+            r"\b([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+(?:de|van|von|la|el|al|bin|ibn)?[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,5})\b"
+        )
+        for p in winner_passages:
+            text = p.get("text") or ""
+            pid = p.get("pid", "")
+            for match in person_pattern.finditer(text):
+                name = match.group(1).strip()
+                # Validate: looks like a person name
+                if _looks_like_person(name):
+                    # Compute support: count occurrences across all passages
+                    support = sum(
+                        1 for pp in winner_passages
+                        if name.lower() in (pp.get("text") or "").lower()
+                    )
+                    # MULTI-TOKEN BONUS: Prefer longer spans (more specific)
+                    # Add 0.5 per token to favor multi-token names over single tokens
+                    token_count = len(name.split())
+                    length_bonus = 0.5 * (token_count - 1)
+                    adjusted_support = support + length_bonus
+                    if name not in candidates or adjusted_support > candidates[name][0]:
+                        candidates[name] = (adjusted_support, pid)
+
+        # SUBSTRING DEDUPLICATION: Remove single-token candidates that are
+        # substrings of higher-scoring multi-token candidates
+        # E2 FIX: Use normalization so punctuation variants compare correctly
+        if len(candidates) > 1:
+            to_remove = set()
+            sorted_cands = sorted(candidates.items(), key=lambda x: x[1][0], reverse=True)
+            for i, (name1, _) in enumerate(sorted_cands):
+                name1_norm = _normalize_for_dedup(name1)
+                for name2, _ in sorted_cands[i+1:]:
+                    name2_norm = _normalize_for_dedup(name2)
+                    # If shorter name is a substring of longer name, mark for removal
+                    if len(name2_norm) < len(name1_norm) and name2_norm in name1_norm:
+                        to_remove.add(name2)
+            for name in to_remove:
+                if name in candidates:
+                    del candidates[name]
+
+    # For PLACE questions
+    elif question_type.expected_type == "PLACE":
+        # Extract capitalized spans that look like places
+        place_pattern = re.compile(
+            r'\b([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})\b'
+        )
+        for p in winner_passages:
+            text = p.get("text") or ""
+            pid = p.get("pid", "")
+            for match in place_pattern.finditer(text):
+                place = match.group(1).strip()
+                # Filter out obvious non-places
+                if len(place) >= 2 and place.lower() not in {
+                    'the', 'a', 'an', 'he', 'she', 'they', 'it', 'his', 'her',
+                    'their', 'was', 'were', 'is', 'are', 'has', 'had', 'have'
+                }:
+                    support = sum(
+                        1 for pp in winner_passages
+                        if place.lower() in (pp.get("text") or "").lower()
+                    )
+                    if place not in candidates or support > candidates[place][0]:
+                        candidates[place] = (support, pid)
+
+    # For DATE questions
+    elif question_type.expected_type == "DATE":
+        # Extract date patterns
+        date_patterns = [
+            # Year only: 1990, 2024
+            re.compile(r'\b(1[0-9]{3}|20[0-2][0-9])\b'),
+            # Month Day, Year: January 1, 2020
+            re.compile(r'\b([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})\b'),
+            # Day Month Year: 1 January 2020
+            re.compile(r'\b(\d{1,2}\s+[A-Z][a-z]+\s+\d{4})\b'),
+            # Month Year: January 2020
+            re.compile(r'\b([A-Z][a-z]+\s+\d{4})\b'),
+        ]
+        for p in winner_passages:
+            text = p.get("text") or ""
+            pid = p.get("pid", "")
+            for pattern in date_patterns:
+                for match in pattern.finditer(text):
+                    date_str = match.group(1).strip()
+                    support = sum(
+                        1 for pp in winner_passages
+                        if date_str in (pp.get("text") or "")
+                    )
+                    if date_str not in candidates or support > candidates[date_str][0]:
+                        candidates[date_str] = (support, pid)
+
+    # For NUMBER questions
+    elif question_type.expected_type == "NUMBER":
+        number_pattern = re.compile(r'\b(\d+(?:,\d{3})*(?:\.\d+)?)\b')
+        for p in winner_passages:
+            text = p.get("text") or ""
+            pid = p.get("pid", "")
+            for match in number_pattern.finditer(text):
+                num = match.group(1).strip()
+                support = sum(
+                    1 for pp in winner_passages
+                    if num in (pp.get("text") or "")
+                )
+                if num not in candidates or support > candidates[num][0]:
+                    candidates[num] = (support, pid)
+
+    # For ENTITY or OTHER: extract all capitalized spans
+    else:
+        # E1 FIX: Punctuation-aware pattern for apostrophes, initials, etc.
+        # Handles: D'Arcy, O'Connor, J.K. Rowling, C.S. Lewis
+        # Increased max tokens from 4 to 6 for longer entity names
+        entity_pattern = re.compile(
+            r"\b([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,6})\b"
+        )
+        # Common stop-words to filter out
+        stop_words = {'The', 'A', 'An', 'He', 'She', 'They', 'It', 'His', 'Her',
+                      'Their', 'Was', 'Were', 'Is', 'Are', 'Has', 'Had', 'Have',
+                      'This', 'That', 'These', 'Those', 'In', 'On', 'At', 'By'}
+        for p in winner_passages:
+            text = p.get("text") or ""
+            pid = p.get("pid", "")
+            for match in entity_pattern.finditer(text):
+                entity = match.group(1).strip()
+                # Skip single-token stop-words
+                if entity in stop_words:
+                    continue
+                if len(entity) >= 2:
+                    support = sum(
+                        1 for pp in winner_passages
+                        if entity.lower() in (pp.get("text") or "").lower()
+                    )
+                    # MULTI-TOKEN BONUS: Prefer longer spans (more specific)
+                    token_count = len(entity.split())
+                    length_bonus = 0.5 * (token_count - 1)
+                    adjusted_support = support + length_bonus
+                    if entity not in candidates or adjusted_support > candidates[entity][0]:
+                        candidates[entity] = (adjusted_support, pid)
+
+        # SUBSTRING DEDUPLICATION: Remove single-token candidates that are
+        # substrings of higher-scoring multi-token candidates
+        # E2 FIX: Use normalization so punctuation variants compare correctly
+        if len(candidates) > 1:
+            to_remove = set()
+            sorted_cands = sorted(candidates.items(), key=lambda x: x[1][0], reverse=True)
+            for i, (name1, _) in enumerate(sorted_cands):
+                name1_norm = _normalize_for_dedup(name1)
+                for name2, _ in sorted_cands[i+1:]:
+                    name2_norm = _normalize_for_dedup(name2)
+                    # If shorter name is a substring of longer name, mark for removal
+                    if len(name2_norm) < len(name1_norm) and name2_norm in name1_norm:
+                        to_remove.add(name2)
+            for name in to_remove:
+                if name in candidates:
+                    del candidates[name]
+
+    # Sort by support score and return top candidates
+    sorted_candidates = sorted(
+        [
+            (text, score, pid)
+            for text, (score, pid) in candidates.items()
+            if pid
+        ],
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    # E3 FIX: Check for low-quality candidates and return empty to trigger fallback
+    # For PERSON/ENTITY types, if all candidates are single-token, it's likely noise
+    if question_type.expected_type in ("PERSON", "ENTITY"):
+        if sorted_candidates:
+            max_token_count = max(len(c[0].split()) for c in sorted_candidates)
+            if max_token_count < 2:
+                # All candidates are single tokens - likely low quality
+                # Return empty to trigger CSS fallback instead of picking noise
+                import os
+                debug = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
+                if debug:
+                    print(f"[EXTRACT] Low-quality candidates: all single-token, returning empty")
+                    print(f"[EXTRACT] Would have returned: {[c[0] for c in sorted_candidates[:5]]}")
+                return []
+
+    return sorted_candidates[:max_candidates]
+
+
+def compute_support_score(
+    candidate: str,
+    passages: List[Dict[str, Any]]
+) -> float:
+    """
+    Compute deterministic support score for a candidate.
+
+    Score = count of passages mentioning candidate, weighted by passage rank.
+    """
+    if not candidate or not passages:
+        return 0.0
+
+    candidate_lower = candidate.lower()
+    score = 0.0
+
+    for i, p in enumerate(passages):
+        text_lower = (p.get("text") or "").lower()
+        title_lower = (p.get("title") or "").lower()
+
+        # Check if candidate appears
+        if candidate_lower in text_lower or candidate_lower in title_lower:
+            # Weight by rank (earlier passages = higher weight)
+            weight = 1.0 / (1 + i * 0.1)
+            score += weight
+
+    return score
+
+
+def get_answer_facet_passages(
+    question: str,
+    certificates: List[Dict[str, Any]],
+    all_passages: List[Dict[str, Any]],
+    facets: Optional[List[Dict[str, Any]]] = None,
+    max_answer_facets: int = 3,
+    max_answer_passages: int = 5,
+) -> Tuple[List[Dict[str, Any]], List[str], str]:
+    """
+    Select passages corresponding to the *answer-determining* facets.
+
+    Certified-only, fail-closed properties:
+    - Only passages whose PID appears in certificates are eligible.
+    - For each facet, only the best (lowest p-value) certificate is used to fetch evidence.
+    - LLM (if used) may only choose from certified facet IDs; outputs are intersected.
+    """
+    import json
+    import os
+
+    debug = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
+
+    if not certificates:
+        return [], [], "NO_CERTIFICATES"
+
+    # -----------------------------
+    # 1) Certified-only PID scope
+    # -----------------------------
+    certified_pids = _cert_pid(certificates)
+
+    # Build passage lookup from certified-only pool
+    pid_to_passage = {
+        p.get("pid"): p
+        for p in all_passages
+        if p.get("pid") in certified_pids
+    }
+
+    # -----------------------------
+    # 2) Best cert per facet (lowest p-value)
+    # -----------------------------
+    facet_to_certs: Dict[str, List[Dict[str, Any]]] = {}
+    for cert in certificates:
+        fid = cert.get("facet_id") or ""
+        pid = cert.get("passage_id") or cert.get("pid") or cert.get("passage_pid") or cert.get("winning_pid") or ""
+        if fid and pid and pid in pid_to_passage:
+            facet_to_certs.setdefault(fid, []).append(cert)
+
+    if not facet_to_certs:
+        # If schema drift: we have certificates but couldn't map to passages cleanly
+        return [], [], "NO_CERT_MAPPABLE_PASSAGES"
+
+    best_cert_by_fid: Dict[str, Dict[str, Any]] = {}
+    for fid, certs in facet_to_certs.items():
+        best_cert_by_fid[fid] = min(certs, key=lambda c: float(c.get("p_value", 1.0)))
+
+    certified_facet_ids = list(best_cert_by_fid.keys())
+
+    # -----------------------------
+    # 3) Choose answer facets deterministically
+    # -----------------------------
+    selected_facet_ids = [
+        fid for fid, _ in sorted(
+            ((fid, cert.get("p_value", 1.0)) for fid, cert in best_cert_by_fid.items()),
+            key=lambda x: float(x[1])
+        )
+    ][:max_answer_facets]
+    selection_reason = "TOP_PVALUE"
+
+    if not selected_facet_ids:
+        selected_facet_ids = certified_facet_ids[:max_answer_facets]
+        selection_reason = f"HEURISTIC:{','.join(selected_facet_ids)}"
+
+    # -----------------------------
+    # 4) Fetch winning passages from best certs (strict provenance)
+    # -----------------------------
+    target_certs = [best_cert_by_fid[fid] for fid in selected_facet_ids if fid in best_cert_by_fid]
+    target_certs.sort(key=lambda c: float(c.get("p_value", 1.0)))
+
+    answer_passages: List[Dict[str, Any]] = []
+    seen = set()
+    for cert in target_certs:
+        pid = cert.get("passage_id") or cert.get("pid") or cert.get("passage_pid") or cert.get("winning_pid") or ""
+        if not pid or pid in seen:
+            continue
+        if pid in pid_to_passage:
+            seen.add(pid)
+            answer_passages.append(pid_to_passage[pid])
+        if len(answer_passages) >= max_answer_passages:
+            break
+
+    if debug:
+        apids = [p.get("pid") for p in answer_passages]
+        print(f"[ANSWER-FACET] reason={selection_reason} facets={selected_facet_ids} pids={apids}")
+
+    return answer_passages, selected_facet_ids, selection_reason
+
+def constrained_span_select(
+    llm,
+    question: str,
+    winner_passages: List[Dict[str, Any]],
+    max_candidates: int = 10,
+    max_chars_per_passage: int = 600,
+    certificates: Optional[List[Dict[str, Any]]] = None,
+) -> ConstrainedSelectionResult:
+    """
+    Primary: Frozen span extraction (pid + offsets + verbatim check) from winner_passages.
+    Secondary: candidate-index selection (legacy) but still certified-only if certificates provided.
+
+    Fail-closed: returns empty answer if nothing can be machine-verified.
+    """
+    import json
+    import os
+    import re
+
+    debug = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
+
+    if not winner_passages:
+        return ConstrainedSelectionResult(
+            answer="",
+            candidate_index=-1,
+            confidence=0.0,
+            passage_id="",
+            candidates=[],
+            support_scores=[],
+            reason="NO_PASSAGES"
+        )
+
+    if certificates:
+        certified_pids = _cert_pid(certificates)
+        winner_passages = [p for p in winner_passages if p.get("pid") in certified_pids]
+        if not winner_passages:
+            return ConstrainedSelectionResult(
+                answer="",
+                candidate_index=-1,
+                confidence=0.0,
+                passage_id="",
+                candidates=[],
+                support_scores=[],
+                reason="NO_CERTIFIED_PASSAGES"
+            )
+
+    # -----------------------------
+    # Frozen span extraction prompt
+    # -----------------------------
+    snippet_map: Dict[str, str] = {}
+    evidence_parts = []
+    for p in winner_passages:
+        pid = p.get("pid")
+        if not pid:
+            continue
+        snip = (p.get("text") or "")[:max_chars_per_passage]
+        snippet_map[pid] = snip
+        evidence_parts.append(f"[{pid}] {snip}")
+
+    evidence_text = "\n\n".join(evidence_parts)
+
+    span_prompt = f"""Extract the answer as an EXACT substring from the evidence.
+
+Question: {question}
+
+Evidence:
+{evidence_text}
+
+Rules:
+1. The answer_span must be copied VERBATIM from the evidence.
+2. Provide start_char and end_char offsets relative to the snippet shown for that pid.
+3. Return JSON only:
+{{ "pid": "...", "start_char": 0, "end_char": 0, "answer_span": "...", "confidence": 0.0 }}
+4. If not found, return {{ "answer_span": null }}
+
+JSON:"""
+
+    def _norm_ws(s: str) -> str:
+        return " ".join((s or "").split())
+
+    try:
+        resp = llm.generate(span_prompt, temperature=0.0)
+        raw = resp.text if hasattr(resp, "text") else str(resp)
+        s = raw.find("{")
+        e = raw.rfind("}")
+        if s != -1 and e != -1:
+            data = json.loads(raw[s:e+1])
+
+            span = data.get("answer_span")
+            pid = data.get("pid")
+            start_char = data.get("start_char")
+            end_char = data.get("end_char")
+            conf = float(data.get("confidence", 0.0))
+
+            if span and pid in snippet_map and isinstance(start_char, int) and isinstance(end_char, int):
+                snippet = snippet_map[pid]
+
+                match = False
+                if 0 <= start_char < end_char <= len(snippet):
+                    sliced = snippet[start_char:end_char]
+                    if _norm_ws(sliced) == _norm_ws(span):
+                        match = True
+
+                # Deterministic repair: exact find in original snippet if offsets wrong
+                if not match:
+                    idx = snippet.find(span)
+                    if idx != -1:
+                        start_char, end_char = idx, idx + len(span)
+                        if _norm_ws(snippet[start_char:end_char]) == _norm_ws(span):
+                            match = True
+
+                if match:
+                    # Type sanity checks (lightweight)
+                    q_type = detect_question_type(question)
+                    ok = True
+                    if getattr(q_type, "expected_type", None) == "NUMBER":
+                        ok = bool(re.search(r"\d", span)) and len(span) <= 50
+                    elif getattr(q_type, "expected_type", None) == "DATE":
+                        ok = bool(re.search(r"\d{4}", span) or re.search(r"\d", span))
+                    elif getattr(q_type, "category", None) == "yes_no":
+                        ok = _norm_ws(span).lower() in {"yes", "no"}
+
+                    if ok:
+                        if debug:
+                            print(f"[FROZEN-SPAN] pid={pid} span='{span}' [{start_char}:{end_char}] conf={conf:.2f}")
+                        return ConstrainedSelectionResult(
+                            answer=span,
+                            candidate_index=0,
+                            confidence=conf,
+                            passage_id=pid,
+                            candidates=[span],
+                            support_scores=[1.0],
+                            reason="OK_FROZEN_SPAN"
+                        )
+    except Exception as ex:
+        if debug:
+            print(f"[FROZEN-SPAN] Failed: {ex}")
+
+    return ConstrainedSelectionResult(
+        answer="",
+        candidate_index=-1,
+        confidence=0.0,
+        passage_id="",
+        candidates=[],
+        support_scores=[],
+        reason="NO_VERIFIED_SPAN"
+    )
+
+def bind_entity_via_css(
+    llm,
+    inner_question: str,
+    hop1_passages: List[Dict[str, Any]],
+    max_chars: int = 600,
+    min_confidence: float = 0.55,
+    certificates: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[str]:
+    """
+    Canonical entity binder: deterministic candidate generation -> LLM index choice.
+
+    Certified-only option:
+    - If certificates provided, restrict hop1_passages to certified PIDs.
+    Fail-closed:
+    - If parsing fails, index out of bounds, or confidence < threshold => None.
+    """
+    import json
+    import os
+    from .nli_scorer import _normalize_text_unicode
+
+    debug = os.environ.get("TRIDENT_DEBUG_CSS", "0") == "1"
+
+    if not hop1_passages:
+        return None
+
+    if certificates:
+        certified_pids = _cert_pid(certificates)
+        hop1_passages = [p for p in hop1_passages if p.get("pid") in certified_pids]
+        if not hop1_passages:
+            return None
+
+    # Candidate enumeration via existing extractor (still deterministic downstream)
+    q_type = detect_question_type(inner_question)
+    raw_candidates = extract_candidates(hop1_passages, q_type, max_candidates=20)
+
+    # Build normalized -> (display_text, source_pid)
+    cand_map: Dict[str, Tuple[str, str]] = {}
+    for text, score, pid in raw_candidates:
+        if not text or not pid:
+            continue
+        toks = text.split()
+        ok = False
+        if len(toks) >= 2:
+            ok = True
+        elif len(toks) == 1:
+            t = toks[0]
+            if len(t) >= 4 and t.lower() not in {"this", "that", "film", "movie", "city"}:
+                ok = True
+        if not ok:
+            continue
+        norm = _normalize_text_unicode(text)
+        if norm and norm not in cand_map:
+            cand_map[norm] = (text, pid)
+
+    cand_items = list(cand_map.values())
+    # Deterministic ordering: longer (more specific) first, then lexicographic, then pid
+    cand_items.sort(key=lambda x: (-(len(x[0].split())), x[0].lower(), x[1]))
+    candidate_list = cand_items[:8]  # (text, pid)
+
+    if not candidate_list:
+        if debug:
+            print("[CSS-BIND] No candidates after filtering.")
+        return None
+
+    # Build evidence snippets only from relevant PIDs (for provenance)
+    relevant_pids = {pid for _, pid in candidate_list}
+    snippet_map: Dict[str, str] = {}
+    evidence_parts = []
+    for p in hop1_passages:
+        pid = p.get("pid")
+        if pid in relevant_pids:
+            snip = (p.get("text") or "")[:max_chars]
+            snippet_map[pid] = snip
+            evidence_parts.append(f"[{pid}] {snip}")
+
+    candidates_formatted = "\n".join([f"{i}: {c[0]}" for i, c in enumerate(candidate_list)])
+    evidence_text = "\n".join(evidence_parts)
+
+    prompt = f"""Identify the entity that answers the question.
+Select ONE candidate from the list by index.
+
+Question: {inner_question}
+
+Candidates:
+{candidates_formatted}
+
+Evidence:
+{evidence_text}
+
+Rules:
+1. Return JSON only: {{ "index": int, "confidence": float }}
+2. If none match, return {{ "index": -1 }}
+
+JSON:"""
+
+    try:
+        resp = llm.generate(prompt, temperature=0.0)
+        raw = resp.text if hasattr(resp, "text") else str(resp)
+        # --- robust JSON extraction (fail-closed) ---
+        def _first_json_obj(text: str) -> Optional[Dict[str, Any]]:
+            """Parse the *first* JSON object from model output.
+            Accepts extra commentary / code fences / multiple JSON blocks."""
+            # Strip code fences (best-effort)
+            cleaned = re.sub(r"```[\s\S]*?```", " ", text).strip()
+            s0 = cleaned.find("{")
+            if s0 == -1:
+                return None
+            try:
+                dec = json.JSONDecoder()
+                obj, _ = dec.raw_decode(cleaned[s0:])
+                return obj if isinstance(obj, dict) else None
+            except Exception:
+                # Fallback: first non-greedy {...}
+                m = re.search(r"\{[\s\S]*?\}", cleaned)
+                if not m:
+                    return None
+                try:
+                    obj = json.loads(m.group(0))
+                    return obj if isinstance(obj, dict) else None
+                except Exception:
+                    return None
+
+        data = _first_json_obj(raw)
+        if not data:
+            if debug:
+                print(f"[CSS-BIND] Failed: could not parse JSON from: {raw[:120]!r}")
+            return None
+
+        idx = int(data.get("index", -1)) if "index" in data and str(data.get("index")).strip() != "" else -1
+        conf = float(data.get("confidence", 0.0) or 0.0)
+
+        # Accept alternate schema: {"pid": "...", "answer": "..."} (some models do this).
+        if idx < 0:
+            pid_raw = str(data.get("pid", "") or "").strip().strip("[]")
+            ans_raw = str(data.get("answer", "") or "").strip()
+            if pid_raw:
+                for j, (_txt, _pid) in enumerate(candidate_list):
+                    if (_pid or "") == pid_raw:
+                        idx = j
+                        break
+            if idx < 0 and ans_raw:
+                norm_ans = _normalize_text_unicode(ans_raw)
+                for j, (_txt, _pid) in enumerate(candidate_list):
+                    if _normalize_text_unicode(_txt) == norm_ans:
+                        idx = j
+                        break
+
+        if conf < min_confidence:
+            return None
+        if not (0 <= idx < len(candidate_list)):
+            return None
+
+        chosen_text, source_pid = candidate_list[idx]
+        snippet = snippet_map.get(source_pid, "")
+
+        # Provenance check (normalization-consistent containment)
+        if _normalize_text_unicode(chosen_text) in _normalize_text_unicode(snippet):
+            if debug:
+                print(f"[CSS-BIND] idx={idx} conf={conf:.2f} -> {chosen_text} (pid={source_pid})")
+            return chosen_text
+
+    except Exception as ex:
+        if debug:
+            print(f"[CSS-BIND] Failed: {ex}")
+
+    return None
+
 def build_inner_question_from_facet(facet: Dict[str, Any]) -> str:
     """
     Build the inner question from a hop-1 facet for entity binding.
@@ -1143,8 +2403,10 @@ def build_inner_question_from_facet(facet: Dict[str, Any]) -> str:
     predicate = template.get("predicate", "")
     obj = template.get("object", "")
 
+    # Build natural question
     question = f"{subject} {predicate} {obj}".strip()
 
+    # Ensure it ends with question mark
     if not question.endswith("?"):
         question += "?"
 
@@ -1162,10 +2424,18 @@ def get_winner_passages_only(
     - Only includes passages that have valid certificates
     - Filters out passages with deny-listed titles
     - Orders by certificate p-value (best first)
+
+    Args:
+        certificates: List of certificates with passage_id
+        passages: List of all selected passages
+
+    Returns:
+        List of unique winning passages (ordered by certificate p-value)
     """
     if not certificates:
         return []
 
+    # CERTIFIED-ONLY: Get set of certified passage IDs
     certified_pids = _cert_pid(certificates)
 
     # Build passage lookup (only certified passages, excluding deny-listed)
@@ -1186,6 +2456,7 @@ def get_winner_passages_only(
 
     for cert in sorted_certs:
         pid = cert.get("passage_id", "")
+        # CERTIFIED-ONLY: Must be in pid_to_passage (certified and not deny-listed)
         if pid and pid not in seen_pids and pid in pid_to_passage:
             seen_pids.add(pid)
             winners.append(pid_to_passage[pid])

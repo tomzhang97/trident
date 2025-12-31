@@ -11,7 +11,6 @@ from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     BitsAndBytesConfig,
-    GenerationConfig,
     set_seed
 )
 
@@ -22,6 +21,8 @@ class LLMOutput:
     text: str
     tokens_used: int
     latency_ms: float
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
     logprobs: Optional[List[float]] = None
 
 
@@ -68,21 +69,18 @@ class LLMInterface:
             low_cpu_mem_usage=True
         )
         
-        # Generation config
-        self.generation_config = GenerationConfig(
-            temperature=temperature if temperature > 0 else 1e-7,
-            do_sample=temperature > 0,
-            max_new_tokens=max_new_tokens,
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id
-        )
+        # Default generation parameters (sampling toggled per call)
+        self.default_max_new_tokens = max_new_tokens
+        self.default_temperature = temperature
     
     def generate(
-        self, 
+        self,
         prompt: str,
         max_new_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
-        return_logprobs: bool = False
+        top_p: Optional[float] = None,
+        stop: Optional[List[str]] = None,
+        return_logprobs: bool = False,
     ) -> LLMOutput:
         """Generate text from prompt."""
         start_time = time.time()
@@ -97,29 +95,46 @@ class LLMInterface:
         
         input_length = inputs['input_ids'].shape[1]
         
-        # Update generation config if needed
-        gen_config = self.generation_config
-        if max_new_tokens is not None:
-            gen_config.max_new_tokens = max_new_tokens
-        if temperature is not None:
-            gen_config.temperature = temperature if temperature > 0 else 1e-7
-            gen_config.do_sample = temperature > 0
-        
+        # Resolve generation parameters
+        max_tokens = max_new_tokens if max_new_tokens is not None else self.default_max_new_tokens
+        temp = temperature if temperature is not None else self.default_temperature
+        do_sample = temp is not None and temp > 0
+        top_p_val = top_p if top_p is not None else 1.0
+
+        generation_kwargs = dict(
+            **inputs,
+            max_new_tokens=max_tokens,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+            do_sample=do_sample,
+            output_scores=return_logprobs,
+            return_dict_in_generate=True,
+        )
+
+        # Only pass temperature when sampling is enabled
+        if do_sample:
+            generation_kwargs["temperature"] = temp
+            generation_kwargs["top_p"] = top_p_val
+
         # Generate
         with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                generation_config=gen_config,
-                output_scores=return_logprobs,
-                return_dict_in_generate=True
-            )
-        
+            outputs = self.model.generate(**generation_kwargs)
+
         # Decode output
         generated_ids = outputs.sequences[0][input_length:]
         generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        
-        # Calculate tokens used
-        tokens_used = len(generated_ids) + input_length
+
+        if stop:
+            for s in stop:
+                idx = generated_text.find(s)
+                if idx != -1:
+                    generated_text = generated_text[:idx]
+                    break
+
+        # Calculate token usage
+        prompt_tokens = input_length
+        completion_tokens = len(generated_ids)
+        tokens_used = prompt_tokens + completion_tokens
         
         # Calculate latency
         latency_ms = (time.time() - start_time) * 1000
@@ -136,6 +151,8 @@ class LLMInterface:
             text=generated_text,
             tokens_used=tokens_used,
             latency_ms=latency_ms,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
             logprobs=logprobs
         )
     
@@ -361,13 +378,20 @@ class VLLMInterface:
     def generate(self, prompt: str, **kwargs) -> LLMOutput:
         """Generate using vLLM."""
         start_time = time.time()
-        
+
         # Update sampling params if provided
-        sampling_params = self.sampling_params
-        if 'temperature' in kwargs:
-            sampling_params.temperature = kwargs['temperature']
-        if 'max_new_tokens' in kwargs:
-            sampling_params.max_tokens = kwargs['max_new_tokens']
+        temperature = kwargs.get('temperature', self.sampling_params.temperature)
+        max_tokens = kwargs.get('max_new_tokens', self.sampling_params.max_tokens)
+        top_p = kwargs.get('top_p', getattr(self.sampling_params, 'top_p', 1.0))
+        stop = kwargs.get('stop', None)
+
+        from vllm import SamplingParams
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            stop=stop,
+        )
         
         # Generate
         outputs = self.llm.generate([prompt], sampling_params)
@@ -386,8 +410,21 @@ class VLLMInterface:
     def batch_generate(self, prompts: List[str], **kwargs) -> List[LLMOutput]:
         """Batch generation with vLLM."""
         start_time = time.time()
-        
-        outputs = self.llm.generate(prompts, self.sampling_params)
+
+        from vllm import SamplingParams
+        temperature = kwargs.get('temperature', self.sampling_params.temperature)
+        max_tokens = kwargs.get('max_new_tokens', self.sampling_params.max_tokens)
+        top_p = kwargs.get('top_p', getattr(self.sampling_params, 'top_p', 1.0))
+        stop = kwargs.get('stop', None)
+
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            stop=stop,
+        )
+
+        outputs = self.llm.generate(prompts, sampling_params)
         
         results = []
         for output in outputs:
