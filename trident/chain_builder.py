@@ -2462,8 +2462,11 @@ def extract_object_from_certified_passage(
     # DIRECTOR: "directed by X" or "film directed by X"
     if relation_kind == "DIRECTOR":
         if "directed" not in t_lower and "director" not in t_lower:
+            if debug:
+                print(f"[CERTIFIED-EXTRACT] DIRECTOR: No 'directed'/'director' in passage")
             return None
 
+        # STEP 3 FIX: More robust patterns with better whitespace handling
         # Pattern 1: "directed by Name" (most common)
         # Capture full name including extended Unicode (Polish Ż, etc.)
         # Stops at sentence delimiters: . , ; ( or newline
@@ -2488,13 +2491,14 @@ def extract_object_from_certified_passage(
                 return name
 
         # Pattern 3: "is a ... film directed by Name" (handles adjectives/descriptions)
-        m = re.search(r"(?i)is\s+a\s+\w+\s+film\s+directed\s+by\s+([A-Z][^.,;(\n]+)", t)
+        # STEP 3 FIX: Allow multiple words between "a" and "film" (e.g., "1985 Polish")
+        m = re.search(r"(?i)is\s+a\s+[\w\s]+film\s+directed\s+by\s+([A-Z][^.,;(\n]+)", t)
         if m:
             name = m.group(1).strip()
             name = re.sub(r'[\s,\.\(\)]+$', '', name)
             if _looks_like_person(name):
                 if debug:
-                    print(f"[CERTIFIED-EXTRACT] DIRECTOR: '{name}' from 'is a film directed by' pattern")
+                    print(f"[CERTIFIED-EXTRACT] DIRECTOR: '{name}' from 'is a ... film directed by' pattern")
                 return name
 
         # Pattern 4: "director Name" (e.g., "director Xawery Żuławski")
@@ -2506,6 +2510,9 @@ def extract_object_from_certified_passage(
                 if debug:
                     print(f"[CERTIFIED-EXTRACT] DIRECTOR: '{name}' from 'director X' pattern")
                 return name
+
+        if debug:
+            print(f"[CERTIFIED-EXTRACT] DIRECTOR: No pattern matched (passage has 'directed'/'director' but extraction failed)"
 
     # MOTHER: "mother of X" or "X is the son/daughter of"
     elif relation_kind in ["MOTHER", "PARENT"]:

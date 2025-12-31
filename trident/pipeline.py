@@ -1654,9 +1654,9 @@ class TridentPipeline:
                     print(f"  [BINDING SOURCE] CSS")
                     print(f"  Bound entity (CSS, raw): {bound_entity}")
 
-                # CRITICAL FIX: Expand CSS partial names to full spans
+                # CRITICAL FIX (STEP 2): Expand CSS partial names to full spans
                 # CSS might return "Xawery" when the full name is "Xawery Żuławski"
-                # Expand to the longest capitalized span containing the CSS result
+                # Expand to the LONGEST capitalized span containing the CSS result
                 if binding_passages:
                     passage_text = binding_passages[0].get('text', '')
                     if passage_text and bound_entity in passage_text:
@@ -1673,13 +1673,29 @@ class TridentPipeline:
                             if bound_entity in span and len(span) > len(bound_entity):
                                 candidate_spans.append(span)
 
-                        # Choose the shortest span that contains bound_entity (most specific)
+                        # STEP 2 FIX: Choose the LONGEST span (not shortest)
+                        # Also require at least 2 tokens for person names
                         if candidate_spans:
-                            best_span = min(candidate_spans, key=len)
-                            original_entity = bound_entity
-                            bound_entity = best_span
-                            if debug:
-                                print(f"  [CSS EXPANSION] '{original_entity}' → '{bound_entity}'")
+                            # Check if this is a person-name question
+                            q_lower = query.lower()
+                            is_person_question = any(kw in q_lower for kw in [
+                                'who', 'whose', 'mother', 'father', 'director',
+                                'actor', 'actress', 'author', 'founder', 'spouse'
+                            ])
+
+                            # Filter to spans with at least 2 tokens if it's a person question
+                            if is_person_question and inner_relation_type:
+                                rel_upper = inner_relation_type.upper()
+                                if rel_upper in {"DIRECTOR", "MOTHER", "FATHER", "SPOUSE", "AUTHOR", "FOUNDER"}:
+                                    candidate_spans = [s for s in candidate_spans if len(s.split()) >= 2]
+
+                            if candidate_spans:
+                                # Choose LONGEST span (most complete name)
+                                best_span = max(candidate_spans, key=len)
+                                original_entity = bound_entity
+                                bound_entity = best_span
+                                if debug:
+                                    print(f"  [CSS EXPANSION] '{original_entity}' → '{bound_entity}'")
 
                 if debug:
                     print(f"  Bound entity (CSS, expanded): {bound_entity}")
