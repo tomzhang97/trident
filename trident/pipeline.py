@@ -32,7 +32,7 @@ from .chain_builder import (
     certified_span_select,
     get_winner_passages_only,
     get_winning_passages_from_certificates,
-    typed_extract_from_winning_passage,
+    _normalize_pid_value,
 )
 
 
@@ -564,7 +564,7 @@ class TridentPipeline:
                 seen_pids: Set[str] = set()
                 for info in facet_id_map.values():
                     passage = info.get("passage", {})
-                    pid = passage.get("pid")
+                    pid = _normalize_pid_value(passage.get("pid"))
                     if pid and pid not in seen_pids:
                         seen_pids.add(pid)
                         winning_passages.append(passage)
@@ -586,35 +586,9 @@ class TridentPipeline:
                         is_grounded = True
                         prompt_type = "css"
                     elif css_result.abstain and css_result.reason == "PARSE_ERROR":
-                        # Fallback: use best certified passage for typed extraction
-                        relation_winners = facet_type_map.get('RELATION', []) if facet_type_map else []
-                        fallback_info = relation_winners[0] if relation_winners else None
-
-                        if not fallback_info and facet_id_map:
-                            fallback_info = sorted(
-                                facet_id_map.values(),
-                                key=lambda x: x.get("p_value", 1.0)
-                            )[0]
-
-                        if fallback_info:
-                            fallback_answer = typed_extract_from_winning_passage(
-                                question=query,
-                                relation_info=fallback_info,
-                            )
-
-                            if fallback_answer:
-                                answer = fallback_answer
-                                is_grounded = True
-                                css_abstained = False
-                                prompt_type = "css_parse_fallback"
-                            else:
-                                answer = ABSTAIN_STR
-                                css_abstained = True
-                                prompt_type = "css_abstain"
-                        else:
-                            answer = ABSTAIN_STR
-                            css_abstained = True
-                            prompt_type = "css_abstain"
+                        answer = ABSTAIN_STR
+                        css_abstained = True
+                        prompt_type = "css_parse_error"
                     else:
                         answer = ABSTAIN_STR
                         css_abstained = True

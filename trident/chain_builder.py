@@ -37,6 +37,13 @@ MONTHS = frozenset([
 # CERTIFIED-ONLY HELPER FUNCTIONS
 # =============================================================================
 
+def _normalize_pid_value(pid: str) -> str:
+    """Normalize passage ids for consistent comparisons."""
+    if not pid:
+        return ""
+    return pid.strip().strip("[]").strip()
+
+
 def _cert_pid(certificates: List[Dict[str, Any]]) -> Set[str]:
     """
     Extract certified passage IDs from certificates.
@@ -44,7 +51,11 @@ def _cert_pid(certificates: List[Dict[str, Any]]) -> Set[str]:
     Returns:
         Set of passage IDs that have at least one valid certificate.
     """
-    return {c.get("passage_id", "") for c in certificates if c.get("passage_id")}
+    return {
+        _normalize_pid_value(c.get("passage_id", ""))
+        for c in certificates
+        if c.get("passage_id")
+    }
 
 
 def _norm_ws(s: str) -> str:
@@ -1316,8 +1327,15 @@ def _find_exact_substring(haystack: str, needle: str) -> Optional[Tuple[int, int
     return None
 
 
+def _strip_code_fences(text: str) -> str:
+    """Remove Markdown code fences while preserving inner content."""
+    return re.sub(r"```[a-zA-Z0-9]*\n?(.*?)```", r"\1", text, flags=re.DOTALL)
+
+
 def _extract_first_json_object(text: str) -> str:
-    stripped = text.strip()
+    cleaned = _strip_code_fences(text or "")
+    cleaned = re.sub(r"^\s*//.*$", "", cleaned, flags=re.MULTILINE)
+    stripped = cleaned.strip()
     start = stripped.find("{")
     if start == -1:
         raise ValueError("No JSON object found in text")
@@ -1335,11 +1353,20 @@ def _extract_first_json_object(text: str) -> str:
                 break
 
     if depth != 0 or end_idx == -1:
-        # Fallback: use the widest brace span available rather than failing
+        brace_span = re.search(r"\{[^{}]*\}", stripped, flags=re.DOTALL)
+        if brace_span:
+            return brace_span.group(0)
         last = stripped.rfind("}")
         if last > start:
             end_idx = last
         else:
+            salvage: Dict[str, Any] = {}
+            for key in ["answer", "candidate_index", "confidence", "explanation"]:
+                m = re.search(rf"{key}\s*[:=]\s*['\"]?([^'\"\n\}}]+)", stripped, flags=re.IGNORECASE)
+                if m:
+                    salvage[key] = m.group(1).strip().strip(",")
+            if salvage:
+                return json.dumps(salvage)
             raise ValueError("Unbalanced JSON braces in text")
 
     return stripped[start:end_idx + 1]
@@ -1350,8 +1377,9 @@ def strict_json_call(llm, prompt: str, max_new_tokens: int = 160, temperature: f
 
     This helper centralizes the JSON-only contract so downstream callers do not
     attempt their own permissive parsing. It extracts the first balanced JSON
-    object and ignores any trailing text, while still rejecting code fences or
-    unbalanced braces to avoid ambiguous parses.
+    object (even inside fences or with surrounding chatter) and ignores any
+    trailing text, while still rejecting unbalanced braces to avoid ambiguous
+    parses.
 
     Returns:
         tuple(parsed_json, raw_output)
@@ -2072,13 +2100,13 @@ def get_answer_facet_passages(
     # -----------------------------
     # 1) Certified-only PID scope
     # -----------------------------
-    certified_pids = _cert_pid(certificates)
+    certified_pids = {_normalize_pid_value(pid) for pid in _cert_pid(certificates)}
 
     # Build passage lookup from certified-only pool
     pid_to_passage = {
-        p.get("pid"): p
+        _normalize_pid_value(p.get("pid")): p
         for p in all_passages
-        if p.get("pid") in certified_pids
+        if _normalize_pid_value(p.get("pid")) in certified_pids
     }
 
     # -----------------------------
@@ -2172,8 +2200,12 @@ def constrained_span_select(
         )
 
     if certificates:
-        certified_pids = _cert_pid(certificates)
-        winner_passages = [p for p in winner_passages if p.get("pid") in certified_pids]
+        certified_pids = {_normalize_pid_value(pid) for pid in _cert_pid(certificates)}
+        winner_passages = [
+            p
+            for p in winner_passages
+            if _normalize_pid_value(p.get("pid")) in certified_pids
+        ]
         if not winner_passages:
             return ConstrainedSelectionResult(
                 answer="",
@@ -2313,8 +2345,10 @@ def bind_entity_via_css(
         return None
 
     if certificates:
-        certified_pids = _cert_pid(certificates)
-        hop1_passages = [p for p in hop1_passages if p.get("pid") in certified_pids]
+        certified_pids = {_normalize_pid_value(pid) for pid in _cert_pid(certificates)}
+        hop1_passages = [
+            p for p in hop1_passages if _normalize_pid_value(p.get("pid")) in certified_pids
+        ]
         if not hop1_passages:
             return None
 
@@ -2462,12 +2496,12 @@ def get_winner_passages_only(
         return []
 
     # CERTIFIED-ONLY: Get set of certified passage IDs
-    certified_pids = _cert_pid(certificates)
+    certified_pids = {_normalize_pid_value(pid) for pid in _cert_pid(certificates)}
 
     # Build passage lookup (only certified passages, excluding deny-listed)
     pid_to_passage = {}
     for p in passages:
-        pid = p.get("pid", "")
+        pid = _normalize_pid_value(p.get("pid", ""))
         if pid and pid in certified_pids:
             title = p.get("title", "")
             if not _is_deny_title(title):
@@ -2481,7 +2515,7 @@ def get_winner_passages_only(
     winners = []
 
     for cert in sorted_certs:
-        pid = cert.get("passage_id", "")
+        pid = _normalize_pid_value(cert.get("passage_id", ""))
         # CERTIFIED-ONLY: Must be in pid_to_passage (certified and not deny-listed)
         if pid and pid not in seen_pids and pid in pid_to_passage:
             seen_pids.add(pid)

@@ -44,6 +44,9 @@ def _looks_like_junk_entity(mention: str) -> bool:
     ml = m.lower()
     bad_tokens = {"first", "second", "third", "which", "what", "who", "when", "where", "one", "two", "this", "that", "the", "a", "an", "and", "or"}
     if ml in bad_tokens: return True
+    lead_token = ml.split()[0]
+    if lead_token in {"are", "is", "was", "were", "do", "does", "did", "has", "have", "had", "can", "could", "should", "would", "will", "shall", "may", "might", "must"}:
+        return True
     if len(m.split()) == 1 and len(m) <= 3: return True
     if re.fullmatch(r"\d+(\.\d+)?", ml): return True
     return False
