@@ -14,11 +14,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-try:
-    import spacy
-except Exception:
-    spacy = None
-
 _PUNCT_FIX_RE = re.compile(r"\s+([,.;:?!])")
 _MULTI_SPACE_RE = re.compile(r"\s{2,}")
 _APOS_S_RE = re.compile(r"\s+'s\b", re.IGNORECASE)
@@ -43,23 +38,6 @@ def _safe_phrase(s: str) -> str:
     s = s.strip("`\"' ")
     return _clean_text(s)
 
-def _normalize_relation_predicate(pred: str) -> str:
-    pred = _clean_text(pred).lower().strip()
-    mapping = {
-        "capital_of": "is the capital of",
-        "located_in": "is located in",
-        "created": "was created by",
-        "directed": "was directed by",
-        "written": "was written by",
-        "produced": "was produced by",
-        "founded": "was founded by",
-        "related_to": "is related to",
-        "features": "features"
-    }
-    for k, v in mapping.items():
-        if k in pred: return v
-    return pred or "is related to"
-
 def _looks_like_junk_entity(mention: str) -> bool:
     m = _safe_phrase(mention)
     if not m: return True
@@ -69,6 +47,14 @@ def _looks_like_junk_entity(mention: str) -> bool:
     if len(m.split()) == 1 and len(m) <= 3: return True
     if re.fullmatch(r"\d+(\.\d+)?", ml): return True
     return False
+
+# WH-words and generic terms that should not be treated as real RELATION endpoints
+_RELATION_WH_WORDS = {"who", "what", "which", "when", "where", "why", "how", "whom", "whose"}
+_RELATION_GENERIC = {"the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are",
+                     "was", "were", "be", "been", "being", "have", "has", "had", "do", "does",
+                     "did", "will", "would", "could", "should", "may", "might", "must", "shall",
+                     "director", "film", "movie", "actor", "actress", "person", "thing", "place",
+                     "name", "title", "author", "writer", "book", "song", "album", "band", "group"}
 
 def _dedupe_strings(xs: List[str]) -> List[str]:
     seen: Set[str] = set()
@@ -81,6 +67,57 @@ def _dedupe_strings(xs: List[str]) -> List[str]:
         seen.add(key)
         out.append(x)
     return out
+
+
+def _dedupe_entities_by_longest_span(mentions: List[str]) -> List[str]:
+    """
+    Deduplicate entity mentions by keeping only the longest span.
+
+    If 'Michael' and 'Michael Doeberl' both exist, drop 'Michael'.
+    This prevents partial matches from covering wrong passages.
+
+    Example:
+        Input: ['Michael', 'Michael Doeberl', 'Edward', 'Edward Dearle']
+        Output: ['Michael Doeberl', 'Edward Dearle']
+    """
+    if not mentions:
+        return []
+
+    # Normalize and dedupe exact matches first
+    normalized = []
+    seen_lower = set()
+    for m in mentions:
+        m = _safe_phrase(m)
+        if not m:
+            continue
+        m_lower = m.lower()
+        if m_lower not in seen_lower:
+            seen_lower.add(m_lower)
+            normalized.append(m)
+
+    if not normalized:
+        return []
+
+    # Sort by length descending so we check longer spans first
+    by_length = sorted(normalized, key=lambda x: len(x), reverse=True)
+
+    # Keep only mentions that are not substrings of a longer mention
+    result = []
+    for m in by_length:
+        m_lower = m.lower()
+        # Check if this mention is a substring of any already-kept mention
+        is_substring = False
+        for kept in result:
+            kept_lower = kept.lower()
+            # Check if m is a proper substring (not equal)
+            if m_lower != kept_lower and m_lower in kept_lower:
+                is_substring = True
+                break
+        if not is_substring:
+            result.append(m)
+
+    return result
+
 
 class FacetType(Enum):
     ENTITY = "ENTITY"
@@ -99,6 +136,162 @@ class FacetType(Enum):
     def core_types(cls) -> list:
         return [cls.ENTITY, cls.RELATION, cls.TEMPORAL, cls.NUMERIC, cls.BRIDGE_HOP]
 
+
+def instantiate_facets(
+    facets: List["Facet"],
+    bindings: Dict[str, str]
+) -> List["Facet"]:
+    """
+    Replace symbolic placeholders in facet templates with concrete bound entities.
+
+    This is the REQUIRED facet instantiation step for hop-2 facets in
+    two-pass Certified Adaptive Safe-Cover.
+
+    Example:
+        bindings = {"DIRECTOR_RESULT": "Xawery Żuławski"}
+
+        Input facet template:
+            {"subject": "[DIRECTOR_RESULT]", "predicate": "'s mother", ...}
+
+        Output facet template:
+            {"subject": "Xawery Żuławski", "predicate": "'s mother", ...}
+
+    CRITICAL: The output facets are NEW objects. Original facets are not mutated.
+
+    Args:
+        facets: List of facets (possibly containing placeholders like [VAR_RESULT])
+        bindings: Dict mapping variable names to bound entity values
+                  e.g., {"DIRECTOR_RESULT": "Xawery Żuławski"}
+
+    Returns:
+        List of new facets with placeholders replaced by concrete values
+    """
+    import os
+    debug = os.environ.get("TRIDENT_DEBUG_INSTANTIATE", "0") == "1"
+
+    if not bindings:
+        return list(facets)
+
+    new_facets = []
+    for facet in facets:
+        # Build new template with placeholders replaced
+        old_tpl = facet.template or {}
+        new_tpl = dict(old_tpl)  # Shallow copy
+
+        # Track if we made any replacements
+        replaced = False
+
+        # Fields that may contain placeholders
+        placeholder_fields = ["subject", "object", "hypothesis", "entity1", "entity2", "bridge_entity"]
+
+        for field in placeholder_fields:
+            if field not in new_tpl:
+                continue
+            value = str(new_tpl[field] or "")
+
+            # Replace each binding
+            for var_name, entity_value in bindings.items():
+                placeholder = f"[{var_name}]"
+                if placeholder in value:
+                    new_value = value.replace(placeholder, entity_value)
+                    new_tpl[field] = new_value
+                    replaced = True
+
+                    if debug:
+                        print(f"[INSTANTIATE] {facet.facet_id} field={field}: "
+                              f"'{value}' -> '{new_value}'")
+
+        # Also update metadata to mark as instantiated
+        old_meta = facet.metadata or {}
+        new_meta = dict(old_meta)
+        if replaced:
+            new_meta["instantiated"] = True
+            new_meta["bindings_applied"] = list(bindings.keys())
+
+        # ================================================================
+        # PARENT NORMALIZATION: Normalize MOTHER/FATHER to PARENT for scoring
+        # ================================================================
+        # Evidence often says "X is the son of Y" which doesn't contain "mother".
+        # NLI fails to entail "mother of X" from "son of Y" reliably.
+        # Fix: Score as PARENT (hypothesis: "The passage states a parent of X")
+        # and gate anchors include {mother, father, son of, daughter of, parent}.
+        # Keep outer_relation_type for reporting/analysis.
+        outer_rel = new_tpl.get("outer_relation_type", "")
+        if outer_rel in ("MOTHER", "FATHER"):
+            new_tpl["scoring_relation_kind"] = "PARENT"
+            if debug:
+                print(f"[INSTANTIATE] {facet.facet_id} normalized {outer_rel} -> scoring_relation_kind=PARENT")
+
+        # Create new facet with updated template
+        # Note: Facet is frozen=True, so we create a new instance
+        new_facet = Facet(
+            facet_id=facet.facet_id,
+            facet_type=facet.facet_type,
+            template=new_tpl,
+            weight=facet.weight,
+            metadata=new_meta,
+            required=facet.required,  # Preserve required flag
+        )
+        new_facets.append(new_facet)
+
+    return new_facets
+
+
+def is_wh_question(question: str) -> bool:
+    """Check if question is a WH-question (who, what, where, when, which, how)."""
+    q_lower = question.lower().strip()
+    wh_starters = ('who ', 'what ', 'where ', 'when ', 'which ', 'how ', 'whose ')
+    return q_lower.startswith(wh_starters) or any(f' {w}' in q_lower[:30] for w in ['who', 'what', 'where', 'when', 'which'])
+
+
+def mark_required_facets(
+    facets: List["Facet"],
+    question: str,
+    require_relation: bool = False,
+) -> List["Facet"]:
+    """
+    Mark RELATION facets as required for WH-questions.
+
+    For questions like "Who is X?" or "Where was Y born?", the RELATION facet
+    MUST be covered for a valid answer. Without it, the answer is unreliable.
+
+    Args:
+        facets: List of facets
+        question: The original question
+
+    Returns:
+        List of facets with required flags set appropriately
+    """
+    if not (require_relation or is_wh_question(question)):
+        return facets
+
+    import os
+    debug = os.environ.get("TRIDENT_DEBUG_REQUIRED", "0") == "1"
+
+    new_facets = []
+    for facet in facets:
+        # Mark RELATION facets as required for WH-questions
+        if facet.facet_type == FacetType.RELATION:
+            if not facet.required:
+                # Create new facet with required=True
+                new_facet = Facet(
+                    facet_id=facet.facet_id,
+                    facet_type=facet.facet_type,
+                    template=facet.template,
+                    weight=facet.weight,
+                    metadata=facet.metadata,
+                    required=True,
+                )
+                if debug:
+                    print(f"[REQUIRED] Marking RELATION facet as required: {facet.facet_id}")
+                new_facets.append(new_facet)
+            else:
+                new_facets.append(facet)
+        else:
+            new_facets.append(facet)
+
+    return new_facets
+
 @dataclass(frozen=True)
 class Facet:
     facet_id: str
@@ -106,6 +299,7 @@ class Facet:
     template: Dict[str, Any]
     weight: float = 1.0
     metadata: Dict[str, Any] = None
+    required: bool = False  # If True, this facet MUST be covered for certification
 
     def __post_init__(self):
         if self.metadata is None:
@@ -121,16 +315,19 @@ class Facet:
         if ft == FacetType.ENTITY:
             mention = _safe_phrase(tpl.get("mention", ""))
             if passage_text:
+                # Try to extract context like "X is a Y" or "X, a Y"
                 pat1 = re.search(rf"\b{re.escape(mention)}\s+(?:is|was|are|were)\s+(?:an?|the)\s+([^,.]+)", passage_text, re.IGNORECASE)
                 if pat1 and len(pat1.group(1).split()) < 10:
                     return _ensure_sentence(f"{mention} is {pat1.group(1)}")
                 pat2 = re.search(rf"\b{re.escape(mention)}\s*[,(]\s*(?:an?|the)\s+([^,)]+)", passage_text, re.IGNORECASE)
                 if pat2 and len(pat2.group(1).split()) < 10:
                     return _ensure_sentence(f"{mention} is {pat2.group(1)}")
-            return _ensure_sentence(f'The passage identifies "{mention}" unambiguously (e.g. by definition, role, or unique context), not merely mentions the phrase.')
+            # Simple fallback: just check if the passage contains the entity
+            # Previous hypothesis was too strict ("identifies unambiguously") for NLI
+            return _ensure_sentence(f'The passage mentions "{mention}".')
 
         if ft == FacetType.NUMERIC:
-            entity = _safe_phrase(tpl.get("entity", "")) 
+            entity = _safe_phrase(tpl.get("entity", ""))
             value = _safe_phrase(tpl.get("value", ""))
             unit = _safe_phrase(tpl.get("unit", ""))
             attr = _safe_phrase(tpl.get("attribute", ""))
@@ -139,10 +336,32 @@ class Facet:
             return _ensure_sentence(f"The passage binds the value {val_str} to a specific property")
 
         if ft == FacetType.RELATION:
-            s = tpl.get('subject', '')
-            o = tpl.get('object', '')
-            p = _normalize_relation_predicate(tpl.get('predicate', ''))
-            return _ensure_sentence(f"The passage states that {s} {p} {o}")
+            custom_hyp = tpl.get("custom_hypothesis")
+            if custom_hyp:
+                return _ensure_sentence(str(custom_hyp))
+
+            subject = _safe_phrase(tpl.get("subject", ""))
+            predicate = _safe_phrase(tpl.get("predicate", ""))
+            obj = _safe_phrase(tpl.get("object", ""))
+            relation_kind = _safe_phrase(tpl.get("relation_kind", ""))
+            is_wh_subject = bool((self.metadata or {}).get("is_wh_subject"))
+
+            # WH-subject: use existential hypothesis entailed by typical passive phrasing
+            if is_wh_subject:
+                anchor = obj or subject or "the topic"
+                if relation_kind.upper() == "DIRECTOR" or "direct" in predicate.lower():
+                    return _ensure_sentence(f"{anchor} was directed by someone")
+                if relation_kind.upper() == "MOTHER":
+                    return _ensure_sentence(f"Someone is the mother of {anchor}")
+                if relation_kind.upper() == "FATHER":
+                    return _ensure_sentence(f"Someone is the father of {anchor}")
+                if relation_kind.upper() == "PARENT":
+                    return _ensure_sentence(f"Someone is a parent of {anchor}")
+                return _ensure_sentence(f"Someone is related to {anchor}")
+
+            anchor = obj or subject or "the topic"
+            core = predicate if predicate else "is related to"
+            return _ensure_sentence(f"The passage states that {anchor} {core}.")
 
         if ft == FacetType.TEMPORAL:
             time = tpl.get('time', '')
@@ -236,6 +455,7 @@ class Facet:
             "template": self.template,
             "weight": self.weight,
             "metadata": self.metadata,
+            "required": self.required,
         }
 
     @classmethod
@@ -246,18 +466,112 @@ class Facet:
             template=data["template"],
             weight=data.get("weight", 1.0),
             metadata=data.get("metadata"),
+            required=data.get("required", False),
         )
 
 class FacetMiner:
-    def __init__(self, config: Any):
-        self.config = config
-        self.nlp = None
-        if spacy is not None:
-            try: self.nlp = spacy.load("en_core_web_sm")
-            except Exception: self.nlp = None
 
-    def extract_facets(self, query: str, supporting_facts: Optional[List[Tuple[str, int]]] = None) -> List[Facet]:
+    def __init__(self, config: Any, llm: Optional[Any] = None):
+        self.config = config
+
+        # Optional LLM for query-time facet planning / relation classification.
+        # Kept None-safe: all LLM-driven behavior is gated by config/env flags.
+        self.llm = llm
+
+        # NLP dependency removed for stability; keep attribute for compatibility.
+        self.nlp = None
+
+    def _relation_facet_builder(
+        self,
+        facet_id: str,
+        template: Dict[str, Any],
+        *,
+        weight: float = 1.0,
+        metadata: Optional[Dict[str, Any]] = None,
+        text: Optional[str] = None,
+        normalize: bool = True,
+    ) -> Optional[Facet]:
+        """Construct a RELATION facet with WH detection and placeholder gating."""
+
+        def _is_placeholder(x: str) -> bool:
+            x = (x or "").strip().lower()
+            return (not x) or (x in {"?", "person", "someone", "something"}) or x in {
+                "who",
+                "what",
+                "where",
+                "when",
+                "which",
+                "whom",
+                "whose",
+                "why",
+                "how",
+            }
+
+        tpl = dict(template or {})
+
+        subject_str = str(tpl.get("subject", ""))
+        object_str = str(tpl.get("object", ""))
+        if _is_placeholder(subject_str) and _is_placeholder(object_str):
+            return None
+
+        subj = subject_str.strip().lower()
+        meta = dict(metadata or {})
+        is_wh_subject = meta.get("is_wh_subject")
+        if is_wh_subject is None:
+            is_wh_subject = subj in {
+                "who",
+                "what",
+                "where",
+                "when",
+                "which",
+                "whom",
+                "whose",
+                "why",
+                "how",
+            }
+
+        meta["is_wh_subject"] = bool(is_wh_subject)
+        if text:
+            meta.setdefault("debug_text", text)
+        if meta["is_wh_subject"]:
+            tpl["anchor_policy"] = "ANY"
+
+        return Facet(
+            facet_id=facet_id,
+            facet_type=FacetType.RELATION,
+            template=tpl,
+            weight=weight,
+            metadata=meta,
+        )
+
+    def _build_relation_facet(
+        self,
+        facet_id: str,
+        template: Dict[str, Any],
+        *,
+        weight: float = 1.0,
+        metadata: Optional[Dict[str, Any]] = None,
+        text: Optional[str] = None,
+        normalize: bool = True,
+    ) -> Optional[Facet]:
+        """Wrapper to keep backward compatibility with callers expecting this name."""
+
+        return self._relation_facet_builder(
+            facet_id,
+            template,
+            weight=weight,
+            metadata=metadata,
+            text=text,
+            normalize=normalize,
+        )
+
+    def extract_facets(
+        self,
+        query: str,
+        supporting_facts: Optional[List[Tuple[str, int]]] = None,
+    ) -> List[Facet]:
         query = _clean_text(query)
+
         facets: List[Facet] = []
         facets.extend(self._extract_entity_facets(query))
         facets.extend(self._extract_relation_facets(query))
@@ -265,14 +579,7 @@ class FacetMiner:
         facets.extend(self._extract_numeric_facets(query))
         facets.extend(self._extract_comparison_facets(query))
         facets.extend(self._extract_causal_facets(query))
-        
-        dataset = str(getattr(self.config, "dataset", "")).lower()
-        if "hotpot" not in dataset:
-            facets.extend(self._extract_procedural_facets(query))
-        
-        if self._is_multi_hop(query):
-            facets.extend(self._extract_bridge_facets(query, supporting_facts))
-            
+
         return self._deduplicate_facets(facets)
 
     # ---- entity ----
@@ -287,38 +594,147 @@ class FacetMiner:
 
     def _extract_entity_facets(self, query: str) -> List[Facet]:
         mentions: List[str] = []
-        if self.nlp is not None:
-            doc = self.nlp(query)
-            for ent in doc.ents:
-                m = (ent.text or "").strip()
-                if not _looks_like_junk_entity(m): mentions.append(m)
         mentions.extend(self._extract_or_entities(query))
         if not mentions:
-            mentions.extend(re.findall(r"\b[A-Z][A-Za-z0-9']+(?:\s+[A-Z][A-Za-z0-9']+)*\b", query))
-        mentions = [m for m in _dedupe_strings(mentions) if not _looks_like_junk_entity(m)]
+            mentions.extend(re.findall(r"\b[A-Z][A-Za-z0-9'\-’]+(?:\s+[A-Z][A-Za-z0-9'\-’]+)*\b", query))
+        # CRITICAL: Use longest-span dedup to prevent "Michael" when "Michael Doeberl" exists
+        # This prevents partial matches from covering wrong passages
+        mentions = [m for m in _dedupe_entities_by_longest_span(mentions) if not _looks_like_junk_entity(m)]
         return [Facet(facet_id=f"entity_{i}", facet_type=FacetType.ENTITY, template={"mention": _safe_phrase(m)}) for i, m in enumerate(mentions)]
 
-    # ---- relation (FIXED) ----
+    # ---- relation (planned or heuristic) ----
     def _extract_relation_facets(self, query: str) -> List[Facet]:
+        q = query.lower()
         facets: List[Facet] = []
-        patterns = [
-            (r"(.+?)\s+(?:is|was|were|are)\s+(?:founded|created|written|directed|produced)\s+by\s+(.+?)(?:\?|$)", "created"),
-            (r"(.+?)\s+(?:is|was|are|were)\s+the\s+capital\s+of\s+(.+?)(?:\?|$)", "capital_of"),
-            (r"(.+?)\s+(?:is|was|are|were)\s+(?:located|situated)\s+in\s+(.+?)(?:\?|$)", "located_in"),
-            (r"(.+?)\s+(?:is|was|are|were)\s+(.+?)\s+of\s+(.+?)(?:\?|$)", "related_to"),
-        ]
-        q = _clean_text(query)
-        for pat, rel_type in patterns:
-            for m in re.finditer(pat, q, flags=re.IGNORECASE):
-                g = []
-                for grp in m.groups():
-                    clean = _safe_phrase(grp)
-                    clean = re.sub(r"^(which|what|who|where|when|why|how)\s+\w+\s*", "", clean, flags=re.IGNORECASE).strip()
-                    clean = re.sub(r"^(which|what|who|where|when|why|how)\s+(?:of\s+the\s+following\s+)?", "", clean, flags=re.IGNORECASE).strip()
-                    g.append(clean)
-                
-                if len(g) < 2 or not g[0] or not g[-1]: continue
-                facets.append(Facet(facet_id=f"relation_{len(facets)}", facet_type=FacetType.RELATION, template={"subject": g[0], "predicate": rel_type, "object": g[-1]}))
+
+        ents = self._extract_entity_facets(query)
+
+        def _choose_anchor(entity_facets: List[Facet]) -> str:
+            mentions: List[str] = []
+            for e in entity_facets:
+                mention = _safe_phrase((e.template or {}).get("mention", ""))
+                if mention:
+                    mentions.append(mention)
+
+            if not mentions:
+                return ""
+
+            generic_singletons = {"film", "movie", "person", "someone", "something", "director"}
+
+            def _score(m: str) -> Tuple[int, int]:
+                tokens = m.split()
+                if len(tokens) == 1 and tokens[0].lower() in generic_singletons:
+                    return (-1, len(m))
+                return (1 if len(tokens) > 1 else 0, len(m))
+
+            mentions.sort(key=_score, reverse=True)
+            return mentions[0]
+
+        anchor = _choose_anchor(ents)
+
+        def _matches_mother(question_text: str) -> bool:
+            return bool(
+                re.search(r"\bwho\b[^?]*\bmother of\b", question_text)
+                or re.search(r"\bmother of\b[^?]*\bwho\b", question_text)
+            )
+
+        def _matches_director(question_text: str) -> bool:
+            return bool(
+                re.search(r"\bwho\b[^?]*\bdirector of\b", question_text)
+                or re.search(r"\bdirector of\b[^?]*\bwho\b", question_text)
+                or re.search(r"\bwho\b[^?]*\bdirected\b", question_text)
+            )
+
+        nested_parent_match = re.search(
+            r"\b(mother|father|parent|son|daughter|child|spouse|wife|husband)\s+of\s+the\s+director\s+of\b",
+            q,
+        )
+
+        if anchor and nested_parent_match:
+            relation_token = nested_parent_match.group(1).lower()
+            relation_map = {
+                "mother": "MOTHER",
+                "father": "FATHER",
+                "parent": "PARENT",
+                "son": "CHILD",
+                "daughter": "CHILD",
+                "child": "CHILD",
+                "spouse": "SPOUSE",
+                "wife": "SPOUSE",
+                "husband": "SPOUSE",
+            }
+
+            outer_relation = relation_map.get(relation_token, "PARENT")
+            predicate_text = f"{relation_token} of" if relation_token not in {"son", "daughter", "child"} else "child of"
+
+            hop1 = self._relation_facet_builder(
+                "rel_director_hop1",
+                template={
+                    "relation_kind": "DIRECTOR",
+                    "subject": "?",
+                    "object": anchor,
+                    "predicate": "directed",
+                    "answer_role": "subject",
+                    "inner_relation_type": "DIRECTOR",
+                    "compositional": True,
+                    "hop": 1,
+                },
+                metadata={"is_wh_subject": True},
+            )
+
+            hop2 = self._relation_facet_builder(
+                f"rel_{relation_token}_of_director_hop2",
+                template={
+                    "relation_kind": outer_relation,
+                    "subject": "?",
+                    "object": "[DIRECTOR_RESULT]",
+                    "bridge_entity": "[DIRECTOR_RESULT]",
+                    "predicate": predicate_text,
+                    "answer_role": "subject",
+                    "outer_relation_type": outer_relation,
+                    "inner_relation_type": "DIRECTOR",
+                    "hop": 2,
+                },
+                metadata={"is_wh_subject": True},
+            )
+
+            if hop1:
+                facets.append(hop1)
+            if hop2:
+                facets.append(hop2)
+
+            return facets
+
+        elif anchor and _matches_mother(q):
+            rel = self._relation_facet_builder(
+                "rel_mother",
+                template={
+                    "relation_kind": "MOTHER",
+                    "subject": "?",
+                    "object": anchor,
+                    "predicate": "mother",
+                    "answer_role": "subject",
+                },
+                metadata={"is_wh_subject": True},
+            )
+            if rel:
+                facets.append(rel)
+
+        if anchor and _matches_director(q):
+            rel = self._relation_facet_builder(
+                "rel_director",
+                template={
+                    "relation_kind": "DIRECTOR",
+                    "subject": "?",
+                    "object": anchor,
+                    "predicate": "directed",
+                    "answer_role": "subject",
+                },
+                metadata={"is_wh_subject": True},
+            )
+            if rel:
+                facets.append(rel)
+
         return facets
 
     # ---- temporal ----
@@ -336,30 +752,13 @@ class FacetMiner:
     def _extract_numeric_facets(self, query: str) -> List[Facet]:
         facets: List[Facet] = []
         numeric_pattern = r"\b(\d+(?:\.\d+)?)\s*(%|percent|million|billion|thousand|hundred)?\b"
-        doc = self.nlp(query) if self.nlp else None
-        
         for m in re.finditer(numeric_pattern, query, flags=re.IGNORECASE):
             value = _safe_phrase(m.group(1))
             unit = _safe_phrase(m.group(2) or "")
             if not value: continue
-            
+
             entity, attribute = "", ""
-            if doc:
-                val_start, val_end = m.span(1)
-                for token in doc:
-                    if token.idx >= val_start and token.idx < val_end:
-                        head = token.head
-                        if head.pos_ in ["NOUN", "PROPN"]:
-                            attribute = head.text
-                            for child in head.children:
-                                if child.dep_ == "prep" and child.text == "of":
-                                    for pobj in child.children:
-                                        if pobj.dep_ == "pobj": entity = self._get_compound_noun(pobj)
-                        if head.dep_ == "prep" and head.head.pos_ == "VERB":
-                            attribute = head.head.text
-                            for child in head.head.children:
-                                if child.dep_ in ["nsubj", "nsubjpass"]: entity = self._get_compound_noun(child)
-            
+
             if not entity and not attribute:
                 q_lower = query.lower()
                 if "population" in q_lower: attribute = "population"
@@ -369,12 +768,6 @@ class FacetMiner:
             
             facets.append(Facet(facet_id=f"numeric_{len(facets)}", facet_type=FacetType.NUMERIC, template={"value": value, "unit": unit, "entity": entity, "attribute": attribute}))
         return facets
-
-    def _get_compound_noun(self, token) -> str:
-        phrase = token.text
-        lefts = sorted([t for t in token.lefts if t.dep_ in ["compound", "det", "amod"]], key=lambda t: t.i)
-        if lefts: phrase = f"{' '.join(t.text for t in lefts)} {phrase}"
-        return phrase
 
     # ---- comparison ----
     def _extract_comparison_facets(self, query: str) -> List[Facet]:
@@ -393,46 +786,6 @@ class FacetMiner:
         if any(re.search(p, q) for p in causal_patterns):
             facets.append(Facet(facet_id="causal_0", facet_type=FacetType.CAUSAL, template={"trigger": "causal"}))
         return facets
-
-    def _extract_procedural_facets(self, query: str) -> List[Facet]:
-        facets: List[Facet] = []
-        q = query.lower()
-        procedural_patterns = [r"\bhow\s+to\b", r"\bwhat\s+are\s+the\s+steps\b", r"\bsteps?\s+to\b", r"\bprocedure\b", r"\bwalk\s+me\s+through\b", r"\bprocess\s+for\b", r"\bmethod\s+for\b"]
-        if any(re.search(p, q) for p in procedural_patterns):
-            facets.append(Facet(facet_id="procedural_0", facet_type=FacetType.PROCEDURAL, template={"trigger": "procedural"}))
-        return facets
-
-    # ---- bridge (GENERIC HOPS) ----
-    def _extract_bridge_facets(self, query: str, supporting_facts: Optional[List[Tuple[str, int]]] = None) -> List[Facet]:
-        facets: List[Facet] = []
-        if not supporting_facts: return facets
-        
-        titles = _dedupe_strings([t for t, _ in supporting_facts])
-        if len(titles) < 2: return facets
-
-        q_lower = query.lower()
-        relation = "is related to"
-        if "guest appearance" in q_lower: relation = "includes guest appearances from"
-        elif "feature" in q_lower: relation = "features"
-        elif "directed" in q_lower: relation = "was directed by"
-        elif "written" in q_lower: relation = "was written by"
-        elif "located" in q_lower: relation = "is located in"
-
-        # Generate adjacent hops for any length (2, 3, 4...)
-        # Uses generic BRIDGE_HOP type.
-        for i in range(len(titles) - 1):
-            e1, e2 = titles[i], titles[i+1]
-            facets.append(Facet(
-                facet_id=f"bridge_hop_{i+1}",
-                facet_type=FacetType.BRIDGE_HOP,
-                template={"entity1": e1, "relation": relation, "bridge_entity": e2, "hop": i+1}
-            ))
-            
-        return facets
-
-    def _is_multi_hop(self, query: str) -> bool:
-        q = query.lower()
-        return (" and " in q and " which " in q) or sum(1 for s in [" and ", " both ", " which "] if s in q) >= 2
 
     def _extract_temporal_event(self, query: str, time_span: Tuple[int, int]) -> str:
         start = max(0, time_span[0] - 30)

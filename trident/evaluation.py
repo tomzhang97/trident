@@ -65,26 +65,33 @@ class BenchmarkEvaluator:
         coverage_rates = []
         
         for pred, ref in zip(predictions, references):
-            # Handle abstentions
+            # Handle abstentions - count as 0 EM/F1 (don't skip!)
             if pred.get('abstained', False):
                 abstention_count += 1
+                em_scores.append(0.0)
+                f1_scores.append(0.0)
                 continue
-            
+
             # Exact Match and F1
             pred_answer = self._normalize_answer(pred.get('prediction', ''))
             ref_answers = ref.get('answer', [])
             if isinstance(ref_answers, str):
                 ref_answers = [ref_answers]
-            
-            # Compute EM
-            em = max(self._exact_match(pred_answer, self._normalize_answer(ans)) 
-                    for ans in ref_answers)
-            em_scores.append(em)
-            
-            # Compute F1
-            f1 = max(self._f1_score(pred_answer, self._normalize_answer(ans)) 
-                    for ans in ref_answers)
-            f1_scores.append(f1)
+
+            # Handle empty ref_answers
+            if not ref_answers:
+                em_scores.append(0.0)
+                f1_scores.append(0.0)
+            else:
+                # Compute EM
+                em = max(self._exact_match(pred_answer, self._normalize_answer(ans))
+                        for ans in ref_answers)
+                em_scores.append(em)
+
+                # Compute F1
+                f1 = max(self._f1_score(pred_answer, self._normalize_answer(ans))
+                        for ans in ref_answers)
+                f1_scores.append(f1)
             
             # Support EM/F1 for multi-hop
             if 'support_em' in self.metrics_to_compute:
@@ -133,43 +140,61 @@ class BenchmarkEvaluator:
         )
     
     def _normalize_answer(self, text: str) -> str:
-        """Normalize answer for evaluation."""
+        """Normalize answer for evaluation.
+
+        Follows official 2WikiMultiHop evaluation order:
+        1. Remove articles (a, an, the)
+        2. Lowercase
+        3. Remove punctuation
+        4. Normalize whitespace
+        """
+        # Remove articles first (before lowercasing for consistency with official)
+        text = re.sub(r'\b(a|an|the)\b', ' ', text, flags=re.IGNORECASE)
+
         # Convert to lowercase
         text = text.lower()
-        
-        # Remove articles
-        text = re.sub(r'\b(a|an|the)\b', ' ', text)
-        
+
         # Remove punctuation
         text = re.sub(r'[^\w\s]', ' ', text)
-        
+
         # Remove extra whitespace
         text = ' '.join(text.split())
-        
+
         return text.strip()
-    
+
     def _exact_match(self, pred: str, ref: str) -> float:
         """Compute exact match score."""
         return float(pred == ref)
-    
+
     def _f1_score(self, pred: str, ref: str) -> float:
-        """Compute token-level F1 score."""
+        """Compute token-level F1 score.
+
+        Follows official 2WikiMultiHop evaluation:
+        - Special case: if either is yes/no/noanswer, require exact match
+        - Otherwise compute token overlap F1 using Counter
+        """
+        # Special case for yes/no/noanswer
+        special_answers = {'yes', 'no', 'noanswer'}
+        if pred in special_answers or ref in special_answers:
+            return float(pred == ref)
+
         pred_tokens = pred.split()
         ref_tokens = ref.split()
-        
+
         if not pred_tokens or not ref_tokens:
             return 0.0
-        
+
+        # Use Counter for proper handling of duplicate tokens
         common = Counter(pred_tokens) & Counter(ref_tokens)
         num_same = sum(common.values())
-        
+
         if num_same == 0:
             return 0.0
-        
+
         precision = num_same / len(pred_tokens)
         recall = num_same / len(ref_tokens)
         f1 = (2 * precision * recall) / (precision + recall)
-        
+
         return f1
     
     def _support_exact_match(
