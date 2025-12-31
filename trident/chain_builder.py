@@ -1335,7 +1335,12 @@ def _extract_first_json_object(text: str) -> str:
                 break
 
     if depth != 0 or end_idx == -1:
-        raise ValueError("Unbalanced JSON braces in text")
+        # Fallback: use the widest brace span available rather than failing
+        last = stripped.rfind("}")
+        if last > start:
+            end_idx = last
+        else:
+            raise ValueError("Unbalanced JSON braces in text")
 
     return stripped[start:end_idx + 1]
 
@@ -1360,7 +1365,14 @@ def strict_json_call(llm, prompt: str, max_new_tokens: int = 160, temperature: f
         max_new_tokens=max_new_tokens,
     )
     raw_text = raw.text if hasattr(raw, "text") else str(raw)
-    extracted = _extract_first_json_object(raw_text)
+    try:
+        extracted = _extract_first_json_object(raw_text)
+    except Exception:
+        first = raw_text.find("{")
+        last = raw_text.rfind("}")
+        if first == -1 or last == -1 or last <= first:
+            raise
+        extracted = raw_text[first:last + 1]
     try:
         parsed = json.loads(extracted)
     except Exception:
@@ -1426,7 +1438,11 @@ def _coerce_json_object(text: str) -> Optional[dict]:
     try:
         candidate = _extract_first_json_object(text)
     except Exception:
-        return None
+        first = text.find("{")
+        last = text.rfind("}")
+        if first == -1 or last == -1 or last <= first:
+            return None
+        candidate = text[first:last + 1]
 
     # Attempt strict parse first
     try:

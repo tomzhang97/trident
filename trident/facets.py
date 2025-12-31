@@ -645,9 +645,28 @@ class FacetMiner:
                 or re.search(r"\bwho\b[^?]*\bdirected\b", question_text)
             )
 
-        nested_director = bool(re.search(r"\bmother of the director of\b", q))
+        nested_parent_match = re.search(
+            r"\b(mother|father|parent|son|daughter|child|spouse|wife|husband)\s+of\s+the\s+director\s+of\b",
+            q,
+        )
 
-        if anchor and nested_director:
+        if anchor and nested_parent_match:
+            relation_token = nested_parent_match.group(1).lower()
+            relation_map = {
+                "mother": "MOTHER",
+                "father": "FATHER",
+                "parent": "PARENT",
+                "son": "CHILD",
+                "daughter": "CHILD",
+                "child": "CHILD",
+                "spouse": "SPOUSE",
+                "wife": "SPOUSE",
+                "husband": "SPOUSE",
+            }
+
+            outer_relation = relation_map.get(relation_token, "PARENT")
+            predicate_text = f"{relation_token} of" if relation_token not in {"son", "daughter", "child"} else "child of"
+
             hop1 = self._relation_facet_builder(
                 "rel_director_hop1",
                 template={
@@ -664,15 +683,15 @@ class FacetMiner:
             )
 
             hop2 = self._relation_facet_builder(
-                "rel_mother_of_director_hop2",
+                f"rel_{relation_token}_of_director_hop2",
                 template={
-                    "relation_kind": "MOTHER",
+                    "relation_kind": outer_relation,
                     "subject": "?",
                     "object": "[DIRECTOR_RESULT]",
                     "bridge_entity": "[DIRECTOR_RESULT]",
-                    "predicate": "mother of",
+                    "predicate": predicate_text,
                     "answer_role": "subject",
-                    "outer_relation_type": "MOTHER",
+                    "outer_relation_type": outer_relation,
                     "inner_relation_type": "DIRECTOR",
                     "hop": 2,
                 },
@@ -683,6 +702,8 @@ class FacetMiner:
                 facets.append(hop1)
             if hop2:
                 facets.append(hop2)
+
+            return facets
 
         elif anchor and _matches_mother(q):
             rel = self._relation_facet_builder(
