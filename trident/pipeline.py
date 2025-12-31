@@ -32,6 +32,7 @@ from .chain_builder import (
     certified_span_select,
     get_winner_passages_only,
     get_winning_passages_from_certificates,
+    typed_extract_from_winning_passage,
 )
 
 
@@ -543,6 +544,7 @@ class TridentPipeline:
         prompt_type = "none"
         css_result = None
         css_abstained = False
+        facet_type_map: Dict[str, List[Dict[str, Any]]] = {}
         total_tokens = 0
         prompt_tokens = 0
         completion_tokens = 0
@@ -552,7 +554,7 @@ class TridentPipeline:
             facet_dicts = [f.to_dict() for f in facets]
 
             if certificates:
-                facet_id_map, _ = get_winning_passages_from_certificates(
+                facet_id_map, facet_type_map = get_winning_passages_from_certificates(
                     certificates,
                     result['selected_passages'],
                     facet_dicts
@@ -583,6 +585,36 @@ class TridentPipeline:
                         answer = css_result.answer
                         is_grounded = True
                         prompt_type = "css"
+                    elif css_result.abstain and css_result.reason == "PARSE_ERROR":
+                        # Fallback: use best certified passage for typed extraction
+                        relation_winners = facet_type_map.get('RELATION', []) if facet_type_map else []
+                        fallback_info = relation_winners[0] if relation_winners else None
+
+                        if not fallback_info and facet_id_map:
+                            fallback_info = sorted(
+                                facet_id_map.values(),
+                                key=lambda x: x.get("p_value", 1.0)
+                            )[0]
+
+                        if fallback_info:
+                            fallback_answer = typed_extract_from_winning_passage(
+                                question=query,
+                                relation_info=fallback_info,
+                            )
+
+                            if fallback_answer:
+                                answer = fallback_answer
+                                is_grounded = True
+                                css_abstained = False
+                                prompt_type = "css_parse_fallback"
+                            else:
+                                answer = ABSTAIN_STR
+                                css_abstained = True
+                                prompt_type = "css_abstain"
+                        else:
+                            answer = ABSTAIN_STR
+                            css_abstained = True
+                            prompt_type = "css_abstain"
                     else:
                         answer = ABSTAIN_STR
                         css_abstained = True

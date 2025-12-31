@@ -5,6 +5,7 @@ ensuring that the answer is grounded in the actual passages selected.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import string
@@ -1321,10 +1322,6 @@ def _extract_first_json_object(text: str) -> str:
     if start == -1:
         raise ValueError("No JSON object found in text")
 
-    # reject code fences before the JSON
-    if "```" in stripped[:start]:
-        raise ValueError("Code fences found before JSON")
-
     depth = 0
     end_idx = -1
     for idx in range(start, len(stripped)):
@@ -1363,7 +1360,16 @@ def strict_json_call(llm, prompt: str, max_new_tokens: int = 160, temperature: f
         max_new_tokens=max_new_tokens,
     )
     raw_text = raw.text if hasattr(raw, "text") else str(raw)
-    parsed = json.loads(_extract_first_json_object(raw_text))
+    extracted = _extract_first_json_object(raw_text)
+    try:
+        parsed = json.loads(extracted)
+    except Exception:
+        # Best-effort fallback for single-quoted dicts
+        try:
+            parsed = ast.literal_eval(extracted)
+        except Exception as exc:
+            raise ValueError(f"Failed to parse JSON: {exc}")
+
     return parsed, raw
 
 
@@ -1425,6 +1431,11 @@ def _coerce_json_object(text: str) -> Optional[dict]:
     # Attempt strict parse first
     try:
         return json_module.loads(candidate)
+    except Exception:
+        pass
+
+    try:
+        return ast.literal_eval(candidate)
     except Exception:
         pass
 

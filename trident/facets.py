@@ -645,7 +645,46 @@ class FacetMiner:
                 or re.search(r"\bwho\b[^?]*\bdirected\b", question_text)
             )
 
-        if anchor and _matches_mother(q):
+        nested_director = bool(re.search(r"\bmother of the director of\b", q))
+
+        if anchor and nested_director:
+            hop1 = self._relation_facet_builder(
+                "rel_director_hop1",
+                template={
+                    "relation_kind": "DIRECTOR",
+                    "subject": "?",
+                    "object": anchor,
+                    "predicate": "directed",
+                    "answer_role": "subject",
+                    "inner_relation_type": "DIRECTOR",
+                    "compositional": True,
+                    "hop": 1,
+                },
+                metadata={"is_wh_subject": True},
+            )
+
+            hop2 = self._relation_facet_builder(
+                "rel_mother_of_director_hop2",
+                template={
+                    "relation_kind": "MOTHER",
+                    "subject": "?",
+                    "object": "[DIRECTOR_RESULT]",
+                    "bridge_entity": "[DIRECTOR_RESULT]",
+                    "predicate": "mother of",
+                    "answer_role": "subject",
+                    "outer_relation_type": "MOTHER",
+                    "inner_relation_type": "DIRECTOR",
+                    "hop": 2,
+                },
+                metadata={"is_wh_subject": True},
+            )
+
+            if hop1:
+                facets.append(hop1)
+            if hop2:
+                facets.append(hop2)
+
+        elif anchor and _matches_mother(q):
             rel = self._relation_facet_builder(
                 "rel_mother",
                 template={
