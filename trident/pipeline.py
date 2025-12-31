@@ -13,7 +13,7 @@ import torch
 from transformers import AutoTokenizer, AutoModel
 
 from .config import TridentConfig, SafeCoverConfig, ParetoConfig
-from .facets import Facet, FacetMiner, FacetType
+from .facets import Facet, FacetMiner, FacetType, instantiate_facets, mark_required_facets, is_wh_question
 from .candidates import Passage
 from .calibration import ReliabilityCalibrator, CalibrationMonitor
 from .safe_cover import SafeCoverAlgorithm, SafeCoverResult
@@ -25,6 +25,19 @@ from .monitoring import DriftMonitor
 from .logging_utils import TelemetryTracker
 from .vqc import VerifierQueryCompiler
 from .bwk import BwKController
+from .chain_builder import (
+    bind_entity_from_hop1_winner,
+    build_inner_question_from_facet,
+    detect_question_type,
+    extract_candidates,
+    compute_support_score,
+    constrained_span_select,
+    ConstrainedSelectionResult,
+    QuestionType,
+    get_answer_facet_passages,
+    get_winner_passages_only,
+    bind_entity_via_css,
+)
 
 
 @dataclass
@@ -336,7 +349,17 @@ class TridentPipeline:
 
         # Step 1: Facet mining
         facets = self.facet_miner.extract_facets(query, supporting_facts)
-        self.telemetry.log("facet_mining", {"num_facets": len(facets)})
+        use_llm_plan = False
+
+        # Mark RELATION facets as required for WH-questions
+        # This ensures that the key relation must be certified for valid answers
+        facets = mark_required_facets(facets, query)
+
+        self.telemetry.log("facet_mining", {
+            "num_facets": len(facets),
+            "num_required": sum(1 for f in facets if f.required),
+            "is_wh_question": is_wh_question(query),
+        })
 
         # CRITICAL FIX: Handle zero facets early with proper abstention
         if not facets:
@@ -388,10 +411,32 @@ class TridentPipeline:
         # Step 3: Two-stage scoring
         scores = self._two_stage_scoring(passages, facets)
         self.telemetry.log("scoring", {"num_scores": len(scores.stage2_scores)})
-        
+
         # Step 4: Mode-specific selection
+        # For compositional questions, check if we need two-pass certification
+        hop1_facets, hop2_facets = self._split_facets_by_hop(facets)
+        is_compositional = False if use_llm_plan else len(hop2_facets) > 0
+
+        if is_compositional:
+            self.telemetry.log("compositional_detected", {
+                "hop1_facets": len(hop1_facets),
+                "hop2_facets": len(hop2_facets)
+            })
+
         if mode == "safe_cover":
-            result = self._run_safe_cover(facets, passages, scores)
+            if is_compositional:
+                # Use two-pass Certified Adaptive Safe-Cover
+                result = self._run_two_pass_safe_cover(
+                    query=query,
+                    hop1_facets=hop1_facets,
+                    hop2_facets=hop2_facets,
+                    passages=passages,
+                    scores=scores,
+                    context=context
+                )
+            else:
+                # Standard single-pass Safe-Cover
+                result = self._run_safe_cover(facets, passages, scores)
             # CRITICAL FIX: If Safe-Cover is infeasible or abstains, optionally fall back to Pareto
             if result.get('abstained', False) or result.get('infeasible', False):
                 # Access the fallback_to_pareto field directly from the dataclass instance
@@ -730,6 +775,23 @@ class TridentPipeline:
         is_infeasible = result.infeasible
         is_abstained = result.abstained
 
+        # ============================================================
+        # FIX D: STRICT CONTRACT - Required facets must be covered
+        # ============================================================
+        # Even in "relaxed" configs, returning an answer when required facets are
+        # uncovered yields confident-but-wrong behavior (exactly what we're seeing).
+        try:
+            required_ids = [f.facet_id for f in facets if getattr(f, 'required', False)]
+            covered = set(getattr(result, 'covered_facets', []) or [])
+            missing_required = [fid for fid in required_ids if fid not in covered]
+            if missing_required:
+                is_infeasible = True
+                is_abstained = True
+                # attach a reason field so callers can propagate it
+                strict_reason = f"REQUIRED_FACETS_UNCOVERED:{','.join(missing_required[:5])}"
+        except Exception:
+            strict_reason = None
+
         capped_evidence_tokens = (
             min(total_cost, budget_cap) if budget_cap is not None else total_cost
         )
@@ -745,6 +807,7 @@ class TridentPipeline:
             'dual_lower_bound': getattr(result, 'dual_lower_bound', None),
             'retrieval_tokens': total_cost,
             'evidence_tokens': capped_evidence_tokens,
+            'abstention_reason': locals().get('strict_reason', None) or (result.abstention_reason.value if is_abstained else None),
             'metrics': {
                 'coverage': len(result.covered_facets) / len(facets) if facets else 0,
                 'utility': len(result.covered_facets),
@@ -752,7 +815,7 @@ class TridentPipeline:
                 'num_units': len(selected),
                 'num_facets': len(facets),  # CRITICAL FIX: Track num_facets
                 'num_violated_facets': len(result.uncovered_facets),
-                'abstention_reason': result.abstention_reason.value if is_abstained else None,  # Track reason
+                'abstention_reason': locals().get('strict_reason', None) or (result.abstention_reason.value if is_abstained else None),  # FIX D: Track strict reason
                 'evidence_token_cap': budget_cap,
                 'evidence_tokens_raw': total_cost,
                 'evidence_tokens_over_budget': evidence_over_budget,
@@ -904,7 +967,321 @@ class TridentPipeline:
                 'evidence_tokens_over_budget': evidence_over_budget,
             }
         }
-    
+
+    def _split_facets_by_hop(
+        self,
+        facets: List[Facet]
+    ) -> Tuple[List[Facet], List[Facet]]:
+        """
+        Split facets into hop-1 and hop-2 for compositional questions.
+
+        Hop-1 facets have template.hop == 1 or no hop field (default single-hop).
+        Hop-2 facets have template.hop == 2 (depend on hop-1 result).
+
+        Returns:
+            Tuple of (hop1_facets, hop2_facets)
+        """
+        hop1_facets = []
+        hop2_facets = []
+
+        for f in facets:
+            template = f.template or {}
+            hop = template.get('hop', 1)  # Default to hop-1
+
+            if hop == 2:
+                hop2_facets.append(f)
+            else:
+                hop1_facets.append(f)
+
+        return hop1_facets, hop2_facets
+
+    def _run_two_pass_safe_cover(
+        self,
+        query: str,
+        hop1_facets: List[Facet],
+        hop2_facets: List[Facet],
+        passages: List[Passage],
+        scores: TwoStageScores,
+        context: Optional[List[List[str]]] = None
+    ) -> Dict[str, Any]:
+        """
+        FIX B, C, D: Certified Adaptive Safe-Cover for compositional (2-hop) questions.
+
+        Two-stage algorithm with typed binding:
+        1. Stage A: Certify hop-1 facets (find bridge entity)
+        2. Typed bind: Extract bridge entity from hop-1 winner
+        3. Conditioned retrieval: Retrieve using bridge entity + relation keyword
+        4. Stage B: Certify hop-2 facets (find final answer)
+        5. Return union of winners from both stages
+
+        FIX B: ABORT IF CSS BINDING FAILS - don't use garbage fallback
+        FIX C: Infer placeholder keys directly from hop-2 facets
+        FIX D: Strict contract - required facets must be covered
+        """
+        import os
+        debug = os.environ.get("TRIDENT_DEBUG_TWOPASS", "0") == "1"
+
+        if debug:
+            print(f"\n[TWO-PASS] Running Certified Adaptive Safe-Cover")
+            print(f"  Hop-1 facets: {len(hop1_facets)}")
+            print(f"  Hop-2 facets: {len(hop2_facets)}")
+
+        # ============================================================
+        # STAGE A: Certify hop-1 facets
+        # ============================================================
+        hop1_scores = self._two_stage_scoring(hop1_facets, passages)
+        hop1_result = self._run_safe_cover(hop1_facets, passages, hop1_scores)
+
+        if debug:
+            hop1_coverage = hop1_result.get('metrics', {}).get('coverage', 0)
+            print(f"  Hop-1 coverage: {hop1_coverage:.2f}")
+            print(f"  Hop-1 selected: {len(hop1_result.get('selected_passages', []))}")
+
+        # If hop-1 fails completely, we can't proceed with hop-2
+        if hop1_result.get('abstained', False) or not hop1_result.get('certificates'):
+            if debug:
+                print(f"  Hop-1 failed/abstained - returning hop-1 result only")
+            return hop1_result
+
+        # ============================================================
+        # CERTIFIED SPAN SELECTION: Bind bridge entity from hop-1 winners
+        # ============================================================
+        bound_entity = None
+        inner_relation_type = None
+        inner_question = None
+
+        # Get winner passages from hop-1 certificates
+        hop1_certs = hop1_result.get('certificates', [])
+        hop1_winners = get_winner_passages_only(
+            hop1_certs,
+            hop1_result.get('selected_passages', [])
+        )
+
+        if debug:
+            print(f"  Hop-1 winners: {len(hop1_winners)} passages")
+
+        # Find the best certified hop-1 facet and build inner question
+        hop1_certs_sorted = sorted(hop1_certs, key=lambda c: c.get('p_value', 1.0))
+        binding_cert = None
+
+        for hop1_cert in hop1_certs_sorted:
+            cert_fid = hop1_cert.get('facet_id', '')
+
+            for f in hop1_facets:
+                if f.facet_id == cert_fid:
+                    # Check if this is a compositional hop-1 facet
+                    inner_type = f.template.get('inner_relation_type', '')
+                    if inner_type or f.template.get('compositional'):
+                        inner_relation_type = inner_type
+                        binding_cert = hop1_cert
+                        # Build inner question from facet template
+                        inner_question = build_inner_question_from_facet(f.to_dict())
+                        if debug:
+                            print(f"  Inner question: {inner_question}")
+                            print(f"  Binding facet: {cert_fid} (p={hop1_cert.get('p_value', 1.0):.4f})")
+                        break
+            if inner_question:
+                break
+
+        # FIX B: Bind entity only from the binding facet's winning passage
+        binding_passages = hop1_winners
+        if binding_cert:
+            binding_pid = binding_cert.get('passage_id')
+            if binding_pid:
+                pid_to_passage = {p.get('pid'): p for p in hop1_winners}
+                if binding_pid in pid_to_passage:
+                    binding_passages = [pid_to_passage[binding_pid]]
+                    if debug:
+                        print(f"  Using only binding passage: {binding_pid[:12]}...")
+
+        # Use CSS to bind entity (general, relation-agnostic)
+        if inner_question and binding_passages:
+            bound_entity = bind_entity_via_css(
+                llm=self.llm,
+                inner_question=inner_question,
+                hop1_passages=binding_passages,
+                max_chars=600
+            )
+            if debug:
+                print(f"  Bound entity (CSS): {bound_entity}")
+
+        # ================================================================
+        # FIX B: ABORT IF CSS BINDING FAILS - DON'T USE GARBAGE FALLBACK
+        # ================================================================
+        if not bound_entity:
+            if debug:
+                print(f"  Failed to bind entity from hop-1 - ABSTAIN (required hop-2 cannot be certified)")
+            # IMPORTANT: Do NOT return hop-1-only answers for compositional questions
+            hop1_result = dict(hop1_result)
+            hop1_result['abstained'] = True
+            hop1_result['abstention_reason'] = 'BINDING_FAILED'
+            hop1_result['selected_passages'] = hop1_result.get('selected_passages', [])
+            hop1_result['certificates'] = hop1_result.get('certificates', [])
+            return hop1_result
+
+        # ============================================================
+        # FIX C: FACET INSTANTIATION - Infer placeholders from hop-2
+        # ============================================================
+        bindings = {}
+        if inner_relation_type:
+            bindings[f"{inner_relation_type}_RESULT"] = bound_entity
+
+        # If inner_relation_type is missing, infer the placeholder key(s)
+        # directly from hop-2 templates
+        if not bindings:
+            placeholder_re = re.compile(r"\[([A-Z0-9_]+_RESULT)\]")
+            for f in hop2_facets:
+                tpl = f.template or {}
+                for field in ("subject", "object", "predicate", "text", "hypothesis"):
+                    val = str(tpl.get(field, "") or "")
+                    m = placeholder_re.search(val)
+                    if m:
+                        bindings[m.group(1)] = bound_entity
+                        break
+                if bindings:
+                    break
+
+        if debug:
+            print(f"  Bindings: {bindings}")
+
+        # Instantiate hop-2 facets with bound entity
+        hop2_facets = instantiate_facets(hop2_facets, bindings)
+
+        if debug:
+            for f in hop2_facets:
+                tpl = f.template or {}
+                print(f"  Instantiated hop-2 facet: {f.facet_id}")
+                print(f"    subject: {tpl.get('subject', '')}")
+
+        # ============================================================
+        # CONDITIONED CANDIDATE GENERATION: Filter/retrieve for hop-2
+        # ============================================================
+        hop2_passages = list(passages)
+        retrieved_new = 0
+
+        # Get the outer relation keyword from hop-2 facets
+        outer_relation_type = ""
+        outer_relation_keywords = []
+        for f in hop2_facets:
+            outer_type = f.template.get('outer_relation_type', '')
+            if outer_type:
+                outer_relation_type = outer_type
+                keyword_map = {
+                    'MOTHER': ['mother', 'son of', 'daughter of', 'child of', 'parent'],
+                    'FATHER': ['father', 'son of', 'daughter of', 'child of', 'parent'],
+                    'SPOUSE': ['married', 'spouse', 'wife', 'husband', 'wed'],
+                    'CHILD': ['son', 'daughter', 'child', 'parent'],
+                    'NATIONALITY': ['nationality', 'national', 'citizen', 'born in'],
+                    'BIRTHPLACE': ['born', 'birthplace', 'native of', 'birth'],
+                    'AWARD': ['award', 'prize', 'won', 'nominated', 'recipient'],
+                }
+                outer_relation_keywords = keyword_map.get(outer_type, [outer_type.lower()])
+                break
+
+        if debug:
+            print(f"  Outer relation: {outer_relation_type}, keywords: {outer_relation_keywords}")
+
+        # Try retrieval first (if available)
+        conditioned_query = f"{bound_entity} {' '.join(outer_relation_keywords[:2])}".strip()
+        if debug:
+            print(f"  Conditioned query: {conditioned_query}")
+
+        if conditioned_query and hasattr(self, 'retriever') and self.retriever is not None:
+            try:
+                conditioned_result = self.retriever.retrieve(
+                    conditioned_query,
+                    top_k=self.config.retrieval.top_k
+                )
+                existing_pids = {p.pid for p in hop2_passages}
+                for p in conditioned_result.passages:
+                    if p.pid not in existing_pids:
+                        hop2_passages.append(p)
+                        existing_pids.add(p.pid)
+                        retrieved_new += 1
+
+                if debug:
+                    print(f"  Retrieved {retrieved_new} new passages for hop-2")
+            except Exception as e:
+                if debug:
+                    print(f"  Conditioned retrieval failed: {e}")
+
+        # ============================================================
+        # STAGE B: Score and certify hop-2 facets
+        # ============================================================
+        hop2_scores = self._two_stage_scoring(hop2_passages, hop2_facets)
+
+        if debug:
+            print(f"  [HOP2-SCORE] Re-scored {len(hop2_facets)} instantiated facets on {len(hop2_passages)} passages")
+
+        hop2_result = self._run_safe_cover(hop2_facets, hop2_passages, hop2_scores)
+
+        if debug:
+            hop2_coverage = hop2_result.get('metrics', {}).get('coverage', 0)
+            print(f"  Hop-2 coverage: {hop2_coverage:.2f}")
+            print(f"  Hop-2 selected: {len(hop2_result.get('selected_passages', []))}")
+
+        # ============================================================
+        # COMBINE: Union of hop-1 and hop-2 winners
+        # ============================================================
+        combined_passages = []
+        seen_pids = set()
+
+        for p in hop1_result.get('selected_passages', []):
+            pid = p.get('pid', '')
+            if pid and pid not in seen_pids:
+                seen_pids.add(pid)
+                combined_passages.append(p)
+
+        for p in hop2_result.get('selected_passages', []):
+            pid = p.get('pid', '')
+            if pid and pid not in seen_pids:
+                seen_pids.add(pid)
+                combined_passages.append(p)
+
+        # Merge certificates
+        combined_certificates = []
+        combined_certificates.extend(hop1_result.get('certificates', []))
+        combined_certificates.extend(hop2_result.get('certificates', []))
+
+        # Combined metrics
+        total_facets = len(hop1_facets) + len(hop2_facets)
+        hop1_covered = hop1_result.get('metrics', {}).get('utility', 0)
+        hop2_covered = hop2_result.get('metrics', {}).get('utility', 0)
+
+        combined_coverage = (hop1_covered + hop2_covered) / total_facets if total_facets > 0 else 0
+
+        # Both must pass for non-abstention
+        combined_abstained = hop1_result.get('abstained', False) or hop2_result.get('abstained', False)
+
+        # Calculate token costs
+        hop1_tokens = hop1_result.get('evidence_tokens', 0)
+        hop2_tokens = hop2_result.get('evidence_tokens', 0)
+
+        if debug:
+            print(f"  Combined coverage: {combined_coverage:.2f}")
+            print(f"  Combined passages: {len(combined_passages)}")
+            print(f"  Combined certificates: {len(combined_certificates)}")
+            print(f"  Abstained: {combined_abstained}")
+
+        return {
+            'selected_passages': combined_passages,
+            'certificates': combined_certificates,
+            'abstained': combined_abstained,
+            'infeasible': hop1_result.get('infeasible', False) or hop2_result.get('infeasible', False),
+            'evidence_tokens': hop1_tokens + hop2_tokens,
+            'metrics': {
+                'coverage': combined_coverage,
+                'utility': hop1_covered + hop2_covered,
+                'num_units': len(combined_passages),
+                'num_facets': total_facets,
+                'hop1_coverage': hop1_result.get('metrics', {}).get('coverage', 0),
+                'hop2_coverage': hop2_result.get('metrics', {}).get('coverage', 0),
+                'bound_entity': bound_entity,
+                'inner_relation_type': inner_relation_type,
+                'two_pass': True,
+            }
+        }
+
     def get_telemetry(self) -> Dict[str, Any]:
         """Get telemetry data."""
         return self.telemetry.get_summary()

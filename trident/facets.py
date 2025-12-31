@@ -448,3 +448,110 @@ class FacetMiner:
             seen.add(sig)
             unique.append(f)
         return unique
+
+
+def instantiate_facets(facets: List[Facet], bindings: Dict[str, str]) -> List[Facet]:
+    """
+    FIX C: Instantiate facet templates with bound entities.
+
+    Replaces placeholders like [DIRECTOR_RESULT] with actual bound entities.
+
+    Args:
+        facets: List of facets with potentially unbound placeholders
+        bindings: Dict mapping placeholder keys to bound values
+                 e.g., {"DIRECTOR_RESULT": "Xawery Żuławski"}
+
+    Returns:
+        List of facets with placeholders replaced by bound values
+    """
+    if not bindings:
+        return facets
+
+    instantiated = []
+    for facet in facets:
+        # Create a copy of the facet
+        new_template = facet.template.copy() if facet.template else {}
+
+        # Replace placeholders in all template fields
+        for key, value in new_template.items():
+            if isinstance(value, str):
+                for placeholder, bound_value in bindings.items():
+                    # Replace [PLACEHOLDER] with bound value
+                    pattern = f"[{placeholder}]"
+                    if pattern in value:
+                        new_template[key] = value.replace(pattern, bound_value)
+
+        # Create new facet with instantiated template
+        new_facet = Facet(
+            facet_id=facet.facet_id,
+            facet_type=facet.facet_type,
+            template=new_template,
+            required=getattr(facet, 'required', False)
+        )
+        instantiated.append(new_facet)
+
+    return instantiated
+
+
+def mark_required_facets(facets: List[Facet], query: str) -> List[Facet]:
+    """
+    FIX D: Mark RELATION facets as required for WH-questions.
+
+    This ensures that the key relation must be certified for valid answers.
+
+    Args:
+        facets: List of facets to mark
+        query: The question being asked
+
+    Returns:
+        List of facets with required flags set
+    """
+    if not is_wh_question(query):
+        return facets
+
+    # Mark RELATION facets as required for WH-questions
+    marked = []
+    for facet in facets:
+        facet_dict = facet.to_dict() if hasattr(facet, 'to_dict') else {}
+        facet_type = facet_dict.get('facet_type', '')
+
+        # RELATION facets are answer-determining for WH-questions
+        is_required = facet_type in ['RELATION', 'BRIDGE_HOP', 'BRIDGE_HOP1', 'BRIDGE_HOP2']
+
+        # Create new facet with required flag
+        new_facet = Facet(
+            facet_id=facet.facet_id,
+            facet_type=facet.facet_type,
+            template=facet.template,
+            required=is_required
+        )
+        marked.append(new_facet)
+
+    return marked
+
+
+def is_wh_question(query: str) -> bool:
+    """
+    Check if a query is a WH-question (who, what, where, when, which, how).
+
+    WH-questions require specific factual answers, so RELATION facets
+    should be marked as required.
+
+    Args:
+        query: The question to check
+
+    Returns:
+        True if query is a WH-question
+    """
+    q_lower = query.lower().strip()
+
+    # Check for WH-words at start
+    wh_words = ['who ', 'what ', 'where ', 'when ', 'which ', 'whose ', 'whom ']
+    if any(q_lower.startswith(w) for w in wh_words):
+        return True
+
+    # Check for "how many" or "how much"
+    if q_lower.startswith('how many ') or q_lower.startswith('how much '):
+        return True
+
+    return False
