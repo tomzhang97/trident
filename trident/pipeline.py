@@ -28,6 +28,7 @@ from .vqc import VerifierQueryCompiler
 from .bwk import BwKController
 from .chain_builder import (
     bind_entity_from_hop1_winner,
+    bind_entity_via_css,
     build_inner_question_from_facet,
     detect_question_type,
     extract_candidates,
@@ -1310,7 +1311,7 @@ class TridentPipeline:
         # ============================================================
         # STAGE A: Certify hop-1 facets
         # ============================================================
-        hop1_scores = self._score_facets_two_stage(hop1_facets, passages)
+        hop1_scores = self._two_stage_scoring(passages, hop1_facets)
         hop1_result = self._run_safe_cover(hop1_facets, passages, hop1_scores)
 
         if debug:
