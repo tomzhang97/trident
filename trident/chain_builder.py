@@ -2488,8 +2488,7 @@ def extract_object_from_certified_passage(
 
     # MOTHER: "mother of X" or "X is the son/daughter of"
     elif relation_kind in ["MOTHER", "PARENT"]:
-        # Pattern: "mother of X" or "mother X"
-        # Stops at sentence delimiters to capture full name
+        # Pattern 1: Direct "mother of X" or "mother X"
         m = re.search(r"(?i)\bmother\s+(?:of\s+)?([A-Z][^.,;(\n]+)", t)
         if m:
             name = m.group(1).strip()
@@ -2499,19 +2498,52 @@ def extract_object_from_certified_passage(
                     print(f"[CERTIFIED-EXTRACT] MOTHER: '{name}' from 'mother of X' pattern")
                 return name
 
-        # Pattern: "X is the son/daughter/child of" -> get subject before "is"
-        # Extract full subject name including extended Unicode
-        m = re.search(r"\b([A-Z][^.,;(\n]+?)\s+(?:is|was)\s+(?:the\s+)?(?:son|daughter|child)\s+of", t)
+        # Pattern 2: "X is the son/daughter of Y and Z" → extract female parent
+        # CRITICAL: Handle "son of actress Y and director Z" → return Y
+        m = re.search(r"(?:son|daughter|child)\s+of\s+(?:actress|actor)?\s*([A-Z][^.,;(\n]+?)\s+and\s+(?:actress|actor|director)?\s*([A-Z][^.,;(\n]+)", t)
+        if m:
+            parent1 = m.group(1).strip()
+            parent2 = m.group(2).strip()
+            parent1 = re.sub(r'[\s,\.\(\)]+$', '', parent1)
+            parent2 = re.sub(r'[\s,\.\(\)]+$', '', parent2)
+
+            # Look for gender/role indicators to identify mother
+            parent1_context = t[max(0, m.start(1)-20):m.end(1)]
+            parent2_context = t[max(0, m.start(2)-20):m.end(2)]
+
+            # Actress/female indicators suggest mother
+            if any(kw in parent1_context.lower() for kw in ['actress', 'mother', 'wife']):
+                if _looks_like_person(parent1):
+                    if debug:
+                        print(f"[CERTIFIED-EXTRACT] MOTHER: '{parent1}' from 'son of actress X and Y' pattern")
+                    return parent1
+            elif any(kw in parent2_context.lower() for kw in ['actress', 'mother', 'wife']):
+                if _looks_like_person(parent2):
+                    if debug:
+                        print(f"[CERTIFIED-EXTRACT] MOTHER: '{parent2}' from 'son of X and actress Y' pattern")
+                    return parent2
+            else:
+                # If no gender indicator, return first parent (convention)
+                if _looks_like_person(parent1):
+                    if debug:
+                        print(f"[CERTIFIED-EXTRACT] MOTHER: '{parent1}' from 'son of X and Y' pattern (first parent)")
+                    return parent1
+
+        # Pattern 3: "X is the son/daughter/child of Y" → get Y (object)
+        m = re.search(r"(?:is|was)\s+(?:the\s+)?(?:son|daughter|child)\s+of\s+(?:actress\s+)?([A-Z][^.,;(\n]+)", t)
         if m:
             name = m.group(1).strip()
+            name = re.sub(r'[\s,\.\(\)]+$', '', name)
+            # Stop at "and" to avoid capturing "Y and Z"
+            name = re.sub(r'\s+and\s+.*$', '', name)
             if _looks_like_person(name):
                 if debug:
-                    print(f"[CERTIFIED-EXTRACT] MOTHER: '{name}' from 'X is the son/daughter of' pattern")
+                    print(f"[CERTIFIED-EXTRACT] MOTHER: '{name}' from 'is the son/daughter of X' pattern")
                 return name
 
     # FATHER: "father of X" or "X is the son/daughter of"
     elif relation_kind == "FATHER":
-        # Pattern: "father of X" or "father X"
+        # Pattern 1: Direct "father of X" or "father X"
         m = re.search(r"(?i)\bfather\s+(?:of\s+)?([A-Z][^.,;(\n]+)", t)
         if m:
             name = m.group(1).strip()
@@ -2521,13 +2553,50 @@ def extract_object_from_certified_passage(
                     print(f"[CERTIFIED-EXTRACT] FATHER: '{name}' from 'father of X' pattern")
                 return name
 
-        # Pattern: "X is the son/daughter/child of" -> get subject before "is"
-        m = re.search(r"\b([A-Z][^.,;(\n]+?)\s+(?:is|was)\s+(?:the\s+)?(?:son|daughter|child)\s+of", t)
+        # Pattern 2: "X is the son/daughter of Y and Z" → extract male parent
+        # CRITICAL: Handle "son of actress Y and director Z" → return Z
+        m = re.search(r"(?:son|daughter|child)\s+of\s+(?:actress|actor)?\s*([A-Z][^.,;(\n]+?)\s+and\s+(?:actress|actor|director)?\s*([A-Z][^.,;(\n]+)", t)
+        if m:
+            parent1 = m.group(1).strip()
+            parent2 = m.group(2).strip()
+            parent1 = re.sub(r'[\s,\.\(\)]+$', '', parent1)
+            parent2 = re.sub(r'[\s,\.\(\)]+$', '', parent2)
+
+            # Look for gender/role indicators to identify father
+            parent1_context = t[max(0, m.start(1)-20):m.end(1)]
+            parent2_context = t[max(0, m.start(2)-20):m.end(2)]
+
+            # Actor/director/male indicators suggest father
+            if any(kw in parent1_context.lower() for kw in ['actor', 'director', 'father']):
+                # Exclude 'actress' which contains 'actor'
+                if 'actress' not in parent1_context.lower():
+                    if _looks_like_person(parent1):
+                        if debug:
+                            print(f"[CERTIFIED-EXTRACT] FATHER: '{parent1}' from 'son of director X and Y' pattern")
+                        return parent1
+            elif any(kw in parent2_context.lower() for kw in ['actor', 'director', 'father']):
+                if 'actress' not in parent2_context.lower():
+                    if _looks_like_person(parent2):
+                        if debug:
+                            print(f"[CERTIFIED-EXTRACT] FATHER: '{parent2}' from 'son of X and director Y' pattern")
+                        return parent2
+            else:
+                # If no gender indicator, return second parent (convention: mother first, father second)
+                if _looks_like_person(parent2):
+                    if debug:
+                        print(f"[CERTIFIED-EXTRACT] FATHER: '{parent2}' from 'son of X and Y' pattern (second parent)")
+                    return parent2
+
+        # Pattern 3: "X is the son/daughter/child of Y" → get Y (object)
+        m = re.search(r"(?:is|was)\s+(?:the\s+)?(?:son|daughter|child)\s+of\s+(?:actor|director)?\s*([A-Z][^.,;(\n]+)", t)
         if m:
             name = m.group(1).strip()
+            name = re.sub(r'[\s,\.\(\)]+$', '', name)
+            # Stop at "and" to avoid capturing "Y and Z"
+            name = re.sub(r'\s+and\s+.*$', '', name)
             if _looks_like_person(name):
                 if debug:
-                    print(f"[CERTIFIED-EXTRACT] FATHER: '{name}' from 'X is the son/daughter of' pattern")
+                    print(f"[CERTIFIED-EXTRACT] FATHER: '{name}' from 'is the son/daughter of X' pattern")
                 return name
 
     # SPOUSE: "married to X" or "spouse X"
@@ -2621,6 +2690,63 @@ def extract_object_from_certified_passage(
             if debug:
                 print(f"[CERTIFIED-EXTRACT] NATIONALITY: '{nationality}' from 'from X' pattern")
             return nationality
+
+    # DIED_ON: Extract death date/year from patterns
+    elif relation_kind in ["DIED_ON", "DIED", "DEATH_DATE"]:
+        # Pattern 1: "died on DATE" or "died in YEAR"
+        m = re.search(r"(?i)\bdied\s+(?:on|in)\s+([A-Z][^.,;(\n]+)", t)
+        if m:
+            date = m.group(1).strip()
+            date = re.sub(r'[\s,\.\(\)]+$', '', date)
+            if debug:
+                print(f"[CERTIFIED-EXTRACT] DIED_ON: '{date}' from 'died on/in X' pattern")
+            return date
+
+        # Pattern 2: "death: DATE" or "death date: DATE"
+        m = re.search(r"(?i)\bdeath\s*(?:date)?[:\s]+(\d{1,2}\s+[A-Z][a-z]+\s+\d{4}|\d{4})", t)
+        if m:
+            date = m.group(1).strip()
+            if debug:
+                print(f"[CERTIFIED-EXTRACT] DIED_ON: '{date}' from 'death: X' pattern")
+            return date
+
+        # Pattern 3: Just a year in parentheses after name (common in Wikipedia)
+        # E.g., "John Smith (1920–1985)"
+        m = re.search(r"\(\d{4}[–-](\d{4})\)", t)
+        if m:
+            year = m.group(1).strip()
+            if debug:
+                print(f"[CERTIFIED-EXTRACT] DIED_ON: '{year}' from '(birth–death)' pattern")
+            return year
+
+    # RELEASE_DATE: Extract release date/year for films, albums, etc.
+    elif relation_kind in ["RELEASE_DATE", "RELEASED", "PREMIERE_DATE"]:
+        # Pattern 1: "released in YEAR" or "released on DATE"
+        m = re.search(r"(?i)\breleased\s+(?:on|in)\s+([A-Z][^.,;(\n]+|\d{4})", t)
+        if m:
+            date = m.group(1).strip()
+            date = re.sub(r'[\s,\.\(\)]+$', '', date)
+            if debug:
+                print(f"[CERTIFIED-EXTRACT] RELEASE_DATE: '{date}' from 'released on/in X' pattern")
+            return date
+
+        # Pattern 2: "premiered in YEAR"
+        m = re.search(r"(?i)\bpremiered\s+(?:on|in)\s+([A-Z][^.,;(\n]+|\d{4})", t)
+        if m:
+            date = m.group(1).strip()
+            date = re.sub(r'[\s,\.\(\)]+$', '', date)
+            if debug:
+                print(f"[CERTIFIED-EXTRACT] RELEASE_DATE: '{date}' from 'premiered on/in X' pattern")
+            return date
+
+        # Pattern 3: Year in parentheses after title
+        # E.g., "The Matrix (1999) is a film"
+        m = re.search(r"\((\d{4})\)\s+(?:is|was)\s+a\s+(?:film|movie|album)", t)
+        if m:
+            year = m.group(1).strip()
+            if debug:
+                print(f"[CERTIFIED-EXTRACT] RELEASE_DATE: '{year}' from '(year) is a film' pattern")
+            return year
 
     if debug:
         print(f"[CERTIFIED-EXTRACT] No match for {relation_kind} in passage")
