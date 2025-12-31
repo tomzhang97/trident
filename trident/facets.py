@@ -14,8 +14,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .relation_templates import RELATION_SLOT_TO_TEMPLATE
-
 _PUNCT_FIX_RE = re.compile(r"\s+([,.;:?!])")
 _MULTI_SPACE_RE = re.compile(r"\s{2,}")
 _APOS_S_RE = re.compile(r"\s+'s\b", re.IGNORECASE)
@@ -46,6 +44,9 @@ def _looks_like_junk_entity(mention: str) -> bool:
     ml = m.lower()
     bad_tokens = {"first", "second", "third", "which", "what", "who", "when", "where", "one", "two", "this", "that", "the", "a", "an", "and", "or"}
     if ml in bad_tokens: return True
+    lead_token = ml.split()[0]
+    if lead_token in {"are", "is", "was", "were", "do", "does", "did", "has", "have", "had", "can", "could", "should", "would", "will", "shall", "may", "might", "must"}:
+        return True
     if len(m.split()) == 1 and len(m) <= 3: return True
     if re.fullmatch(r"\d+(\.\d+)?", ml): return True
     return False
@@ -246,7 +247,11 @@ def is_wh_question(question: str) -> bool:
     return q_lower.startswith(wh_starters) or any(f' {w}' in q_lower[:30] for w in ['who', 'what', 'where', 'when', 'which'])
 
 
-def mark_required_facets(facets: List["Facet"], question: str) -> List["Facet"]:
+def mark_required_facets(
+    facets: List["Facet"],
+    question: str,
+    require_relation: bool = False,
+) -> List["Facet"]:
     """
     Mark RELATION facets as required for WH-questions.
 
@@ -260,7 +265,7 @@ def mark_required_facets(facets: List["Facet"], question: str) -> List["Facet"]:
     Returns:
         List of facets with required flags set appropriately
     """
-    if not is_wh_question(question):
+    if not (require_relation or is_wh_question(question)):
         return facets
 
     import os
@@ -341,6 +346,22 @@ class Facet:
             subject = _safe_phrase(tpl.get("subject", ""))
             predicate = _safe_phrase(tpl.get("predicate", ""))
             obj = _safe_phrase(tpl.get("object", ""))
+            relation_kind = _safe_phrase(tpl.get("relation_kind", ""))
+            is_wh_subject = bool((self.metadata or {}).get("is_wh_subject"))
+
+            # WH-subject: use existential hypothesis entailed by typical passive phrasing
+            if is_wh_subject:
+                anchor = obj or subject or "the topic"
+                if relation_kind.upper() == "DIRECTOR" or "direct" in predicate.lower():
+                    return _ensure_sentence(f"{anchor} was directed by someone")
+                if relation_kind.upper() == "MOTHER":
+                    return _ensure_sentence(f"Someone is the mother of {anchor}")
+                if relation_kind.upper() == "FATHER":
+                    return _ensure_sentence(f"Someone is the father of {anchor}")
+                if relation_kind.upper() == "PARENT":
+                    return _ensure_sentence(f"Someone is a parent of {anchor}")
+                return _ensure_sentence(f"Someone is related to {anchor}")
+
             anchor = obj or subject or "the topic"
             core = predicate if predicate else "is related to"
             return _ensure_sentence(f"The passage states that {anchor} {core}.")
@@ -551,13 +572,12 @@ class FacetMiner:
         self,
         query: str,
         supporting_facts: Optional[List[Tuple[str, int]]] = None,
-        question_plan: Optional[Dict[str, Any]] = None,
     ) -> List[Facet]:
         query = _clean_text(query)
 
         facets: List[Facet] = []
         facets.extend(self._extract_entity_facets(query))
-        facets.extend(self._extract_relation_facets(query, question_plan=question_plan))
+        facets.extend(self._extract_relation_facets(query))
         facets.extend(self._extract_temporal_facets(query))
         facets.extend(self._extract_numeric_facets(query))
         facets.extend(self._extract_comparison_facets(query))
@@ -579,64 +599,146 @@ class FacetMiner:
         mentions: List[str] = []
         mentions.extend(self._extract_or_entities(query))
         if not mentions:
-            mentions.extend(re.findall(r"\b[A-Z][A-Za-z0-9']+(?:\s+[A-Z][A-Za-z0-9']+)*\b", query))
+            mentions.extend(re.findall(r"\b[A-Z][A-Za-z0-9'\-’]+(?:\s+[A-Z][A-Za-z0-9'\-’]+)*\b", query))
         # CRITICAL: Use longest-span dedup to prevent "Michael" when "Michael Doeberl" exists
         # This prevents partial matches from covering wrong passages
         mentions = [m for m in _dedupe_entities_by_longest_span(mentions) if not _looks_like_junk_entity(m)]
         return [Facet(facet_id=f"entity_{i}", facet_type=FacetType.ENTITY, template={"mention": _safe_phrase(m)}) for i, m in enumerate(mentions)]
 
     # ---- relation (planned or heuristic) ----
-    def _extract_relation_facets(self, query: str, question_plan: Optional[Dict[str, Any]] = None) -> List[Facet]:
-        planned = self._extract_relation_facets_llm_plan(question_plan)
-        if planned:
-            return planned
-        return []
+    def _extract_relation_facets(self, query: str) -> List[Facet]:
+        q = query.lower()
+        facets: List[Facet] = []
 
-    def _extract_relation_facets_llm_plan(self, question_plan: Optional[Dict[str, Any]]) -> List[Facet]:
-        if question_plan and isinstance(question_plan, dict):
-            req = question_plan.get("required_facts", [])
-            if isinstance(req, list) and req:
-                facets: List[Facet] = []
-                for i, r in enumerate(req[:3]):
-                    if not isinstance(r, dict):
-                        continue
-                    slot = str(r.get("slot", "")).strip().lower()
-                    ent = _clean_text(str(r.get("entity", "")).strip())
-                    if not slot or not ent:
-                        continue
-                    spec = RELATION_SLOT_TO_TEMPLATE.get(slot)
-                    if not spec:
-                        continue
+        ents = self._extract_entity_facets(query)
 
-                    hyp = spec["hypothesis"].format(entity=ent)
-                    tpl = {
-                        "subject": "",
-                        "predicate": spec["predicate"],
-                        "object": ent,
-                        "relation_kind": spec["relation_kind"],
-                        "relation_pid": spec.get("relation_pid"),
-                        "relation_schema_source": spec.get("relation_schema_source", ""),
-                        "relation_schema_version": spec.get("relation_schema_version", ""),
-                        "answer_role": spec.get("answer_role", "object"),
-                        "anchor_policy": spec.get("anchor_policy", "ANY"),
-                        "custom_hypothesis": hyp,
-                        "is_wh_subject": True,
-                    }
+        def _choose_anchor(entity_facets: List[Facet]) -> str:
+            mentions: List[str] = []
+            for e in entity_facets:
+                mention = _safe_phrase((e.template or {}).get("mention", ""))
+                if mention:
+                    mentions.append(mention)
 
-                    facets.append(
-                        Facet(
-                            facet_id=f"plan_rel_{i}",
-                            facet_type=FacetType.RELATION,
-                            template=tpl,
-                            weight=1.0,
-                            metadata={"planned": True, "slot": slot, "is_wh_subject": True},
-                            required=True,
-                        )
-                    )
-                if facets:
-                    return facets
+            if not mentions:
+                return ""
 
-        return []
+            generic_singletons = {"film", "movie", "person", "someone", "something", "director"}
+
+            def _score(m: str) -> Tuple[int, int]:
+                tokens = m.split()
+                if len(tokens) == 1 and tokens[0].lower() in generic_singletons:
+                    return (-1, len(m))
+                return (1 if len(tokens) > 1 else 0, len(m))
+
+            mentions.sort(key=_score, reverse=True)
+            return mentions[0]
+
+        anchor = _choose_anchor(ents)
+
+        def _matches_mother(question_text: str) -> bool:
+            return bool(
+                re.search(r"\bwho\b[^?]*\bmother of\b", question_text)
+                or re.search(r"\bmother of\b[^?]*\bwho\b", question_text)
+            )
+
+        def _matches_director(question_text: str) -> bool:
+            return bool(
+                re.search(r"\bwho\b[^?]*\bdirector of\b", question_text)
+                or re.search(r"\bdirector of\b[^?]*\bwho\b", question_text)
+                or re.search(r"\bwho\b[^?]*\bdirected\b", question_text)
+            )
+
+        nested_parent_match = re.search(
+            r"\b(mother|father|parent|son|daughter|child|spouse|wife|husband)\s+of\s+the\s+director\s+of\b",
+            q,
+        )
+
+        if anchor and nested_parent_match:
+            relation_token = nested_parent_match.group(1).lower()
+            relation_map = {
+                "mother": "MOTHER",
+                "father": "FATHER",
+                "parent": "PARENT",
+                "son": "CHILD",
+                "daughter": "CHILD",
+                "child": "CHILD",
+                "spouse": "SPOUSE",
+                "wife": "SPOUSE",
+                "husband": "SPOUSE",
+            }
+
+            outer_relation = relation_map.get(relation_token, "PARENT")
+            predicate_text = f"{relation_token} of" if relation_token not in {"son", "daughter", "child"} else "child of"
+
+            hop1 = self._relation_facet_builder(
+                "rel_director_hop1",
+                template={
+                    "relation_kind": "DIRECTOR",
+                    "subject": "?",
+                    "object": anchor,
+                    "predicate": "directed",
+                    "answer_role": "subject",
+                    "inner_relation_type": "DIRECTOR",
+                    "compositional": True,
+                    "hop": 1,
+                },
+                metadata={"is_wh_subject": True},
+            )
+
+            hop2 = self._relation_facet_builder(
+                f"rel_{relation_token}_of_director_hop2",
+                template={
+                    "relation_kind": outer_relation,
+                    "subject": "?",
+                    "object": "[DIRECTOR_RESULT]",
+                    "bridge_entity": "[DIRECTOR_RESULT]",
+                    "predicate": predicate_text,
+                    "answer_role": "subject",
+                    "outer_relation_type": outer_relation,
+                    "inner_relation_type": "DIRECTOR",
+                    "hop": 2,
+                },
+                metadata={"is_wh_subject": True},
+            )
+
+            if hop1:
+                facets.append(hop1)
+            if hop2:
+                facets.append(hop2)
+
+            return facets
+
+        elif anchor and _matches_mother(q):
+            rel = self._relation_facet_builder(
+                "rel_mother",
+                template={
+                    "relation_kind": "MOTHER",
+                    "subject": "?",
+                    "object": anchor,
+                    "predicate": "mother",
+                    "answer_role": "subject",
+                },
+                metadata={"is_wh_subject": True},
+            )
+            if rel:
+                facets.append(rel)
+
+        if anchor and _matches_director(q):
+            rel = self._relation_facet_builder(
+                "rel_director",
+                template={
+                    "relation_kind": "DIRECTOR",
+                    "subject": "?",
+                    "object": anchor,
+                    "predicate": "directed",
+                    "answer_role": "subject",
+                },
+                metadata={"is_wh_subject": True},
+            )
+            if rel:
+                facets.append(rel)
+
+        return facets
 
     # ---- temporal ----
     def _extract_temporal_facets(self, query: str) -> List[Facet]:

@@ -284,6 +284,7 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
 
         # WH-subject handling (Who / What / Where)
         is_wh_subject = bool(meta.get("is_wh_subject")) or s_raw.strip().lower() in _WH_WORDS
+        is_wh_object = bool(meta.get("is_wh_object"))
 
         relation_pid = str(tpl.get("relation_pid", "") or "") or None
 
@@ -296,7 +297,9 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         # Anchor constraint: require at least one grounded endpoint
         s_clean = _clean_relation_endpoint(s_raw)
         o_clean = _clean_relation_endpoint(o_raw)
-        if is_wh_subject:
+        if is_wh_subject and is_wh_object:
+            has_anchor = bool(s_clean or o_clean)
+        elif is_wh_subject:
             has_anchor = bool(o_clean)
         else:
             has_anchor = bool(s_clean or o_clean)
@@ -313,19 +316,27 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
             _record_failure("placeholder_anchor")
             return False
 
+        o_tokens = _get_token_set(_normalize_text_unicode(o_clean)) if o_clean else set()
+
         s_match = _fuzzy_phrase_match(s_clean, passage_norm, passage_tokens) if s_clean else False
         o_match = _fuzzy_phrase_match(o_clean, passage_norm, passage_tokens) if o_clean else False
 
-        # WH subjects are intentionally abstract; don't require subject grounding.
-        if is_wh_subject:
-            s_match = True
+        # If WH subject ("Who/What/..."), relax object anchoring:
+        # allow partial token overlap instead of full token subset.
+        if is_wh_subject and o_clean and not o_match:
+            overlap = o_tokens.intersection(passage_tokens)
+            # require at least 2 tokens overlap OR 1 token if object is short
+            if len(overlap) >= 2 or (len(o_tokens) <= 2 and len(overlap) >= 1):
+                o_match = True
 
         anchor_policy = str(tpl.get("anchor_policy") or "ANY").upper()
         if anchor_policy not in {"ANY", "ALL"}:
             anchor_policy = "ANY"
 
         anchor_ok = False
-        if is_wh_subject:
+        if is_wh_subject and is_wh_object:
+            anchor_ok = bool(s_match or o_match)
+        elif is_wh_subject:
             anchor_ok = bool(o_match)
         elif anchor_policy == "ALL":
             anchor_ok = bool(s_match and o_match)
@@ -337,14 +348,19 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
             return False
 
         # Predicate constraint
+        predicate_required = bool(relation_kind or relation_pid or predicate)
         predicate_ok = False
         if relation_kind or relation_pid:
             predicate_ok = _check_relation_keywords(relation_kind, passage_norm, passage_tokens, relation_pid=relation_pid)
         if not predicate_ok and predicate:
             predicate_ok = _fuzzy_phrase_match(predicate, passage_norm, passage_tokens)
 
+        if not predicate_required:
+            return True
+
         if not predicate_ok:
             _record_failure("predicate_mismatch")
+            return False
 
         return predicate_ok
 
