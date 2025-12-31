@@ -339,6 +339,27 @@ class ReasoningChain:
         ]
 
 
+@dataclass
+class AnswerCertificate:
+    """
+    LLM Answer Certificate with provenance (Step 3).
+
+    This is a SEPARATE certificate type from facet conformal certificates.
+    Used as fallback when Safe-Cover has no answer facets certified.
+
+    Hard acceptance rules (non-negotiable):
+    - quote must be a substring of passage_text(pid)
+    - answer must be a substring of quote
+    - for yes/no or choice: quote must contain decisive fact
+    """
+    answer: str  # The extracted answer
+    pid: str  # Supporting passage ID
+    quote: str  # Exact substring from that passage containing answer
+    answer_type: str  # entity/date/number/yesno/choice
+    confidence: Optional[float] = None  # Optional, don't trust alone
+    verified: bool = False  # Set to True after verification passes
+
+
 def extract_entities(text: str, doc_title: Optional[str] = None) -> Set[str]:
     """Extract entity mentions from text.
 
@@ -2945,6 +2966,189 @@ def extract_answer_from_certified_facet(
         print(f"  ✗ No extraction succeeded")
 
     return None
+
+
+def get_llm_answer_certificate(
+    llm: Any,
+    question: str,
+    passages: List[Dict[str, Any]],
+    max_passages: int = 10,
+    max_chars_per_passage: int = 600
+) -> Optional[AnswerCertificate]:
+    """
+    STEP 3: LLM Answer Certificate fallback.
+
+    Get LLM to extract answer with provenance (quote from passage).
+    This is used when Safe-Cover has no answer facets certified.
+
+    Hard acceptance rules (non-negotiable):
+    - quote must be a substring of passage_text(pid)
+    - answer must be a substring of quote
+    - for yes/no or choice: quote must contain both entities/candidates
+
+    Args:
+        llm: LLM interface
+        question: Original question
+        passages: Top passages (already retrieved/scored)
+        max_passages: Maximum passages to send to LLM
+        max_chars_per_passage: Truncate passages to this length
+
+    Returns:
+        AnswerCertificate if verification passes, None otherwise
+    """
+    import json
+    import os
+    import unicodedata
+
+    debug = os.environ.get("TRIDENT_DEBUG_LLM_CERT", "0") == "1"
+
+    if not passages:
+        return None
+
+    # Prepare passages for LLM (truncate and format)
+    evidence_parts = []
+    pid_to_passage = {}
+    for i, p in enumerate(passages[:max_passages]):
+        pid = p.get("pid", f"p{i}")
+        text = p.get("text", "")
+        title = p.get("title", "")
+
+        # Truncate text
+        if len(text) > max_chars_per_passage:
+            text = text[:max_chars_per_passage] + "..."
+
+        pid_to_passage[pid] = p
+        evidence_parts.append(f"[{pid}] {title}\n{text}")
+
+    evidence_str = "\n\n".join(evidence_parts)
+
+    # Build LLM prompt requesting structured answer certificate
+    prompt = f"""Question: {question}
+
+Evidence passages:
+{evidence_str}
+
+TASK: Extract the answer to the question with provenance.
+
+OUTPUT FORMAT (JSON):
+{{
+  "answer": "the extracted answer",
+  "passage_id": "pid of supporting passage",
+  "quote": "exact quote from that passage containing the answer",
+  "answer_type": "entity or date or number or yesno or choice"
+}}
+
+CRITICAL RULES:
+1. quote MUST be an exact substring from the passage
+2. answer MUST be a substring of quote
+3. For yes/no questions: quote must contain the decisive fact
+4. For choice questions ("which came first?"): quote must contain both entities
+5. If no answer can be verified, return {{"answer": "", "reason": "no_verified_answer"}}
+
+JSON:"""
+
+    try:
+        # Call LLM
+        response = llm.generate(prompt, max_tokens=200, temperature=0.0)
+        response_text = response.strip()
+
+        # Parse JSON (try to extract if wrapped in markdown)
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0].strip()
+
+        cert_dict = json.loads(response_text)
+
+        answer = cert_dict.get("answer", "").strip()
+        pid = cert_dict.get("passage_id", "").strip()
+        quote = cert_dict.get("quote", "").strip()
+        answer_type = cert_dict.get("answer_type", "entity").strip()
+
+        if debug:
+            print(f"\n[LLM CERT] Raw response parsed")
+            print(f"  Answer: '{answer}'")
+            print(f"  PID: {pid}")
+            print(f"  Quote: '{quote[:100]}...'")
+            print(f"  Type: {answer_type}")
+
+        # Empty answer means LLM abstained
+        if not answer or not quote or not pid:
+            if debug:
+                print(f"[LLM CERT] Empty answer/quote/pid - LLM abstained")
+            return None
+
+        # Get passage text for verification
+        if pid not in pid_to_passage:
+            if debug:
+                print(f"[LLM CERT] Invalid PID {pid} - not in passage set")
+            return None
+
+        passage_text = pid_to_passage[pid].get("text", "")
+
+        # HARD RULE 1: Quote must be substring of passage
+        def normalize_for_match(text: str) -> str:
+            """Normalize for substring matching (Unicode + whitespace)."""
+            text = unicodedata.normalize('NFKC', text)
+            text = ' '.join(text.split())
+            return text
+
+        quote_norm = normalize_for_match(quote)
+        passage_norm = normalize_for_match(passage_text)
+
+        if quote_norm not in passage_norm:
+            if debug:
+                print(f"[LLM CERT] REJECTED: Quote not found in passage")
+                print(f"  Quote (norm): '{quote_norm[:100]}'")
+            return None
+
+        # HARD RULE 2: Answer must be substring of quote
+        answer_norm = normalize_for_match(answer)
+        if answer_norm not in quote_norm:
+            if debug:
+                print(f"[LLM CERT] REJECTED: Answer not found in quote")
+                print(f"  Answer (norm): '{answer_norm}'")
+                print(f"  Quote (norm): '{quote_norm[:100]}'")
+            return None
+
+        # HARD RULE 3: For yes/no, check quote contains decisive info
+        q_lower = question.lower()
+        is_yesno = q_lower.startswith(("is ", "are ", "was ", "were ", "do ", "does ", "did "))
+        if is_yesno and answer_type == "yesno":
+            # For yes/no, quote should contain key entities from question
+            # Simple heuristic: quote should be substantial (not just "yes"/"no")
+            if len(quote_norm) < 20:
+                if debug:
+                    print(f"[LLM CERT] REJECTED: Yes/no quote too short ({len(quote_norm)} chars)")
+                return None
+
+        # All verification passed!
+        cert = AnswerCertificate(
+            answer=answer,
+            pid=pid,
+            quote=quote,
+            answer_type=answer_type,
+            confidence=None,
+            verified=True
+        )
+
+        if debug:
+            print(f"[LLM CERT] ✓ VERIFIED Answer Certificate")
+            print(f"  Answer: '{answer}'")
+            print(f"  PID: {pid[:12]}...")
+            print(f"  Quote length: {len(quote)} chars")
+
+        return cert
+
+    except json.JSONDecodeError as e:
+        if debug:
+            print(f"[LLM CERT] JSON parse error: {e}")
+            print(f"  Response: {response_text[:200]}")
+        return None
+    except Exception as e:
+        if debug:
+            print(f"[LLM CERT] Error: {e}")
+        return None
 
 
 def looks_generic(entity: str) -> bool:

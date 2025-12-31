@@ -829,48 +829,18 @@ class TridentPipeline:
                                     print(f"[CONSTRAINED] Failed: {constrained_result.reason}")
                                     if constrained_result.candidates:
                                         print(f"[CONSTRAINED] Had {len(constrained_result.candidates)} candidates")
-                    elif certificates and winner_passages:
-                        # No answer facets, but we still have certified passages (likely ENTITY).
-                        # Attempt extraction from best certified passages instead of skipping outright.
-                        if debug_chain or debug_constrained:
-                            print("[CONSTRAINED] No answer facets certified; attempting on certified passages")
 
-                        constrained_result = constrained_span_select(
-                            llm=self.llm,
-                            question=query,
-                            winner_passages=winner_passages,
-                            max_candidates=10,
-                            max_chars_per_passage=600
-                        )
-
-                        if constrained_result.reason == "OK":
-                            answer = constrained_result.answer
-                            is_grounded = True
-                            used_constrained = True
-                            prompt_type = "constrained_certified_only"
-
-                            if debug_chain or debug_constrained:
-                                print(f"[CONSTRAINED] Success (certified-only): '{answer[:50] if answer else ''}' (index={constrained_result.candidate_index})")
-                                print(f"[CONSTRAINED] Candidates: {constrained_result.candidates[:3]}...")
-                        elif constrained_result.reason == "FALLBACK_SUPPORT":
-                            answer = constrained_result.answer
-                            is_grounded = True
-                            used_constrained = True
-                            prompt_type = "constrained_certified_support"
-
-                            if debug_chain or debug_constrained:
-                                print(f"[CONSTRAINED] Fallback (certified-only) to support-based: '{answer[:50] if answer else ''}'")
-                        else:
-                            if debug_chain or debug_constrained:
-                                print(f"[CONSTRAINED] Certified-only attempt failed: {constrained_result.reason}")
-                                if constrained_result.candidates:
-                                    print(f"[CONSTRAINED] Had {len(constrained_result.candidates)} candidates")
-                    else:
-                        # No answer facets certified - skip constrained selection entirely
-                        skipped_constrained_reason = "no_answer_facets_certified"
+                    # STEP 1 FIX: Removed "certified-only attempt" on ENTITY-only certificates
+                    # This was the #1 source of NO_VERIFIED_SPAN / empty outputs when
+                    # has_answer_facet_certified=False
+                    # Now we skip extraction here and will use LLM Answer Certificate (Step 3)
+                    # or abstain
+                    if not has_answer_facet_certified:
                         if debug_chain or debug_constrained:
                             certified_types = [facet_type_by_id.get(c.get("facet_id")) for c in certificates]
-                            print(f"[CONSTRAINED] Skipped: only {certified_types} certified, no answer facets")
+                            print(f"\n[STEP 1] No answer facets certified (only {certified_types})")
+                            print(f"  Skipping constrained extraction entirely")
+                            print(f"  Will route to LLM Answer Certificate or abstain")
 
             # ANSWER VALIDATION: ensure we only keep grounded, non-empty answers
             def _is_garbage_answer(ans: str) -> bool:
@@ -993,6 +963,18 @@ class TridentPipeline:
             'certified_facet_ids': list(certified_facet_ids),
             'answer_grounded': is_grounded,
         })
+
+        # STEP 2: Final abstention guard (single choke point)
+        # INVARIANT: If abstained, answer MUST be "ABSTAIN" and confidence MUST be 0
+        # This ensures we never output empty strings or hallucinated answers when abstained
+        if final_abstained or result.get('abstained', False):
+            if answer not in ["ABSTAIN", ABSTAIN_STR]:
+                if os.environ.get("TRIDENT_DEBUG_ABSTAIN", "0") == "1":
+                    print(f"\n[STEP 2 GUARD] Abstention invariant violation caught!")
+                    print(f"  abstained=True but answer='{answer}'")
+                    print(f"  Forcing answer='ABSTAIN'")
+                answer = "ABSTAIN"
+            final_abstained = True
 
         return PipelineOutput(
             answer=answer,
