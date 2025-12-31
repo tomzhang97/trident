@@ -37,6 +37,8 @@ from .chain_builder import (
     QuestionType,
     get_answer_facet_passages,
     get_winner_passages_only,
+    extract_object_from_certified_passage,
+    looks_generic,
 )
 
 
@@ -1379,30 +1381,36 @@ class TridentPipeline:
                     if debug:
                         print(f"  G1: Using only binding passage: {binding_pid[:12]}...")
 
-        # Use CSS to bind entity (general, relation-agnostic)
-        if inner_question and binding_passages:
-            bound_entity = bind_entity_via_css(
-                llm=self.llm,
-                inner_question=inner_question,
-                hop1_passages=binding_passages,
-                max_chars=600
-            )
-            if debug:
-                print(f"  Bound entity (CSS): {bound_entity}")
+        # ================================================================
+        # FIX 1, 2, 3: Use CERTIFIED extraction (no CSS, no regex fallback)
+        # ================================================================
+        # CRITICAL CHANGES:
+        # - FIX 1: Kill regex fallback entirely (it poisons everything with garbage like "Polish film")
+        # - FIX 2: Use certified passage span to extract the binding (deterministic patterns)
+        # - FIX 3: Validate bound entity is not generic before allowing hop-2 scoring
+        #
+        # Rule (hard): If certified extraction fails → ABSTAIN. Never invent a relation anchor.
+        binding_source = "none"
+        if inner_relation_type and binding_passages:
+            passage_text = binding_passages[0].get('text', '') if binding_passages else ''
+            if passage_text:
+                bound_entity = extract_object_from_certified_passage(
+                    passage_text,
+                    inner_relation_type
+                )
+                binding_source = "certified" if bound_entity else "failed"
+                if debug:
+                    print(f"  [BINDING SOURCE] {binding_source}")
+                    print(f"  Bound entity (certified): {bound_entity}")
 
-        # ================================================================
-        # ABORT IF CSS BINDING FAILS - DON'T USE GARBAGE FALLBACK
-        # ================================================================
-        # The regex-based fallback (bind_entity_from_hop1_winner) can produce
-        # garbage like "Polish film" which poisons hop-2 retrieval.
-        # Better to abort hop-2 and return hop-1 result than continue with garbage.
-        #
-        # If CSS binding fails, it means either:
-        # 1. The LLM couldn't extract a valid person name from the passage
-        # 2. The extracted name isn't a verbatim substring (hallucination)
-        # 3. The extracted name failed type validation (not PERSON-like)
-        #
-        # In all cases, proceeding with hop-2 would produce wrong answers.
+        # FIX 3: Validate bound entity is not generic
+        if bound_entity and looks_generic(bound_entity):
+            if debug:
+                print(f"  Bound entity '{bound_entity}' is GENERIC - rejecting")
+                binding_source = "generic_rejected"
+            bound_entity = None
+
+        # FIX 1: ABORT IF BINDING FAILS - NO FALLBACK ALLOWED
         if not bound_entity:
             if debug:
                 print(f"  Failed to bind entity from hop-1 - ABSTAIN (required hop-2 cannot be certified)")
@@ -1412,6 +1420,7 @@ class TridentPipeline:
             hop1_result = dict(hop1_result)  # shallow copy
             hop1_result['abstained'] = True
             hop1_result['abstention_reason'] = 'BINDING_FAILED'
+            hop1_result['binding_source'] = binding_source  # Track why binding failed
             # ensure no downstream answer extraction uses partial evidence
             hop1_result['selected_passages'] = hop1_result.get('selected_passages', [])
             hop1_result['certificates'] = hop1_result.get('certificates', [])

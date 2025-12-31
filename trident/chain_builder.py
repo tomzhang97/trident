@@ -2388,6 +2388,183 @@ JSON:"""
 
     return None
 
+
+def extract_object_from_certified_passage(
+    passage_text: str,
+    relation_kind: str
+) -> Optional[str]:
+    """
+    FIX 2: Extract the object (answer) from a CERTIFIED relation passage.
+
+    This is NOT heuristic - it extracts from passages that have already
+    been certified by Safe-Cover. Uses simple, reliable patterns.
+
+    Args:
+        passage_text: The certified passage text
+        relation_kind: The relation type (DIRECTOR, MOTHER, FATHER, etc.)
+
+    Returns:
+        The extracted entity (e.g., "Xawery Żuławski"), or None if not found
+    """
+    if not passage_text:
+        return None
+
+    import os
+    debug = os.environ.get("TRIDENT_DEBUG_CSS", "0") == "1"
+
+    t = passage_text
+    t_lower = t.lower()
+
+    # DIRECTOR: "directed by X"
+    if relation_kind == "DIRECTOR":
+        if "directed" not in t_lower and "director" not in t_lower:
+            return None
+
+        # Pattern: "directed by Name" (most reliable)
+        m = re.search(r"(?i)\bdirected\s+by\s+([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,4})", t)
+        if m:
+            name = m.group(1).strip()
+            # Clean up trailing punctuation
+            name = re.sub(r'[,\.\(\)]+$', '', name)
+            if _looks_like_person(name):
+                if debug:
+                    print(f"[CERTIFIED-EXTRACT] DIRECTOR: '{name}' from 'directed by' pattern")
+                return name
+
+        # Pattern: "director Name" (e.g., "director Xawery Żuławski")
+        m = re.search(r"(?i)\bdirector\s+([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,4})", t)
+        if m:
+            name = m.group(1).strip()
+            name = re.sub(r'[,\.\(\)]+$', '', name)
+            if _looks_like_person(name):
+                if debug:
+                    print(f"[CERTIFIED-EXTRACT] DIRECTOR: '{name}' from 'director X' pattern")
+                return name
+
+    # MOTHER: "mother of X" or "X is the son/daughter of"
+    elif relation_kind in ["MOTHER", "PARENT"]:
+        # Pattern: "mother of X" or "mother X"
+        m = re.search(r"(?i)\bmother\s+(?:of\s+)?([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,4})", t)
+        if m:
+            name = m.group(1).strip()
+            name = re.sub(r'[,\.\(\)]+$', '', name)
+            if _looks_like_person(name):
+                if debug:
+                    print(f"[CERTIFIED-EXTRACT] MOTHER: '{name}' from 'mother of X' pattern")
+                return name
+
+        # Pattern: "X is the son/daughter/child of" -> get subject before "is"
+        m = re.search(r"([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,4})\s+(?:is|was)\s+(?:the\s+)?(?:son|daughter|child)\s+of", t)
+        if m:
+            name = m.group(1).strip()
+            if _looks_like_person(name):
+                if debug:
+                    print(f"[CERTIFIED-EXTRACT] MOTHER: '{name}' from 'X is the son/daughter of' pattern")
+                return name
+
+    # FATHER: "father of X" or "X is the son/daughter of"
+    elif relation_kind == "FATHER":
+        # Pattern: "father of X" or "father X"
+        m = re.search(r"(?i)\bfather\s+(?:of\s+)?([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,4})", t)
+        if m:
+            name = m.group(1).strip()
+            name = re.sub(r'[,\.\(\)]+$', '', name)
+            if _looks_like_person(name):
+                if debug:
+                    print(f"[CERTIFIED-EXTRACT] FATHER: '{name}' from 'father of X' pattern")
+                return name
+
+        # Pattern: "X is the son/daughter/child of" -> get subject before "is"
+        m = re.search(r"([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,4})\s+(?:is|was)\s+(?:the\s+)?(?:son|daughter|child)\s+of", t)
+        if m:
+            name = m.group(1).strip()
+            if _looks_like_person(name):
+                if debug:
+                    print(f"[CERTIFIED-EXTRACT] FATHER: '{name}' from 'X is the son/daughter of' pattern")
+                return name
+
+    # SPOUSE: "married to X" or "spouse X"
+    elif relation_kind == "SPOUSE":
+        m = re.search(r"(?i)\bmarried\s+(?:to\s+)?([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,4})", t)
+        if m:
+            name = m.group(1).strip()
+            name = re.sub(r'[,\.\(\)]+$', '', name)
+            if _looks_like_person(name):
+                if debug:
+                    print(f"[CERTIFIED-EXTRACT] SPOUSE: '{name}' from 'married to X' pattern")
+                return name
+
+    # AUTHOR: "written by X" or "author X"
+    elif relation_kind == "AUTHOR":
+        m = re.search(r"(?i)\bwritten\s+by\s+([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,4})", t)
+        if m:
+            name = m.group(1).strip()
+            name = re.sub(r'[,\.\(\)]+$', '', name)
+            if _looks_like_person(name):
+                if debug:
+                    print(f"[CERTIFIED-EXTRACT] AUTHOR: '{name}' from 'written by X' pattern")
+                return name
+
+        m = re.search(r"(?i)\bauthor\s+([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,4})", t)
+        if m:
+            name = m.group(1).strip()
+            name = re.sub(r'[,\.\(\)]+$', '', name)
+            if _looks_like_person(name):
+                if debug:
+                    print(f"[CERTIFIED-EXTRACT] AUTHOR: '{name}' from 'author X' pattern")
+                return name
+
+    if debug:
+        print(f"[CERTIFIED-EXTRACT] No match for {relation_kind} in passage")
+
+    return None
+
+
+def looks_generic(entity: str) -> bool:
+    """
+    FIX 3: Check if bound entity is generic/invalid for hop-2.
+
+    Returns True if entity looks like:
+    - Generic nouns: "film", "movie", "Polish film"
+    - Common words in lowercase
+    - Too short or invalid
+
+    Returns False if entity looks like a proper named entity.
+    """
+    if not entity or len(entity.strip()) < 2:
+        return True
+
+    entity = entity.strip()
+
+    # Lowercase common nouns are generic
+    if entity.lower() == entity:
+        return True
+
+    # Generic words that should never be hop-2 anchors
+    generic_words = {
+        'film', 'movie', 'book', 'song', 'album', 'series',
+        'city', 'country', 'place', 'person', 'thing',
+        'war', 'battle', 'event', 'show', 'game'
+    }
+
+    entity_lower = entity.lower()
+
+    # Check if it's just a generic word
+    if entity_lower in generic_words:
+        return True
+
+    # Check if it's a generic phrase like "Polish film", "American movie"
+    tokens = entity_lower.split()
+    if len(tokens) == 2 and tokens[1] in generic_words:
+        return True
+
+    # If it contains only generic words, it's generic
+    if all(tok in generic_words for tok in tokens if tok):
+        return True
+
+    return False
+
+
 def build_inner_question_from_facet(facet: Dict[str, Any]) -> str:
     """
     Build the inner question from a hop-1 facet for entity binding.
