@@ -39,6 +39,8 @@ from .chain_builder import (
     get_winner_passages_only,
     extract_object_from_certified_passage,
     extract_answer_from_certified_facet,
+    get_llm_answer_certificate,
+    AnswerCertificate,
     looks_generic,
 )
 
@@ -840,7 +842,45 @@ class TridentPipeline:
                             certified_types = [facet_type_by_id.get(c.get("facet_id")) for c in certificates]
                             print(f"\n[STEP 1] No answer facets certified (only {certified_types})")
                             print(f"  Skipping constrained extraction entirely")
-                            print(f"  Will route to LLM Answer Certificate or abstain")
+                            print(f"  Will route to LLM Answer Certificate fallback")
+
+                    # STEP 4: LLM Answer Certificate fallback (routing policy)
+                    # If answer still empty (no answer facets certified OR typed extraction failed),
+                    # try LLM Answer Certificate as fallback before abstaining
+                    if not answer or answer.strip() == "":
+                        # Get top passages for LLM cert (use answer_passages if available, else winner_passages)
+                        llm_cert_passages = answer_passages if answer_passages else winner_passages
+                        if not llm_cert_passages and result.get('selected_passages'):
+                            # Fallback to top retrieved passages
+                            llm_cert_passages = result['selected_passages'][:10]
+
+                        if llm_cert_passages and self.llm:
+                            if debug_chain or debug_constrained:
+                                print(f"\n[STEP 4] Trying LLM Answer Certificate fallback")
+                                print(f"  Passages: {len(llm_cert_passages)}")
+                                print(f"  Reason: {'no_answer_facets' if not has_answer_facet_certified else 'typed_extraction_failed'}")
+
+                            llm_cert = get_llm_answer_certificate(
+                                llm=self.llm,
+                                question=query,
+                                passages=llm_cert_passages,
+                                max_passages=10,
+                                max_chars_per_passage=600
+                            )
+
+                            if llm_cert and llm_cert.verified:
+                                answer = llm_cert.answer
+                                is_grounded = True
+                                prompt_type = "llm_answer_certificate"
+
+                                if debug_chain or debug_constrained:
+                                    print(f"[STEP 4] ✓ LLM Answer Certificate succeeded")
+                                    print(f"  Answer: '{answer}'")
+                                    print(f"  PID: {llm_cert.pid[:12]}...")
+                                    print(f"  Quote: '{llm_cert.quote[:100]}...'")
+                                    print(f"  Type: {llm_cert.answer_type}")
+                            elif debug_chain or debug_constrained:
+                                print(f"[STEP 4] ✗ LLM Answer Certificate failed (will abstain)")
 
             # ANSWER VALIDATION: ensure we only keep grounded, non-empty answers
             def _is_garbage_answer(ans: str) -> bool:
