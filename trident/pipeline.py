@@ -503,9 +503,41 @@ class TridentPipeline:
             )
         
         # Step 3: Two-stage scoring
-        scores = self._two_stage_scoring(passages, facets)
-        self.telemetry.log("scoring", {"num_scores": len(scores.stage2_scores)})
-        
+        # CRITICAL (Change 10): Don't score placeholder facets in global pre-pass
+        # For compositional questions, hop-2 facets have placeholders like [DIRECTOR_RESULT]
+        # that haven't been instantiated yet. Scoring them produces meaningless results
+        # and logs confusing "GATED OUT" messages.
+        import re
+        placeholder_pattern = re.compile(r'\[([A-Z0-9_]+_RESULT)\]')
+
+        def has_placeholder(facet: Facet) -> bool:
+            """Check if facet template contains placeholder like [DIRECTOR_RESULT]."""
+            tpl = facet.template or {}
+            for field in ("subject", "object", "predicate", "text", "hypothesis"):
+                val = str(tpl.get(field, "") or "")
+                if placeholder_pattern.search(val):
+                    return True
+            return False
+
+        # Filter out placeholder facets for initial scoring
+        scorable_facets = [f for f in facets if not has_placeholder(f)]
+        placeholder_facets = [f for f in facets if has_placeholder(f)]
+
+        debug_prepass = os.environ.get("TRIDENT_DEBUG_PREPASS", "0") == "1"
+        if debug_prepass and placeholder_facets:
+            print(f"\n[PREPASS] Skipped {len(placeholder_facets)} hop2 placeholder facets")
+            for pf in placeholder_facets[:3]:
+                tpl = pf.template or {}
+                print(f"  - {pf.facet_id}: subject={tpl.get('subject', '')}")
+
+        # Score only instantiated facets (hop-1 + any fully-bound facets)
+        scores = self._two_stage_scoring(passages, scorable_facets)
+        self.telemetry.log("scoring", {
+            "num_scores": len(scores.stage2_scores),
+            "num_scorable_facets": len(scorable_facets),
+            "num_placeholder_facets": len(placeholder_facets)
+        })
+
         # Step 4: Mode-specific selection
         # For compositional questions, check if we need two-pass certification
         hop1_facets, hop2_facets = self._split_facets_by_hop(facets)
@@ -1539,7 +1571,37 @@ class TridentPipeline:
                 binding_source = "css"
                 if debug:
                     print(f"  [BINDING SOURCE] CSS")
-                    print(f"  Bound entity (CSS): {bound_entity}")
+                    print(f"  Bound entity (CSS, raw): {bound_entity}")
+
+                # CRITICAL FIX: Expand CSS partial names to full spans
+                # CSS might return "Xawery" when the full name is "Xawery Żuławski"
+                # Expand to the longest capitalized span containing the CSS result
+                if binding_passages:
+                    passage_text = binding_passages[0].get('text', '')
+                    if passage_text and bound_entity in passage_text:
+                        # Find all capitalized spans that contain bound_entity
+                        import re
+                        # Pattern: capital letter followed by non-punctuation, up to 6 tokens
+                        # Captures: "Xawery Żuławski", "J.K. Rowling", etc.
+                        candidate_spans = []
+                        for match in re.finditer(r'\b([A-Z][^.,;(\n]*?(?:\s+[A-Z][^.,;(\n]*?){0,5})\b', passage_text):
+                            span = match.group(1).strip()
+                            # Clean up trailing punctuation
+                            span = re.sub(r'[\s,\.\(\)]+$', '', span)
+                            # Check if this span contains bound_entity as a substring
+                            if bound_entity in span and len(span) > len(bound_entity):
+                                candidate_spans.append(span)
+
+                        # Choose the shortest span that contains bound_entity (most specific)
+                        if candidate_spans:
+                            best_span = min(candidate_spans, key=len)
+                            original_entity = bound_entity
+                            bound_entity = best_span
+                            if debug:
+                                print(f"  [CSS EXPANSION] '{original_entity}' → '{bound_entity}'")
+
+                if debug:
+                    print(f"  Bound entity (CSS, expanded): {bound_entity}")
 
                 # VALIDATION: Check if CSS binding agrees with certified extraction (debug only)
                 if debug and inner_relation_type and binding_passages:
