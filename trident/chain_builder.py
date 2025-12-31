@@ -1766,26 +1766,38 @@ def extract_candidates(
 
     # For PERSON questions
     if question_type.expected_type == "PERSON":
-        # E1 FIX: Punctuation-aware pattern for apostrophes, initials, etc.
-        # Handles: D'Arcy, O'Connor, J.K. Rowling
-        # Includes common name prefixes: de, van, von, la, el, al, bin, ibn
-        person_pattern = re.compile(
-            r"\b([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+(?:de|van|von|la|el|al|bin|ibn)?[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,5})\b"
-        )
+        # CRITICAL FIX: Span-based extraction with full Unicode support
+        # Old pattern missed Polish Ż (U+017B) and other extended Unicode
+        # New approach: Extract until punctuation, handles all languages
+
+        # Also include passage title as high-value candidate
         for p in winner_passages:
+            title = p.get("title", "")
             text = p.get("text") or ""
             pid = p.get("pid", "")
-            for match in person_pattern.finditer(text):
+
+            # Add title as a candidate (often the entity being discussed)
+            if title and _looks_like_person(title):
+                # High support score for title
+                support = len(winner_passages) + 1.0
+                candidates[title] = (support, pid)
+
+            # Extract capitalized spans from text
+            # Pattern: capital letter followed by non-punctuation until delimiter
+            # Captures: "Xawery Żuławski", "J.K. Rowling", "D'Arcy", etc.
+            for match in re.finditer(r'\b([A-Z][^.,;(\n]*?(?:\s+[A-Z][^.,;(\n]*?){0,5})\b', text):
                 name = match.group(1).strip()
+                # Clean trailing whitespace and partial punctuation
+                name = re.sub(r'[\s,\.\(\)]+$', '', name)
+
                 # Validate: looks like a person name
-                if _looks_like_person(name):
+                if name and _looks_like_person(name):
                     # Compute support: count occurrences across all passages
                     support = sum(
                         1 for pp in winner_passages
                         if name.lower() in (pp.get("text") or "").lower()
                     )
                     # MULTI-TOKEN BONUS: Prefer longer spans (more specific)
-                    # Add 0.5 per token to favor multi-token names over single tokens
                     token_count = len(name.split())
                     length_bonus = 0.5 * (token_count - 1)
                     adjusted_support = support + length_bonus
@@ -1794,16 +1806,20 @@ def extract_candidates(
 
         # SUBSTRING DEDUPLICATION: Remove single-token candidates that are
         # substrings of higher-scoring multi-token candidates
-        # E2 FIX: Use normalization so punctuation variants compare correctly
+        # But DON'T remove all single-token candidates (Plato, Madonna, Oregon exist!)
         if len(candidates) > 1:
             to_remove = set()
             sorted_cands = sorted(candidates.items(), key=lambda x: x[1][0], reverse=True)
-            for i, (name1, _) in enumerate(sorted_cands):
+            for i, (name1, (score1, _)) in enumerate(sorted_cands):
                 name1_norm = _normalize_for_dedup(name1)
-                for name2, _ in sorted_cands[i+1:]:
+                for name2, (score2, _) in sorted_cands[i+1:]:
                     name2_norm = _normalize_for_dedup(name2)
-                    # If shorter name is a substring of longer name, mark for removal
-                    if len(name2_norm) < len(name1_norm) and name2_norm in name1_norm:
+                    # Only remove if:
+                    # 1. Shorter name is substring of longer name
+                    # 2. Longer name has significantly better support
+                    if (len(name2_norm) < len(name1_norm) and
+                        name2_norm in name1_norm and
+                        score1 > score2 * 1.2):  # 20% margin
                         to_remove.add(name2)
             for name in to_remove:
                 if name in candidates:
@@ -1933,20 +1949,10 @@ def extract_candidates(
         reverse=True
     )
 
-    # E3 FIX: Check for low-quality candidates and return empty to trigger fallback
-    # For PERSON/ENTITY types, if all candidates are single-token, it's likely noise
-    if question_type.expected_type in ("PERSON", "ENTITY"):
-        if sorted_candidates:
-            max_token_count = max(len(c[0].split()) for c in sorted_candidates)
-            if max_token_count < 2:
-                # All candidates are single tokens - likely low quality
-                # Return empty to trigger CSS fallback instead of picking noise
-                import os
-                debug = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
-                if debug:
-                    print(f"[EXTRACT] Low-quality candidates: all single-token, returning empty")
-                    print(f"[EXTRACT] Would have returned: {[c[0] for c in sorted_candidates[:5]]}")
-                return []
+    # CRITICAL FIX (Change 7): REMOVED single-token rejection logic
+    # Single-token entities ARE valid: "Plato", "Madonna", "Oregon", "Cher", "Prince"
+    # The ranking/support scoring handles quality filtering, not hard rejection
+    # If all candidates are single-token, that's the best we can do from the evidence
 
     return sorted_candidates[:max_candidates]
 
@@ -2427,12 +2433,17 @@ def extract_object_from_certified_passage(
     t = passage_text
     t_lower = t.lower()
 
-    # DIRECTOR: "directed by X"
+    # CRITICAL FIX (Change 8): Normalize relation_kind to handle variants
+    # "DIRECTOR" vs "rel_director_hop1" vs "director"
+    if relation_kind:
+        relation_kind = relation_kind.upper().replace("REL_", "").replace("_HOP1", "").replace("_HOP2", "")
+
+    # DIRECTOR: "directed by X" or "film directed by X"
     if relation_kind == "DIRECTOR":
         if "directed" not in t_lower and "director" not in t_lower:
             return None
 
-        # Pattern: "directed by Name" (most reliable)
+        # Pattern 1: "directed by Name" (most common)
         # Capture full name including extended Unicode (Polish Ż, etc.)
         # Stops at sentence delimiters: . , ; ( or newline
         m = re.search(r"(?i)\bdirected\s+by\s+([A-Z][^.,;(\n]+)", t)
@@ -2445,7 +2456,27 @@ def extract_object_from_certified_passage(
                     print(f"[CERTIFIED-EXTRACT] DIRECTOR: '{name}' from 'directed by' pattern")
                 return name
 
-        # Pattern: "director Name" (e.g., "director Xawery Żuławski")
+        # Pattern 2: "film directed by Name" (Wikipedia common)
+        m = re.search(r"(?i)\bfilm\s+directed\s+by\s+([A-Z][^.,;(\n]+)", t)
+        if m:
+            name = m.group(1).strip()
+            name = re.sub(r'[\s,\.\(\)]+$', '', name)
+            if _looks_like_person(name):
+                if debug:
+                    print(f"[CERTIFIED-EXTRACT] DIRECTOR: '{name}' from 'film directed by' pattern")
+                return name
+
+        # Pattern 3: "is a ... film directed by Name" (handles adjectives/descriptions)
+        m = re.search(r"(?i)is\s+a\s+\w+\s+film\s+directed\s+by\s+([A-Z][^.,;(\n]+)", t)
+        if m:
+            name = m.group(1).strip()
+            name = re.sub(r'[\s,\.\(\)]+$', '', name)
+            if _looks_like_person(name):
+                if debug:
+                    print(f"[CERTIFIED-EXTRACT] DIRECTOR: '{name}' from 'is a film directed by' pattern")
+                return name
+
+        # Pattern 4: "director Name" (e.g., "director Xawery Żuławski")
         m = re.search(r"(?i)\bdirector\s+([A-Z][^.,;(\n]+)", t)
         if m:
             name = m.group(1).strip()
