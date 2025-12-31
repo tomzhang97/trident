@@ -3047,10 +3047,17 @@ CRITICAL RULES:
 
 JSON:"""
 
+    # Parse LLM response (try JSON, then fallback format)
+    answer = ""
+    pid = ""
+    quote = ""
+    answer_type = "entity"
+
     try:
-        # Call LLM
-        response = llm.generate(prompt, max_tokens=200, temperature=0.0)
-        response_text = response.strip()
+        # Call LLM (CRITICAL FIX Step 0: use max_new_tokens not max_tokens)
+        response = llm.generate(prompt, max_new_tokens=200, temperature=0.0)
+        # LLMOutput has .text attribute
+        response_text = response.text.strip()
 
         # Parse JSON (try to extract if wrapped in markdown)
         if "```json" in response_text:
@@ -3058,19 +3065,55 @@ JSON:"""
         elif "```" in response_text:
             response_text = response_text.split("```")[1].split("```")[0].strip()
 
-        cert_dict = json.loads(response_text)
+        # Try JSON parsing first
+        try:
+            cert_dict = json.loads(response_text)
 
-        answer = cert_dict.get("answer", "").strip()
-        pid = cert_dict.get("passage_id", "").strip()
-        quote = cert_dict.get("quote", "").strip()
-        answer_type = cert_dict.get("answer_type", "entity").strip()
+            answer = cert_dict.get("answer", "").strip()
+            pid = cert_dict.get("passage_id", "").strip()
+            quote = cert_dict.get("quote", "").strip()
+            answer_type = cert_dict.get("answer_type", "entity").strip()
 
-        if debug:
-            print(f"\n[LLM CERT] Raw response parsed")
-            print(f"  Answer: '{answer}'")
-            print(f"  PID: {pid}")
-            print(f"  Quote: '{quote[:100]}...'")
-            print(f"  Type: {answer_type}")
+            if debug:
+                print(f"\n[LLM CERT] JSON parsed successfully")
+                print(f"  Answer: '{answer}'")
+                print(f"  PID: {pid}")
+                print(f"  Quote: '{quote[:100]}...'")
+                print(f"  Type: {answer_type}")
+
+        except json.JSONDecodeError as e:
+            # STEP 5: Fallback parsing for non-JSON format
+            # Try to parse "ANSWER: ...\nPID: ...\nQUOTE: ..." format
+            if debug:
+                print(f"[LLM CERT] JSON parse error: {e}")
+                print(f"  Trying fallback parsing...")
+
+            # Parse line-by-line
+            for line in response_text.split('\n'):
+                line = line.strip()
+                if line.startswith("ANSWER:"):
+                    answer = line.split("ANSWER:", 1)[1].strip()
+                elif line.startswith("PID:") or line.startswith("PASSAGE_ID:"):
+                    pid = line.split(":", 1)[1].strip()
+                    # Clean up "context_X" to just the PID
+                    pid = pid.replace("context_", "")
+                elif line.startswith("QUOTE:"):
+                    quote = line.split("QUOTE:", 1)[1].strip()
+                    # Remove surrounding quotes if present
+                    quote = quote.strip('"\'')
+                elif line.startswith("TYPE:") or line.startswith("ANSWER_TYPE:"):
+                    answer_type = line.split(":", 1)[1].strip()
+
+            if debug:
+                print(f"[LLM CERT] Fallback parsed:")
+                print(f"  Answer: '{answer}'")
+                print(f"  PID: {pid}")
+                print(f"  Quote: '{quote[:100]}...'")
+
+            if not (answer and quote and pid):
+                if debug:
+                    print(f"[LLM CERT] Fallback parsing incomplete")
+                return None
 
         # Empty answer means LLM abstained
         if not answer or not quote or not pid:
@@ -3140,11 +3183,6 @@ JSON:"""
 
         return cert
 
-    except json.JSONDecodeError as e:
-        if debug:
-            print(f"[LLM CERT] JSON parse error: {e}")
-            print(f"  Response: {response_text[:200]}")
-        return None
     except Exception as e:
         if debug:
             print(f"[LLM CERT] Error: {e}")

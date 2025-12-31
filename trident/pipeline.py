@@ -848,16 +848,28 @@ class TridentPipeline:
                     # If answer still empty (no answer facets certified OR typed extraction failed),
                     # try LLM Answer Certificate as fallback before abstaining
                     if not answer or answer.strip() == "":
-                        # Get top passages for LLM cert (use answer_passages if available, else winner_passages)
-                        llm_cert_passages = answer_passages if answer_passages else winner_passages
-                        if not llm_cert_passages and result.get('selected_passages'):
-                            # Fallback to top retrieved passages
-                            llm_cert_passages = result['selected_passages'][:10]
+                        # STEP 1 FIX: Use top 6-10 passages from context pool, not just 1-2 winners
+                        # Start with all retrieved passages (not just certified winners)
+                        llm_cert_passages = result.get('selected_passages', [])
+
+                        # Prioritize certified passages if available, but ensure we have at least 6-10 total
+                        if winner_passages and len(winner_passages) < 6:
+                            # Add certified winners to front, then fill with rest
+                            winner_pids = {p.get('pid') for p in winner_passages}
+                            other_passages = [p for p in llm_cert_passages if p.get('pid') not in winner_pids]
+                            llm_cert_passages = winner_passages + other_passages[:max(0, 10 - len(winner_passages))]
+                        elif winner_passages and len(winner_passages) >= 6:
+                            # Have enough certified winners
+                            llm_cert_passages = winner_passages[:10]
+                        # else: use all selected_passages (already set above)
+
+                        # Ensure we have a reasonable number
+                        llm_cert_passages = llm_cert_passages[:10]  # Cap at 10
 
                         if llm_cert_passages and self.llm:
                             if debug_chain or debug_constrained:
                                 print(f"\n[STEP 4] Trying LLM Answer Certificate fallback")
-                                print(f"  Passages: {len(llm_cert_passages)}")
+                                print(f"  Passages: {len(llm_cert_passages)} (STEP 1: using top N from pool)")
                                 print(f"  Reason: {'no_answer_facets' if not has_answer_facet_certified else 'typed_extraction_failed'}")
 
                             llm_cert = get_llm_answer_certificate(
