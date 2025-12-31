@@ -891,14 +891,33 @@ class TridentPipeline:
             if answer_is_invalid:
                 answer = ""
                 is_grounded = False
-            # DEBUG: Log when answer becomes empty after extraction
+
+            # CRITICAL (Answerable Contract): If certification passed but answer is empty, ABSTAIN
+            # Never return empty string when we have certified answer facets
+            # This prevents EM/F1 collapse from "certified but empty" cases
             if not answer or answer.strip() == "":
-                if os.environ.get("TRIDENT_DEBUG_EMPTY_ANSWER", "0") == "1":
+                debug_empty = os.environ.get("TRIDENT_DEBUG_EMPTY_ANSWER", "0") == "1"
+
+                # Check if we had certified answer facets (should have gotten an answer)
+                if certificates and has_answer_facet_certified:
+                    if debug_empty or debug_chain:
+                        print(f"\n[ANSWERABLE CONTRACT VIOLATION]")
+                        print(f"  Certified answer facets: {answer_facet_ids}")
+                        print(f"  But extraction returned empty")
+                        print(f"  Enforcing contract: ABSTAIN instead of empty")
+
+                    # Override to ABSTAIN (contract: never return empty if certified)
+                    answer = "ABSTAIN"
+                    result['abstained'] = True
+                    result['abstention_reason'] = 'extraction_failed_despite_certification'
+                    if 'metrics' not in result:
+                        result['metrics'] = {}
+                    result['metrics']['abstention_reason'] = 'extraction_failed_despite_certification'
+                elif debug_empty:
+                    # Debug: no certified answer facets, empty is expected
                     print(f"\n[EMPTY ANSWER DEBUG]")
                     print(f"  Query: {query[:100]}...")
-                    if prompt:
-                        print(f"  Prompt (last 300 chars): ...{prompt[-300:]}")
-                    print(f"  Extracted answer: '{answer}'")
+                    print(f"  No certified answer facets, empty is expected")
                     print(f"  Mode: {mode}")
                     print(f"  Num passages: {len(result['selected_passages'])}")
 
