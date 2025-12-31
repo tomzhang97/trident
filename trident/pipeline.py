@@ -38,6 +38,7 @@ from .chain_builder import (
     get_answer_facet_passages,
     get_winner_passages_only,
     extract_object_from_certified_passage,
+    extract_answer_from_certified_facet,
     looks_generic,
 )
 
@@ -757,50 +758,77 @@ class TridentPipeline:
                 # Only proceed with extraction if we haven't abstained
                 if not result.get('abstained', False):
                     if debug_chain or debug_constrained:
-                        print(f"\n[CONSTRAINED] Attempting FACET-TARGETED Candidate Selection")
+                        print(f"\n[EXTRACT] Attempting answer extraction from certified facets")
                         print(f"  Answer facets: {answer_facet_ids}")
                         print(f"  Has answer facet certified: {has_answer_facet_certified}")
                         print(f"  Answer passages: {len(answer_passages)} (from answer facets)")
                         print(f"  All winner passages: {len(winner_passages)}")
-                        for wp in answer_passages[:3]:
-                            print(f"    - {wp.get('pid', '')[:12]}... ({len(wp.get('text', ''))} chars)")
 
-                    # CRITICAL FIX: Only run constrained selection if answer facets are certified
-                    # Do NOT fall back to ENTITY-only winner passages - that produces wrong answers
-                    if has_answer_facet_certified and answer_passages:
-                        constrained_result = constrained_span_select(
-                            llm=self.llm,
-                            question=query,
-                            winner_passages=answer_passages,
-                            max_candidates=10,
-                            max_chars_per_passage=600
-                        )
+                    # NEW APPROACH: Try typed extraction first from certified facets
+                    # This enforces "answer from certifying passage only" contract
+                    if has_answer_facet_certified and answer_facet_ids:
+                        # Try extraction for each certified answer facet
+                        extraction_method = "none"
+                        for facet_id in answer_facet_ids:
+                            extracted = extract_answer_from_certified_facet(
+                                facet_id=facet_id,
+                                certificates=certificates,
+                                all_passages=result['selected_passages'],
+                                facets=facet_dicts,
+                                llm=self.llm,
+                                question=query
+                            )
+                            if extracted:
+                                answer = extracted
+                                is_grounded = True
+                                used_constrained = True  # Mark as constrained (from certified passage)
+                                prompt_type = "typed_from_cert"
+                                extraction_method = "typed_first"
 
-                        if constrained_result.reason == "OK":
-                            answer = constrained_result.answer
-                            is_grounded = True
-                            used_constrained = True
-                            prompt_type = "constrained"
+                                if debug_chain or debug_constrained:
+                                    print(f"[EXTRACT] ✓ Success from facet {facet_id[:8]}...")
+                                    print(f"  Answer: '{answer[:100] if answer else ''}'")
+                                    print(f"  Method: typed extraction from certifying passage")
+                                break
 
+                        # If typed extraction failed for all facets, try legacy constrained selection
+                        if not answer and answer_passages:
                             if debug_chain or debug_constrained:
-                                print(f"[CONSTRAINED] Success: '{answer[:50] if answer else ''}' (index={constrained_result.candidate_index})")
-                                print(f"[CONSTRAINED] Confidence: {constrained_result.confidence}")
-                                print(f"[CONSTRAINED] Pool: {answer_selection_reason}")
-                                print(f"[CONSTRAINED] Candidates: {constrained_result.candidates[:3]}...")
-                        elif constrained_result.reason == "FALLBACK_SUPPORT":
-                            # LLM gave invalid index, but we used support-based fallback
-                            answer = constrained_result.answer
-                            is_grounded = True
-                            used_constrained = True
-                            prompt_type = "constrained_fallback"
+                                print(f"[EXTRACT] Typed extraction failed, trying legacy constrained selection...")
 
-                            if debug_chain or debug_constrained:
-                                print(f"[CONSTRAINED] Fallback to support-based: '{answer[:50] if answer else ''}'")
-                        else:
-                            if debug_chain or debug_constrained:
-                                print(f"[CONSTRAINED] Failed: {constrained_result.reason}")
-                                if constrained_result.candidates:
-                                    print(f"[CONSTRAINED] Had {len(constrained_result.candidates)} candidates")
+                            constrained_result = constrained_span_select(
+                                llm=self.llm,
+                                question=query,
+                                winner_passages=answer_passages,
+                                max_candidates=10,
+                                max_chars_per_passage=600
+                            )
+
+                            if constrained_result.reason == "OK":
+                                answer = constrained_result.answer
+                                is_grounded = True
+                                used_constrained = True
+                                prompt_type = "constrained"
+
+                                if debug_chain or debug_constrained:
+                                    print(f"[CONSTRAINED] Success: '{answer[:50] if answer else ''}' (index={constrained_result.candidate_index})")
+                                    print(f"[CONSTRAINED] Confidence: {constrained_result.confidence}")
+                                    print(f"[CONSTRAINED] Pool: {answer_selection_reason}")
+                                    print(f"[CONSTRAINED] Candidates: {constrained_result.candidates[:3]}...")
+                            elif constrained_result.reason == "FALLBACK_SUPPORT":
+                                # LLM gave invalid index, but we used support-based fallback
+                                answer = constrained_result.answer
+                                is_grounded = True
+                                used_constrained = True
+                                prompt_type = "constrained_fallback"
+
+                                if debug_chain or debug_constrained:
+                                    print(f"[CONSTRAINED] Fallback to support-based: '{answer[:50] if answer else ''}'")
+                            else:
+                                if debug_chain or debug_constrained:
+                                    print(f"[CONSTRAINED] Failed: {constrained_result.reason}")
+                                    if constrained_result.candidates:
+                                        print(f"[CONSTRAINED] Had {len(constrained_result.candidates)} candidates")
                     elif certificates and winner_passages:
                         # No answer facets, but we still have certified passages (likely ENTITY).
                         # Attempt extraction from best certified passages instead of skipping outright.

@@ -2754,6 +2754,152 @@ def extract_object_from_certified_passage(
     return None
 
 
+def extract_answer_from_certified_facet(
+    facet_id: str,
+    certificates: List[Dict[str, Any]],
+    all_passages: List[Dict[str, Any]],
+    facets: List[Dict[str, Any]],
+    llm: Any = None,
+    question: str = ""
+) -> Optional[str]:
+    """
+    Extract answer from the winning passage of a certified facet.
+
+    CRITICAL: This enforces "answer from certifying passage only" contract.
+
+    Strategy:
+    1. Find the winning certificate for this facet (lowest p-value)
+    2. Get the winning passage
+    3. Try typed extraction first (deterministic, fast, reliable)
+    4. If typed extraction fails, fall back to LLM (only on that passage)
+    5. Verify extracted span appears in the winning passage
+
+    Args:
+        facet_id: The facet ID to extract answer for
+        certificates: List of certificates from Safe-Cover
+        all_passages: All available passages
+        facets: Facet metadata (for relation_kind)
+        llm: LLM interface for fallback extraction
+        question: Original question (for LLM fallback)
+
+    Returns:
+        Extracted answer string, or None if extraction failed
+    """
+    import os
+    debug = os.environ.get("TRIDENT_DEBUG_EXTRACT", "0") == "1"
+
+    # 1. Find winning certificate for this facet
+    facet_certs = [c for c in certificates if c.get("facet_id") == facet_id]
+    if not facet_certs:
+        if debug:
+            print(f"[EXTRACT] No certificate for facet {facet_id[:8]}...")
+        return None
+
+    # Get best certificate (lowest p-value)
+    best_cert = min(facet_certs, key=lambda c: float(c.get("p_value", 1.0)))
+    winning_pid = best_cert.get("passage_id") or best_cert.get("pid") or ""
+
+    if not winning_pid:
+        if debug:
+            print(f"[EXTRACT] Certificate has no passage_id for facet {facet_id[:8]}...")
+        return None
+
+    # 2. Get winning passage
+    pid_to_passage = {p.get("pid"): p for p in all_passages}
+    if winning_pid not in pid_to_passage:
+        if debug:
+            print(f"[EXTRACT] Winning passage {winning_pid[:12]}... not found")
+        return None
+
+    winning_passage = pid_to_passage[winning_pid]
+    passage_text = winning_passage.get("text", "")
+
+    if not passage_text:
+        if debug:
+            print(f"[EXTRACT] Winning passage has no text")
+        return None
+
+    # 3. Get relation_kind from facet metadata
+    facet_dict = None
+    for f in facets:
+        if f.get("facet_id") == facet_id:
+            facet_dict = f
+            break
+
+    relation_kind = None
+    if facet_dict:
+        tpl = facet_dict.get("template", {})
+        # Try multiple field names for relation type
+        relation_kind = (
+            tpl.get("outer_relation_type") or
+            tpl.get("inner_relation_type") or
+            tpl.get("relation_kind") or
+            tpl.get("relation_type")
+        )
+
+    if debug:
+        print(f"\n[EXTRACT] Facet {facet_id[:8]}...")
+        print(f"  Winning PID: {winning_pid[:12]}...")
+        print(f"  Relation kind: {relation_kind}")
+        print(f"  Passage length: {len(passage_text)} chars")
+
+    # 4. Try typed extraction first (PRIMARY PATH)
+    extracted = None
+    extraction_method = "none"
+
+    if relation_kind:
+        extracted = extract_object_from_certified_passage(passage_text, relation_kind)
+        if extracted:
+            extraction_method = "typed"
+            if debug:
+                print(f"  ✓ Typed extraction: '{extracted}'")
+
+    # 5. Fallback to LLM (SECONDARY PATH) - only if typed extraction failed
+    if not extracted and llm and question:
+        if debug:
+            print(f"  Typed extraction failed, trying LLM fallback...")
+
+        # Use constrained selection with ONLY the winning passage
+        from .chain_builder import constrained_span_select
+        result = constrained_span_select(
+            llm=llm,
+            question=question,
+            winner_passages=[winning_passage],
+            max_candidates=5,
+            max_chars_per_passage=600
+        )
+
+        if result.reason == "OK" and result.answer:
+            extracted = result.answer
+            extraction_method = "llm_fallback"
+            if debug:
+                print(f"  ✓ LLM fallback: '{extracted}'")
+        elif debug:
+            print(f"  ✗ LLM fallback failed: {result.reason}")
+
+    # 6. Verify extracted span appears in winning passage (provenance check)
+    if extracted:
+        # Normalize for verification (handle Unicode, punctuation variations)
+        extracted_norm = extracted.strip().lower()
+        passage_norm = passage_text.lower()
+
+        if extracted_norm not in passage_norm:
+            if debug:
+                print(f"  ✗ Extracted '{extracted}' not found in passage (provenance check failed)")
+            return None
+
+        if debug:
+            print(f"  ✓ Provenance verified: '{extracted}' found in passage")
+            print(f"  Method: {extraction_method}")
+
+        return extracted
+
+    if debug:
+        print(f"  ✗ No extraction succeeded")
+
+    return None
+
+
 def looks_generic(entity: str) -> bool:
     """
     FIX 3: Check if bound entity is generic/invalid for hop-2.
