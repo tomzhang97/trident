@@ -2153,60 +2153,72 @@ JSON:"""
     def _norm_ws(s: str) -> str:
         return " ".join((s or "").split())
 
+    def _normalize_pid(pid: str) -> str:
+        """Normalize PID format: [context_4] -> context_4"""
+        if not pid:
+            return pid
+        # Strip brackets and whitespace
+        return pid.strip().strip("[]")
+
     try:
         resp = llm.generate(span_prompt, temperature=0.0)
         raw = resp.text if hasattr(resp, "text") else str(resp)
-        s = raw.find("{")
-        e = raw.rfind("}")
-        if s != -1 and e != -1:
-            data = json.loads(raw[s:e+1])
+        # Use robust JSON extraction to handle LLM commentary/fences
+        json_str = _extract_first_json_object(raw)
+        data = json.loads(json_str)
 
-            span = data.get("answer_span")
-            pid = data.get("pid")
-            start_char = data.get("start_char")
-            end_char = data.get("end_char")
-            conf = float(data.get("confidence", 0.0))
+        span = data.get("answer_span")
+        pid_raw = data.get("pid")
+        start_char = data.get("start_char")
+        end_char = data.get("end_char")
+        conf = float(data.get("confidence", 0.0))
 
-            if span and pid in snippet_map and isinstance(start_char, int) and isinstance(end_char, int):
-                snippet = snippet_map[pid]
+        # Normalize PID to handle [context_4] vs context_4 inconsistencies
+        pid = _normalize_pid(pid_raw) if pid_raw else None
 
-                match = False
-                if 0 <= start_char < end_char <= len(snippet):
-                    sliced = snippet[start_char:end_char]
-                    if _norm_ws(sliced) == _norm_ws(span):
+        # Also normalize snippet_map keys for comparison
+        snippet_map_normalized = {_normalize_pid(k): v for k, v in snippet_map.items()}
+
+        if span and pid in snippet_map_normalized and isinstance(start_char, int) and isinstance(end_char, int):
+            snippet = snippet_map_normalized[pid]
+
+            match = False
+            if 0 <= start_char < end_char <= len(snippet):
+                sliced = snippet[start_char:end_char]
+                if _norm_ws(sliced) == _norm_ws(span):
+                    match = True
+
+            # Deterministic repair: exact find in original snippet if offsets wrong
+            if not match:
+                idx = snippet.find(span)
+                if idx != -1:
+                    start_char, end_char = idx, idx + len(span)
+                    if _norm_ws(snippet[start_char:end_char]) == _norm_ws(span):
                         match = True
 
-                # Deterministic repair: exact find in original snippet if offsets wrong
-                if not match:
-                    idx = snippet.find(span)
-                    if idx != -1:
-                        start_char, end_char = idx, idx + len(span)
-                        if _norm_ws(snippet[start_char:end_char]) == _norm_ws(span):
-                            match = True
+            if match:
+                # Type sanity checks (lightweight)
+                q_type = detect_question_type(question)
+                ok = True
+                if getattr(q_type, "expected_type", None) == "NUMBER":
+                    ok = bool(re.search(r"\d", span)) and len(span) <= 50
+                elif getattr(q_type, "expected_type", None) == "DATE":
+                    ok = bool(re.search(r"\d{4}", span) or re.search(r"\d", span))
+                elif getattr(q_type, "category", None) == "yes_no":
+                    ok = _norm_ws(span).lower() in {"yes", "no"}
 
-                if match:
-                    # Type sanity checks (lightweight)
-                    q_type = detect_question_type(question)
-                    ok = True
-                    if getattr(q_type, "expected_type", None) == "NUMBER":
-                        ok = bool(re.search(r"\d", span)) and len(span) <= 50
-                    elif getattr(q_type, "expected_type", None) == "DATE":
-                        ok = bool(re.search(r"\d{4}", span) or re.search(r"\d", span))
-                    elif getattr(q_type, "category", None) == "yes_no":
-                        ok = _norm_ws(span).lower() in {"yes", "no"}
-
-                    if ok:
-                        if debug:
-                            print(f"[FROZEN-SPAN] pid={pid} span='{span}' [{start_char}:{end_char}] conf={conf:.2f}")
-                        return ConstrainedSelectionResult(
-                            answer=span,
-                            candidate_index=0,
-                            confidence=conf,
-                            passage_id=pid,
-                            candidates=[span],
-                            support_scores=[1.0],
-                            reason="OK_FROZEN_SPAN"
-                        )
+                if ok:
+                    if debug:
+                        print(f"[FROZEN-SPAN] pid={pid} span='{span}' [{start_char}:{end_char}] conf={conf:.2f}")
+                    return ConstrainedSelectionResult(
+                        answer=span,
+                        candidate_index=0,
+                        confidence=conf,
+                        passage_id=pid,
+                        candidates=[span],
+                        support_scores=[1.0],
+                        reason="OK_FROZEN_SPAN"
+                    )
     except Exception as ex:
         if debug:
             print(f"[FROZEN-SPAN] Failed: {ex}")
@@ -2517,6 +2529,67 @@ def extract_object_from_certified_passage(
                 if debug:
                     print(f"[CERTIFIED-EXTRACT] AUTHOR: '{name}' from 'author X' pattern")
                 return name
+
+    # BIRTHPLACE: "born in X" or "birthplace X"
+    elif relation_kind == "BIRTHPLACE":
+        # Pattern: "born in Location" or "born at Location"
+        m = re.search(r"(?i)\bborn\s+(?:in|at)\s+([A-Z][^.,;(\n]+)", t)
+        if m:
+            place = m.group(1).strip()
+            place = re.sub(r'[\s,\.\(\)]+$', '', place)
+            if debug:
+                print(f"[CERTIFIED-EXTRACT] BIRTHPLACE: '{place}' from 'born in X' pattern")
+            return place
+
+        # Pattern: "birthplace: X"
+        m = re.search(r"(?i)\bbirthplace[:\s]+([A-Z][^.,;(\n]+)", t)
+        if m:
+            place = m.group(1).strip()
+            place = re.sub(r'[\s,\.\(\)]+$', '', place)
+            if debug:
+                print(f"[CERTIFIED-EXTRACT] BIRTHPLACE: '{place}' from 'birthplace X' pattern")
+            return place
+
+    # FOUNDER: "founded by X" or "founder X"
+    elif relation_kind == "FOUNDER":
+        # Pattern: "founded by Person" or "established by Person"
+        m = re.search(r"(?i)\b(?:founded|established|created)\s+by\s+([A-Z][^.,;(\n]+)", t)
+        if m:
+            name = m.group(1).strip()
+            name = re.sub(r'[\s,\.\(\)]+$', '', name)
+            if _looks_like_person(name):
+                if debug:
+                    print(f"[CERTIFIED-EXTRACT] FOUNDER: '{name}' from 'founded by X' pattern")
+                return name
+
+        # Pattern: "founder: X"
+        m = re.search(r"(?i)\bfounder[:\s]+([A-Z][^.,;(\n]+)", t)
+        if m:
+            name = m.group(1).strip()
+            name = re.sub(r'[\s,\.\(\)]+$', '', name)
+            if _looks_like_person(name):
+                if debug:
+                    print(f"[CERTIFIED-EXTRACT] FOUNDER: '{name}' from 'founder X' pattern")
+                return name
+
+    # NATIONALITY: Extract the nationality/country from patterns
+    elif relation_kind == "NATIONALITY":
+        # Pattern: "is a Polish actress" / "was a French writer"
+        m = re.search(r"(?:is|was)\s+a\s+([A-Z][a-z]+)\s+(?:actor|actress|writer|director|artist|politician|scientist)", t)
+        if m:
+            nationality = m.group(1).strip()
+            if debug:
+                print(f"[CERTIFIED-EXTRACT] NATIONALITY: '{nationality}' from 'is a X actor' pattern")
+            return nationality
+
+        # Pattern: "from Country" or "citizen of Country"
+        m = re.search(r"(?i)\b(?:from|citizen\s+of|national\s+of)\s+([A-Z][^.,;(\n]+)", t)
+        if m:
+            nationality = m.group(1).strip()
+            nationality = re.sub(r'[\s,\.\(\)]+$', '', nationality)
+            if debug:
+                print(f"[CERTIFIED-EXTRACT] NATIONALITY: '{nationality}' from 'from X' pattern")
+            return nationality
 
     if debug:
         print(f"[CERTIFIED-EXTRACT] No match for {relation_kind} in passage")

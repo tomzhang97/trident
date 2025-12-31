@@ -353,21 +353,63 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         if relation_kind or relation_pid:
             predicate_ok = _check_relation_keywords(relation_kind, passage_norm, passage_tokens, relation_pid=relation_pid)
 
-        # CRITICAL FIX: For MOTHER/FATHER/PARENT relations with WH subject,
-        # allow inverse relation keywords (e.g., "son of", "daughter of")
-        # because the evidence expresses the inverse relation:
-        # Question: "Who is the mother of Xawery?"
-        # Passage: "Xawery is the son of Małgorzata Braunek"
-        # These are logically equivalent but lexically inverted.
+        # CRITICAL FIX: For WH-subject relations, allow inverse surface forms
+        # Many KB-style relations appear in inverse surface forms in text:
+        # - mother/father ↔ son/daughter/child
+        # - spouse ↔ married to / husband/wife
+        # - birthplace ↔ born in
+        # - founder ↔ founded by / established by
+        # - author ↔ written by / composed by
+        # - director ↔ directed by / filmmaker
         if not predicate_ok and is_wh_subject and relation_kind:
             kind_upper = relation_kind.upper()
-            if kind_upper in {"MOTHER", "FATHER", "PARENT"}:
-                # Allow inverse keywords for parent relations
-                inverse_keywords = {
+
+            # Relation-specific inverse keyword mapping
+            inverse_map = {
+                "MOTHER": {
                     "son of", "daughter of", "child of",
                     "is the son", "is the daughter", "is the child",
                     "was the son", "was the daughter", "was the child"
-                }
+                },
+                "FATHER": {
+                    "son of", "daughter of", "child of",
+                    "is the son", "is the daughter", "is the child",
+                    "was the son", "was the daughter", "was the child"
+                },
+                "PARENT": {
+                    "son of", "daughter of", "child of",
+                    "is the son", "is the daughter", "is the child",
+                    "was the son", "was the daughter", "was the child"
+                },
+                "SPOUSE": {
+                    "married to", "married", "husband of", "wife of",
+                    "is married to", "was married to",
+                    "spouse of", "partner of"
+                },
+                "BIRTHPLACE": {
+                    "born in", "born at", "native of", "birth",
+                    "was born in", "was born at"
+                },
+                "FOUNDER": {
+                    "founded by", "established by", "created by",
+                    "was founded by", "was established by"
+                },
+                "AUTHOR": {
+                    "written by", "composed by", "authored by",
+                    "was written by", "was composed by"
+                },
+                "DIRECTOR": {
+                    "directed by", "film by", "directed",
+                    "was directed by"
+                },
+                "NATIONALITY": {
+                    "is a", "was a", "from", "national of",
+                    "citizen of", "born in"
+                },
+            }
+
+            inverse_keywords = inverse_map.get(kind_upper, set())
+            if inverse_keywords:
                 for kw in inverse_keywords:
                     if _fuzzy_phrase_match(kw, passage_norm, passage_tokens):
                         predicate_ok = True
