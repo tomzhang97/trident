@@ -424,7 +424,7 @@ class TridentPipeline:
         if not facets:
             latency_ms = (time.time() - start_time) * 1000
             return PipelineOutput(
-                answer="ABSTAINED",
+                answer="ABSTAIN",
                 selected_passages=[],
                 certificates=None,
                 abstained=True,
@@ -450,7 +450,7 @@ class TridentPipeline:
         if not passages:
             latency_ms = (time.time() - start_time) * 1000
             return PipelineOutput(
-                answer="ABSTAINED",
+                answer="ABSTAIN",
                 selected_passages=[],
                 certificates=None,
                 abstained=True,
@@ -783,18 +783,26 @@ class TridentPipeline:
                 prompt_tokens = 0
                 completion_tokens = 0
         else:
-            answer = "ABSTAINED" if result['abstained'] else ""
+            # CRITICAL: Standardize abstention output contract
+            # When abstained, answer must be "ABSTAIN" (not "ABSTAINED" or verbose message)
+            # This ensures consistent output for downstream processing
+            answer = "ABSTAIN"
             total_tokens = 0
             prompt_tokens = 0
             completion_tokens = 0
             prompt_type = "none"
-        
+
         # Calculate total latency
         latency_ms = (time.time() - start_time) * 1000
 
         # Check if model abstained (either selection abstained OR model said "I cannot answer")
-        model_abstained = (answer == ABSTAIN_STR)
+        # Normalize to consistent "ABSTAIN" string
+        model_abstained = (answer == ABSTAIN_STR) or (answer == "ABSTAIN")
         final_abstained = result['abstained'] or model_abstained
+
+        # CRITICAL: Enforce abstention contract - when abstained, answer must be "ABSTAIN"
+        if final_abstained and answer not in ["ABSTAIN", ABSTAIN_STR]:
+            answer = "ABSTAIN"
 
         # Prepare output
         metrics = result.get('metrics', {})
