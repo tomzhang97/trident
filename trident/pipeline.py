@@ -1312,7 +1312,7 @@ class TridentPipeline:
         # ============================================================
         # STAGE A: Certify hop-1 facets
         # ============================================================
-        hop1_scores = self._score_facets_two_stage(hop1_facets, passages)
+        hop1_scores = self._two_stage_scoring(passages, hop1_facets)
         hop1_result = self._run_safe_cover(hop1_facets, passages, hop1_scores)
 
         if debug:
