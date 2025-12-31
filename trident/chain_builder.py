@@ -2421,21 +2421,23 @@ def extract_object_from_certified_passage(
             return None
 
         # Pattern: "directed by Name" (most reliable)
-        m = re.search(r"(?i)\bdirected\s+by\s+([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,4})", t)
+        # Capture full name including extended Unicode (Polish Ż, etc.)
+        # Stops at sentence delimiters: . , ; ( or newline
+        m = re.search(r"(?i)\bdirected\s+by\s+([A-Z][^.,;(\n]+)", t)
         if m:
             name = m.group(1).strip()
-            # Clean up trailing punctuation
-            name = re.sub(r'[,\.\(\)]+$', '', name)
+            # Clean up trailing punctuation/whitespace
+            name = re.sub(r'[\s,\.\(\)]+$', '', name)
             if _looks_like_person(name):
                 if debug:
                     print(f"[CERTIFIED-EXTRACT] DIRECTOR: '{name}' from 'directed by' pattern")
                 return name
 
         # Pattern: "director Name" (e.g., "director Xawery Żuławski")
-        m = re.search(r"(?i)\bdirector\s+([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,4})", t)
+        m = re.search(r"(?i)\bdirector\s+([A-Z][^.,;(\n]+)", t)
         if m:
             name = m.group(1).strip()
-            name = re.sub(r'[,\.\(\)]+$', '', name)
+            name = re.sub(r'[\s,\.\(\)]+$', '', name)
             if _looks_like_person(name):
                 if debug:
                     print(f"[CERTIFIED-EXTRACT] DIRECTOR: '{name}' from 'director X' pattern")
@@ -2444,17 +2446,19 @@ def extract_object_from_certified_passage(
     # MOTHER: "mother of X" or "X is the son/daughter of"
     elif relation_kind in ["MOTHER", "PARENT"]:
         # Pattern: "mother of X" or "mother X"
-        m = re.search(r"(?i)\bmother\s+(?:of\s+)?([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,4})", t)
+        # Stops at sentence delimiters to capture full name
+        m = re.search(r"(?i)\bmother\s+(?:of\s+)?([A-Z][^.,;(\n]+)", t)
         if m:
             name = m.group(1).strip()
-            name = re.sub(r'[,\.\(\)]+$', '', name)
+            name = re.sub(r'[\s,\.\(\)]+$', '', name)
             if _looks_like_person(name):
                 if debug:
                     print(f"[CERTIFIED-EXTRACT] MOTHER: '{name}' from 'mother of X' pattern")
                 return name
 
         # Pattern: "X is the son/daughter/child of" -> get subject before "is"
-        m = re.search(r"([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,4})\s+(?:is|was)\s+(?:the\s+)?(?:son|daughter|child)\s+of", t)
+        # Extract full subject name including extended Unicode
+        m = re.search(r"\b([A-Z][^.,;(\n]+?)\s+(?:is|was)\s+(?:the\s+)?(?:son|daughter|child)\s+of", t)
         if m:
             name = m.group(1).strip()
             if _looks_like_person(name):
@@ -2465,17 +2469,17 @@ def extract_object_from_certified_passage(
     # FATHER: "father of X" or "X is the son/daughter of"
     elif relation_kind == "FATHER":
         # Pattern: "father of X" or "father X"
-        m = re.search(r"(?i)\bfather\s+(?:of\s+)?([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,4})", t)
+        m = re.search(r"(?i)\bfather\s+(?:of\s+)?([A-Z][^.,;(\n]+)", t)
         if m:
             name = m.group(1).strip()
-            name = re.sub(r'[,\.\(\)]+$', '', name)
+            name = re.sub(r'[\s,\.\(\)]+$', '', name)
             if _looks_like_person(name):
                 if debug:
                     print(f"[CERTIFIED-EXTRACT] FATHER: '{name}' from 'father of X' pattern")
                 return name
 
         # Pattern: "X is the son/daughter/child of" -> get subject before "is"
-        m = re.search(r"([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,4})\s+(?:is|was)\s+(?:the\s+)?(?:son|daughter|child)\s+of", t)
+        m = re.search(r"\b([A-Z][^.,;(\n]+?)\s+(?:is|was)\s+(?:the\s+)?(?:son|daughter|child)\s+of", t)
         if m:
             name = m.group(1).strip()
             if _looks_like_person(name):
@@ -2485,10 +2489,10 @@ def extract_object_from_certified_passage(
 
     # SPOUSE: "married to X" or "spouse X"
     elif relation_kind == "SPOUSE":
-        m = re.search(r"(?i)\bmarried\s+(?:to\s+)?([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,4})", t)
+        m = re.search(r"(?i)\bmarried\s+(?:to\s+)?([A-Z][^.,;(\n]+)", t)
         if m:
             name = m.group(1).strip()
-            name = re.sub(r'[,\.\(\)]+$', '', name)
+            name = re.sub(r'[\s,\.\(\)]+$', '', name)
             if _looks_like_person(name):
                 if debug:
                     print(f"[CERTIFIED-EXTRACT] SPOUSE: '{name}' from 'married to X' pattern")
@@ -2496,19 +2500,19 @@ def extract_object_from_certified_passage(
 
     # AUTHOR: "written by X" or "author X"
     elif relation_kind == "AUTHOR":
-        m = re.search(r"(?i)\bwritten\s+by\s+([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,4})", t)
+        m = re.search(r"(?i)\bwritten\s+by\s+([A-Z][^.,;(\n]+)", t)
         if m:
             name = m.group(1).strip()
-            name = re.sub(r'[,\.\(\)]+$', '', name)
+            name = re.sub(r'[\s,\.\(\)]+$', '', name)
             if _looks_like_person(name):
                 if debug:
                     print(f"[CERTIFIED-EXTRACT] AUTHOR: '{name}' from 'written by X' pattern")
                 return name
 
-        m = re.search(r"(?i)\bauthor\s+([A-Z][a-zA-ZÀ-ÿ''\.­-]+(?:\s+[A-Z][a-zA-ZÀ-ÿ''\.­-]+){0,4})", t)
+        m = re.search(r"(?i)\bauthor\s+([A-Z][^.,;(\n]+)", t)
         if m:
             name = m.group(1).strip()
-            name = re.sub(r'[,\.\(\)]+$', '', name)
+            name = re.sub(r'[\s,\.\(\)]+$', '', name)
             if _looks_like_person(name):
                 if debug:
                     print(f"[CERTIFIED-EXTRACT] AUTHOR: '{name}' from 'author X' pattern")

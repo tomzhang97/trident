@@ -352,6 +352,27 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
         predicate_ok = False
         if relation_kind or relation_pid:
             predicate_ok = _check_relation_keywords(relation_kind, passage_norm, passage_tokens, relation_pid=relation_pid)
+
+        # CRITICAL FIX: For MOTHER/FATHER/PARENT relations with WH subject,
+        # allow inverse relation keywords (e.g., "son of", "daughter of")
+        # because the evidence expresses the inverse relation:
+        # Question: "Who is the mother of Xawery?"
+        # Passage: "Xawery is the son of Małgorzata Braunek"
+        # These are logically equivalent but lexically inverted.
+        if not predicate_ok and is_wh_subject and relation_kind:
+            kind_upper = relation_kind.upper()
+            if kind_upper in {"MOTHER", "FATHER", "PARENT"}:
+                # Allow inverse keywords for parent relations
+                inverse_keywords = {
+                    "son of", "daughter of", "child of",
+                    "is the son", "is the daughter", "is the child",
+                    "was the son", "was the daughter", "was the child"
+                }
+                for kw in inverse_keywords:
+                    if _fuzzy_phrase_match(kw, passage_norm, passage_tokens):
+                        predicate_ok = True
+                        break
+
         if not predicate_ok and predicate:
             predicate_ok = _fuzzy_phrase_match(predicate, passage_norm, passage_tokens)
 
