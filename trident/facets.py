@@ -39,13 +39,56 @@ def _safe_phrase(s: str) -> str:
     return _clean_text(s)
 
 def _looks_like_junk_entity(mention: str) -> bool:
+    """
+    Filter junk ENTITY facets that waste cover budget and dilute certification.
+
+    Rejects:
+    - Generic nouns: "film", "movie", "song", "album", "book", "episode", "series", etc.
+    - Partial punctuation entities: ", Blind Shaft", " Film", etc.
+    - WH-leading contamination: "Are North Marion High School"
+    - Single-letter or very short non-informative tokens
+    """
     m = _safe_phrase(mention)
     if not m: return True
+
+    # CRITICAL FIX: Filter leading/trailing punctuation
+    # Rejects: ", Blind Shaft", " Film", "Film,", etc.
+    if m[0] in ",.;:!?'\"-" or m[-1] in ",.;:!?'\"":
+        return True
+
     ml = m.lower()
-    bad_tokens = {"first", "second", "third", "which", "what", "who", "when", "where", "one", "two", "this", "that", "the", "a", "an", "and", "or"}
-    if ml in bad_tokens: return True
+
+    # CRITICAL FIX: Expanded stoplist of generic nouns
+    # These waste cover budget and create false positives for "required facet" logic
+    generic_nouns = {
+        "first", "second", "third", "which", "what", "who", "when", "where", "one", "two",
+        "this", "that", "the", "a", "an", "and", "or",
+        # Media types
+        "film", "movie", "song", "album", "book", "episode", "series", "season", "game",
+        "show", "documentary", "video", "track", "record", "novel", "story", "play",
+        # Generic places/things
+        "city", "town", "country", "place", "location", "area", "region",
+        "thing", "person", "people", "man", "woman", "group", "team", "company",
+        # Generic roles
+        "director", "actor", "actress", "writer", "author", "artist", "musician",
+        "singer", "player", "coach", "politician", "scientist", "president",
+    }
+
+    if ml in generic_nouns: return True
+
+    # CRITICAL FIX: Filter WH-leading contamination
+    # Rejects: "Are North Marion High School", "Is John", "The Film", etc.
+    wh_prefixes = {"are", "is", "was", "were", "the", "a", "an", "can", "will", "would", "could"}
+    first_token = ml.split()[0] if ml.split() else ""
+    if first_token in wh_prefixes:
+        return True
+
+    # Single token that's very short and non-informative
     if len(m.split()) == 1 and len(m) <= 3: return True
+
+    # Bare numbers
     if re.fullmatch(r"\d+(\.\d+)?", ml): return True
+
     return False
 
 # WH-words and generic terms that should not be treated as real RELATION endpoints

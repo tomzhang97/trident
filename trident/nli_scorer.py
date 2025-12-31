@@ -329,12 +329,26 @@ def _check_lexical_gate(facet: Facet, passage_text: str) -> Optional[bool]:
             if len(overlap) >= 2 or (len(o_tokens) <= 2 and len(overlap) >= 1):
                 o_match = True
 
-        anchor_policy = str(tpl.get("anchor_policy") or "ANY").upper()
-        if anchor_policy not in {"ANY", "ALL"}:
-            anchor_policy = "ANY"
+        # CRITICAL FIX: For hop-2 outer relation facets (e.g., "mother of director of Film"),
+        # allow single-endpoint anchor policy where only the bound entity needs to appear.
+        # This makes hop-2 certification viable at scale for compositional questions.
+        is_hop2_outer = bool(tpl.get("outer_relation_type"))
+        if is_hop2_outer and is_wh_subject:
+            # For hop-2 WH-subject facets (e.g., "Who is the mother of Xawery?"):
+            # - Object = bound entity from hop-1 (e.g., "Xawery")
+            # - Subject = unknown answer (e.g., "Who")
+            # Only require object anchor (bound entity), not both endpoints
+            anchor_policy = "SINGLE_ENDPOINT"
+        else:
+            anchor_policy = str(tpl.get("anchor_policy") or "ANY").upper()
+            if anchor_policy not in {"ANY", "ALL"}:
+                anchor_policy = "ANY"
 
         anchor_ok = False
-        if is_wh_subject and is_wh_object:
+        if anchor_policy == "SINGLE_ENDPOINT":
+            # For hop-2: only require the bound entity (object) to match
+            anchor_ok = bool(o_match)
+        elif is_wh_subject and is_wh_object:
             anchor_ok = bool(s_match or o_match)
         elif is_wh_subject:
             anchor_ok = bool(o_match)

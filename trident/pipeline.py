@@ -1423,35 +1423,69 @@ class TridentPipeline:
                         print(f"  G1: Using only binding passage: {binding_pid[:12]}...")
 
         # ================================================================
-        # FIX 1, 2, 3: Use CERTIFIED extraction (no CSS, no regex fallback)
+        # CRITICAL: CSS binding is the PRIMARY path (scales better)
         # ================================================================
-        # CRITICAL CHANGES:
-        # - FIX 1: Kill regex fallback entirely (it poisons everything with garbage like "Polish film")
-        # - FIX 2: Use certified passage span to extract the binding (deterministic patterns)
-        # - FIX 3: Validate bound entity is not generic before allowing hop-2 scoring
+        # Strategy:
+        # 1. Try CSS binding first (uses LLM with fixed inner question)
+        # 2. Validate extracted entity is not generic
+        # 3. Optionally use certified extraction as debug validator
+        # 4. If CSS fails, try certified extraction as fallback
+        # 5. If both fail → ABSTAIN
         #
-        # Rule (hard): If certified extraction fails → ABSTAIN. Never invent a relation anchor.
+        # Rationale:
+        # - CSS covers Wikipedia phrasing variations better than regex
+        # - CSS has provenance check (must be substring of snippet)
+        # - Typed regex is kept only for validation/fallback
         binding_source = "none"
-        if inner_relation_type and binding_passages:
-            passage_text = binding_passages[0].get('text', '') if binding_passages else ''
+        bound_entity = None
+
+        # PRIMARY PATH: CSS binding with fixed inner question
+        if inner_question and binding_passages:
+            from .chain_builder import bind_entity_via_css
+            bound_entity = bind_entity_via_css(
+                llm=self.llm,
+                inner_question=inner_question,
+                hop1_passages=binding_passages,
+                max_chars=600
+            )
+            if bound_entity:
+                binding_source = "css"
+                if debug:
+                    print(f"  [BINDING SOURCE] CSS")
+                    print(f"  Bound entity (CSS): {bound_entity}")
+
+                # VALIDATION: Check if CSS binding agrees with certified extraction (debug only)
+                if debug and inner_relation_type and binding_passages:
+                    passage_text = binding_passages[0].get('text', '')
+                    certified_entity = extract_object_from_certified_passage(
+                        passage_text,
+                        inner_relation_type
+                    )
+                    if certified_entity and certified_entity != bound_entity:
+                        print(f"  [BINDING MISMATCH] CSS='{bound_entity}' vs CERTIFIED='{certified_entity}'")
+
+        # FALLBACK PATH: Certified extraction if CSS failed
+        if not bound_entity and inner_relation_type and binding_passages:
+            passage_text = binding_passages[0].get('text', '')
             if passage_text:
                 bound_entity = extract_object_from_certified_passage(
                     passage_text,
                     inner_relation_type
                 )
-                binding_source = "certified" if bound_entity else "failed"
-                if debug:
-                    print(f"  [BINDING SOURCE] {binding_source}")
-                    print(f"  Bound entity (certified): {bound_entity}")
+                if bound_entity:
+                    binding_source = "certified_fallback"
+                    if debug:
+                        print(f"  [BINDING SOURCE] CERTIFIED (fallback)")
+                        print(f"  Bound entity (certified): {bound_entity}")
 
-        # FIX 3: Validate bound entity is not generic
+        # VALIDATION: Reject generic entities
         if bound_entity and looks_generic(bound_entity):
             if debug:
                 print(f"  Bound entity '{bound_entity}' is GENERIC - rejecting")
-                binding_source = "generic_rejected"
+            binding_source = "generic_rejected"
             bound_entity = None
 
-        # FIX 1: ABORT IF BINDING FAILS - NO FALLBACK ALLOWED
+        # ABORT IF BINDING FAILS - NO FURTHER FALLBACKS
         if not bound_entity:
             if debug:
                 print(f"  Failed to bind entity from hop-1 - ABSTAIN (required hop-2 cannot be certified)")

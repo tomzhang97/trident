@@ -2646,8 +2646,12 @@ def build_inner_question_from_facet(facet: Dict[str, Any]) -> str:
     """
     Build the inner question from a hop-1 facet for entity binding.
 
+    CRITICAL: Normalizes subject="?" to proper WH words to avoid malformed prompts.
+    Example: "? directed Polish-Russian War?" → "Who directed Polish-Russian War?"
+
     Example facet template:
-        {"subject": "Who", "predicate": "is the director of", "object": "Polish-Russian War"}
+        {"subject": "?", "predicate": "directed", "object": "Polish-Russian War",
+         "inner_relation_type": "DIRECTOR"}
 
     Returns:
         "Who is the director of Polish-Russian War?"
@@ -2656,6 +2660,58 @@ def build_inner_question_from_facet(facet: Dict[str, Any]) -> str:
     subject = template.get("subject", "Who")
     predicate = template.get("predicate", "")
     obj = template.get("object", "")
+    relation_type = template.get("inner_relation_type") or template.get("relation_kind", "")
+
+    # CRITICAL FIX: Normalize subject="?" to proper WH word
+    # This prevents malformed binding questions like "? directed Polish-Russian War?"
+    if subject in {"?", "", "who", "what", "which", "where", "when"}:
+        # Infer WH word from relation type
+        if relation_type:
+            rel_upper = relation_type.upper()
+            if rel_upper in {"DIRECTOR", "MOTHER", "FATHER", "SPOUSE", "AUTHOR", "FOUNDER", "CREATOR"}:
+                subject = "Who"
+            elif rel_upper in {"BIRTHPLACE", "BORN", "LOCATION", "CAPITAL", "LOCATED_IN"}:
+                subject = "Where"
+            elif rel_upper in {"DATE", "BORN_DATE", "DIED_DATE", "FOUNDED_DATE"}:
+                subject = "When"
+            elif "COMPARISON" in rel_upper or "CHOICE" in rel_upper:
+                subject = "Which"
+            else:
+                subject = "What"
+        else:
+            # Default based on predicate if no relation type
+            pred_lower = predicate.lower()
+            if any(kw in pred_lower for kw in ["director", "mother", "father", "spouse", "author", "founder", "creator"]):
+                subject = "Who"
+            elif any(kw in pred_lower for kw in ["born", "birthplace", "location", "capital", "located"]):
+                subject = "Where"
+            elif any(kw in pred_lower for kw in ["date", "when", "year"]):
+                subject = "When"
+            else:
+                subject = "What"
+
+    # CRITICAL FIX: Ensure predicate is grammatical
+    # Prefer "is the director of" over bare verb "directed"
+    if relation_type and predicate:
+        rel_upper = relation_type.upper()
+        pred_lower = predicate.lower().strip()
+
+        # Normalize common bare verbs to grammatical forms
+        if rel_upper == "DIRECTOR" and pred_lower in {"directed", "direct"}:
+            predicate = "is the director of"
+        elif rel_upper == "AUTHOR" and pred_lower in {"wrote", "written", "authored"}:
+            predicate = "is the author of"
+        elif rel_upper == "FOUNDER" and pred_lower in {"founded", "established", "created"}:
+            predicate = "is the founder of"
+        elif rel_upper in {"MOTHER", "FATHER"} and pred_lower in {"parent", "parents"}:
+            if rel_upper == "MOTHER":
+                predicate = "is the mother of"
+            else:
+                predicate = "is the father of"
+        elif rel_upper == "SPOUSE" and pred_lower in {"married", "spouse"}:
+            predicate = "is the spouse of"
+        elif rel_upper in {"BIRTHPLACE", "BORN"} and pred_lower in {"born", "birthplace"}:
+            predicate = "was born in"
 
     # Build natural question
     question = f"{subject} {predicate} {obj}".strip()
