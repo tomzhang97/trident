@@ -1493,6 +1493,33 @@ class TridentPipeline:
             binding_source = "generic_rejected"
             bound_entity = None
 
+        # CRITICAL FIX (Change 11): Binding provenance invariants
+        # Prevents silent regressions by asserting binding contract
+        if bound_entity:
+            # Invariant 1: Bound entity is non-empty and not generic
+            assert bound_entity and bound_entity.strip(), f"Bound entity is empty: {bound_entity!r}"
+            assert not looks_generic(bound_entity), f"Bound entity is generic: {bound_entity!r}"
+
+            # Invariant 2: Bound entity appears in binding passage (provenance check)
+            if binding_passages:
+                passage_text = binding_passages[0].get('text', '')
+                assert bound_entity in passage_text, \
+                    f"Bound entity '{bound_entity}' not found in binding passage (source={binding_source})"
+
+            # Store provenance for debugging
+            if binding_cert:
+                binding_pid = binding_cert.get('passage_id', '')
+            elif binding_passages:
+                binding_pid = binding_passages[0].get('pid', '')
+            else:
+                binding_pid = ''
+
+            if debug:
+                print(f"  [BINDING INVARIANTS] All checks passed")
+                print(f"    Entity: '{bound_entity}'")
+                print(f"    Source: {binding_source}")
+                print(f"    PID: {binding_pid[:12]}...")
+
         # ABORT IF BINDING FAILS - NO FURTHER FALLBACKS
         if not bound_entity:
             if debug:
@@ -1757,6 +1784,8 @@ class TridentPipeline:
                 'hop2_coverage': hop2_result.get('metrics', {}).get('coverage', 0),
                 'bound_entity': bound_entity,
                 'inner_relation_type': inner_relation_type,
+                'binding_source': binding_source,  # CHANGE 11: Track binding provenance
+                'binding_pid': binding_pid if 'binding_pid' in locals() else '',  # CHANGE 11
                 'two_pass': True,
             }
         }
