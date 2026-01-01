@@ -346,6 +346,72 @@ def _extract_death_year(text: str, person: str) -> Optional[int]:
     return None
 
 
+# =============================================================================
+# CHANGE 1: QUESTION-INTENT → ANSWER-TYPE GATING
+# =============================================================================
+
+def detect_question_intent(question: str) -> str:
+    """
+    Detect the high-level intent of a question to gate answer types.
+
+    This prevents type mismatches like:
+    - "Who won award X?" returning entity instead of award name
+    - "Which film came first?" returning date instead of film title
+
+    Returns:
+        Intent category: "temporal", "comparison", "award", "person",
+                        "location", "yesno", "entity", "other"
+    """
+    q_lower = question.lower()
+
+    # Temporal questions: when, what year, what date
+    if any(word in q_lower for word in ["when did", "what year", "what date"]):
+        return "temporal"
+
+    # Comparison questions: which ... first, which ... earlier
+    if "which" in q_lower and any(word in q_lower for word in ["first", "earlier", "later", "before", "after"]):
+        return "comparison"
+
+    # Award questions: what award, which award, what prize
+    if any(phrase in q_lower for phrase in ["what award", "which award", "what prize", "which prize", "won the", "received the"]):
+        return "award"
+
+    # Location questions: where, what city, what country
+    if any(word in q_lower for word in ["where was", "where is", "what city", "what country", "what place"]):
+        return "location"
+
+    # Person questions: who is, who was, who did
+    if any(phrase in q_lower for phrase in ["who is", "who was", "who were", "who did", "who directed", "who wrote"]):
+        return "person"
+
+    # Yes/no questions
+    if q_lower.startswith(("is ", "are ", "was ", "were ", "do ", "does ", "did ", "can ", "could ", "will ", "would ")):
+        return "yesno"
+
+    # Default to entity
+    return "entity"
+
+
+def get_allowed_answer_types(intent: str) -> Set[str]:
+    """
+    Map question intent to allowed answer types.
+
+    This enforces answer-type consistency to prevent LLM cert from
+    returning wrong answer category.
+    """
+    INTENT_TO_TYPES = {
+        "temporal": {"date", "year", "entity"},  # Allow entity for "2020" etc.
+        "comparison": {"entity", "choice"},  # For "which X" questions
+        "award": {"entity"},  # Award names are entities (but check this matches)
+        "person": {"entity"},
+        "location": {"entity", "location"},
+        "yesno": {"yesno"},
+        "entity": {"entity", "date", "number"},  # Generic fallback
+        "other": {"entity", "date", "number", "yesno", "choice"}  # Permissive
+    }
+    return INTENT_TO_TYPES.get(intent, {"entity", "date", "number", "yesno", "choice"})
+
+
 def llm_route_relation(
     llm,
     question: str,
@@ -3245,16 +3311,11 @@ def get_llm_answer_certificate(
         print(f"  Backend: {llm.__class__.__name__}")
         print(f"{'='*80}")
 
+    # CHANGE 2: Abstain-friendly - no passages means abstain, not error
     if not passages:
-        error_msg = (
-            f"[LLM CERT] HARD FAILURE: No passages provided\n"
-            f"  Question: {question}\n"
-            f"  Backend: {llm.__class__.__name__}\n"
-            f"  This should never happen - passages list is empty"
-        )
         if debug:
-            print(error_msg)
-        raise RuntimeError(error_msg)
+            print(f"[LLM CERT] No passages provided - abstaining")
+        return None
 
     # Prepare passages for LLM (truncate and format)
     evidence_parts = []
@@ -3351,18 +3412,11 @@ JSON:"""
 
         response_text = response.text
 
-        # P0: Check for empty response BEFORE stripping
+        # CHANGE 2: Abstain-friendly - empty response means abstain
         if not response_text:
-            error_msg = (
-                f"[LLM CERT] HARD FAILURE: Empty response from LLM\n"
-                f"  Backend: {llm.__class__.__name__}\n"
-                f"  Prompt length: {len(prompt)} chars\n"
-                f"  Prompt (first 200): {prompt[:200]}\n"
-                f"  Response text is empty or None"
-            )
             if debug:
-                print(error_msg)
-            raise RuntimeError(error_msg)
+                print(f"[LLM CERT] Empty response from LLM - abstaining")
+            return None
 
         response_text = response_text.strip()
 
@@ -3405,19 +3459,11 @@ JSON:"""
                 print(f"  Confidence: {confidence:.2f}")
 
         except json.JSONDecodeError as e:
-            # P0 FIX: Handle "Unterminated string" error (LLM hit token limit)
+            # CHANGE 2: Abstain-friendly - truncated JSON means abstain
             if "Unterminated string" in str(e):
-                error_msg = (
-                    f"[LLM CERT] HARD FAILURE: JSON truncated (unterminated string)\n"
-                    f"  Backend: {llm.__class__.__name__}\n"
-                    f"  Error: {e}\n"
-                    f"  Response text: {response_text}\n"
-                    f"  Root cause: LLM hit max_new_tokens limit mid-quote\n"
-                    f"  Solution: Increase max_new_tokens (currently 512)"
-                )
                 if debug:
-                    print(error_msg)
-                raise RuntimeError(error_msg)
+                    print(f"[LLM CERT] JSON truncated (hit token limit) - abstaining")
+                return None
 
             # P0 FIX: Handle "Extra data" error (trailing garbage after JSON)
             # Try to extract just the JSON object by finding matching braces
@@ -3522,19 +3568,12 @@ JSON:"""
                     print(f"  PID: {pid}")
                     print(f"  Quote: '{quote[:100]}...'")
 
+                # CHANGE 2: Abstain-friendly - incomplete parsing means abstain
                 if not (answer and quote and pid):
-                    error_msg = (
-                        f"[LLM CERT] HARD FAILURE: Fallback parsing incomplete\n"
-                        f"  Backend: {llm.__class__.__name__}\n"
-                        f"  Response text: {response_text}\n"
-                        f"  Parsed answer: '{answer}'\n"
-                        f"  Parsed pid: '{pid}'\n"
-                        f"  Parsed quote: '{quote}'\n"
-                        f"  LLM returned non-JSON and fallback extraction failed"
-                    )
                     if debug:
-                        print(error_msg)
-                    raise RuntimeError(error_msg)
+                        print(f"[LLM CERT] Fallback parsing incomplete - abstaining")
+                        print(f"  Parsed answer: '{answer}', pid: '{pid}', quote length: {len(quote) if quote else 0}")
+                    return None
 
         # Check for empty answer - could be abstention or error
         if not answer or not quote or not pid:
@@ -3562,47 +3601,27 @@ JSON:"""
                     print(f"  This is expected for unanswerable questions")
                 return None
 
-            # Otherwise, this is an incomplete response - raise error
-            error_msg = (
-                f"[LLM CERT] HARD FAILURE: Empty fields in parsed response\n"
-                f"  Backend: {llm.__class__.__name__}\n"
-                f"  answer={bool(answer)} ('{answer}')\n"
-                f"  quote={bool(quote)} ('{quote}')\n"
-                f"  pid={bool(pid)} ('{pid}')\n"
-                f"  Response text: {response_text}\n"
-                f"  LLM returned incomplete certificate (no reason for abstention)"
-            )
+            # CHANGE 2: Abstain-friendly - incomplete response means abstain
             if debug:
-                print(error_msg)
-            raise RuntimeError(error_msg)
+                print(f"[LLM CERT] Empty fields in response - abstaining")
+                print(f"  answer={bool(answer)}, quote={bool(quote)}, pid={bool(pid)}")
+            return None
 
-        # Get passage text for verification
+        # CHANGE 2: Abstain-friendly - invalid PID means abstain (hallucination)
         if pid not in pid_to_passage:
-            error_msg = (
-                f"[LLM CERT] HARD FAILURE: Invalid PID\n"
-                f"  Backend: {llm.__class__.__name__}\n"
-                f"  PID '{pid}' not found in passage set\n"
-                f"  Available PIDs: {list(pid_to_passage.keys())[:5]}...\n"
-                f"  Total passages: {len(pid_to_passage)}\n"
-                f"  LLM hallucinated a passage ID"
-            )
             if debug:
-                print(error_msg)
-            raise RuntimeError(error_msg)
+                print(f"[LLM CERT] Invalid PID '{pid}' - abstaining (LLM hallucinated)")
+                print(f"  Available PIDs: {list(pid_to_passage.keys())[:5]}...")
+            return None
 
         passage_text = pid_to_passage[pid].get("text", "")
 
+        # CHANGE 2: Abstain-friendly - no passage text means abstain
         if not passage_text:
-            error_msg = (
-                f"[LLM CERT] HARD FAILURE: Passage has no text\n"
-                f"  Backend: {llm.__class__.__name__}\n"
-                f"  PID: {pid}\n"
-                f"  Passage object: {pid_to_passage[pid]}\n"
-                f"  This should never happen - passage data is corrupted"
-            )
             if debug:
-                print(error_msg)
-            raise RuntimeError(error_msg)
+                print(f"[LLM CERT] Passage has no text - abstaining")
+                print(f"  PID: {pid}")
+            return None
 
         # P1: RELAXED VERIFICATION - 2-tier certification policy
         # Type B: LLM-Confident Certificate (Soft-Verified)
@@ -3619,6 +3638,18 @@ JSON:"""
             if debug:
                 print(f"[LLM CERT] Confidence too low: {confidence:.2f} < 0.85")
                 print(f"  Rejecting certificate (low confidence)")
+            return None
+
+        # CHANGE 1: Gate on question-intent → answer-type consistency
+        intent = detect_question_intent(question)
+        allowed_types = get_allowed_answer_types(intent)
+        if answer_type not in allowed_types:
+            if debug:
+                print(f"[LLM CERT] Answer type mismatch")
+                print(f"  Question intent: '{intent}'")
+                print(f"  Answer type: '{answer_type}'")
+                print(f"  Allowed types: {allowed_types}")
+                print(f"  Rejecting certificate (type mismatch)")
             return None
 
         answer_norm = normalize_for_match(answer)
@@ -3677,13 +3708,51 @@ JSON:"""
                 print(f"  Quote: '{quote}'")
                 print(f"  Accepting due to confidence {confidence:.2f} >= 0.85")
 
+        # CHANGE 3: Calibrate LLM confidence internally
+        # Don't trust self-reported confidence blindly - check consistency
+        passages_with_answer = 0
+        answer_occurrences = 0
+        for p in passages:
+            p_text = p.get("text", "")
+            if not p_text:
+                continue
+            p_norm = normalize_for_match(p_text).lower()
+            if answer_norm.lower() in p_norm:
+                passages_with_answer += 1
+                # Count how many times answer appears in this passage
+                answer_occurrences += p_norm.count(answer_norm.lower())
+
+        # Calibrate confidence based on consistency
+        calibrated_confidence = confidence
+        if passages_with_answer >= 2:
+            # Answer found in multiple passages - boost confidence
+            calibrated_confidence = min(1.0, confidence + 0.05)
+            if debug:
+                print(f"[LLM CERT] Confidence boost: answer in {passages_with_answer} passages")
+        elif passages_with_answer == 0:
+            # Answer not found in ANY passage - major red flag
+            if debug:
+                print(f"[LLM CERT] ✗ FAILED: Answer not found in any passage (confidence check)")
+                print(f"  Answer: '{answer}'")
+                print(f"  This is likely hallucination")
+            return None
+
+        if answer_occurrences >= 3:
+            # Answer appears multiple times across passages
+            calibrated_confidence = min(1.0, calibrated_confidence + 0.03)
+            if debug:
+                print(f"[LLM CERT] Confidence boost: answer appears {answer_occurrences} times")
+
+        if debug and calibrated_confidence != confidence:
+            print(f"[LLM CERT] Confidence calibrated: {confidence:.2f} → {calibrated_confidence:.2f}")
+
         # All verification passed!
         cert = AnswerCertificate(
             answer=answer,
             pid=pid,
             quote=quote,
             answer_type=answer_type,
-            confidence=confidence,  # P1: Include actual confidence
+            confidence=calibrated_confidence,  # CHANGE 3: Use calibrated confidence
             verified=True
         )
 
