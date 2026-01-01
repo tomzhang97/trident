@@ -3097,7 +3097,7 @@ JSON:"""
                 f"  Backend: {llm.__class__.__name__}\n"
                 f"  Prompt length: {len(prompt)} chars\n"
                 f"  Prompt (first 200): {prompt[:200]}\n"
-                f"  Parameters: max_new_tokens=128, temperature=0.0\n"
+                f"  Parameters: max_new_tokens=512, temperature=0.0\n"
                 f"  This means the LLM interface itself is broken"
             )
             if debug:
