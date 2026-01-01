@@ -907,11 +907,18 @@ class TridentPipeline:
                     # - Questions where typed extraction failed
                     # - Comparison, temporal, yes/no, quantity questions (where facets don't help)
                     if should_use_tier2:
-                        # P0: Feed LLM cert the FULL context pool, not just selected/certified passages
-                        # For 2Wiki/Hotpot, this is the full 10-context set from the sample
-                        # result['selected_passages'] is WRONG - it's only certified passages (1-2)
-                        # We need ALL retrieved passages
-                        all_passages_raw = passages  # This is the full list from retrieval (line 484)
+                        # P1-2: CONTEXT POOL INVARIANT (CRITICAL FOR CORRECTNESS)
+                        # ========================================================
+                        # Tier-2 LLM and deterministic solvers MUST see the FULL context pool (all retrieved passages),
+                        # NOT just the certified winners from Safe-Cover.
+                        #
+                        # result['selected_passages'] = certified winners (1-2 passages) - WRONG for Tier-2/deterministic
+                        # passages = full retrieval result (10 passages) - CORRECT for Tier-2/deterministic
+                        #
+                        # Using certified winners causes deterministic failover to see only 1 passage instead of 10,
+                        # leading to incorrect abstentions on answerable questions.
+                        # ========================================================
+                        all_passages_raw = passages  # This is the full list from retrieval (line 486)
 
                         # Convert Passage objects to dicts for LLM cert
                         all_passages = []
@@ -1085,7 +1092,9 @@ class TridentPipeline:
                     print(f"  Query: {query[:100]}...")
                     print(f"  No certified answer facets, empty is expected")
                     print(f"  Mode: {mode}")
-                    print(f"  Num passages: {len(result['selected_passages'])}")
+                    # P1-2: Use full context pool, not just certified passages
+                    print(f"  Num passages (full context pool): {len(passages)}")
+                    print(f"  Num certified passages: {len(result['selected_passages'])}")
 
             # Compute token usage
             if used_constrained:
