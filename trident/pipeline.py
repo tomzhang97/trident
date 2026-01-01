@@ -1186,16 +1186,39 @@ class TridentPipeline:
         })
 
         # STEP 2: Final abstention guard (single choke point)
-        # INVARIANT: If abstained, answer MUST be "ABSTAIN" and confidence MUST be 0
+        # P2-8: INVARIANT: If abstained, answer MUST be exactly "ABSTAIN"
         # This ensures we never output empty strings or hallucinated answers when abstained
+        # Hard-enforce: no exceptions, no bypass
         if final_abstained or result.get('abstained', False):
-            if answer not in ["ABSTAIN", ABSTAIN_STR]:
+            # P2-8: Unconditionally force answer to "ABSTAIN" if abstained
+            # Don't allow "I cannot answer based on the given context." or any other string
+            if answer != "ABSTAIN":
                 if os.environ.get("TRIDENT_DEBUG_ABSTAIN", "0") == "1":
-                    print(f"\n[STEP 2 GUARD] Abstention invariant violation caught!")
-                    print(f"  abstained=True but answer='{answer}'")
-                    print(f"  Forcing answer='ABSTAIN'")
-                answer = "ABSTAIN"
+                    print(f"\n[P2-8 GUARD] Abstention invariant violation caught!")
+                    print(f"  abstained=True but answer='{answer[:100]}'")
+                    print(f"  Forcing answer='ABSTAIN' (hard-enforced)")
+                answer = "ABSTAIN"  # P2-8: No exceptions
             final_abstained = True
+
+        # P2-8: Also catch hallucinated abstention strings when abstained=False
+        # These are LLM outputs that look like abstentions but weren't marked as such
+        hallucinated_abstentions = [
+            "I cannot answer",
+            "I don't have enough information",
+            "The passage does not contain",
+            "cannot be determined",
+            "not enough information",
+            "insufficient information",
+        ]
+        if not final_abstained:
+            answer_lower = answer.lower() if answer else ""
+            if any(phrase in answer_lower for phrase in hallucinated_abstentions):
+                if os.environ.get("TRIDENT_DEBUG_ABSTAIN", "0") == "1":
+                    print(f"\n[P2-8 GUARD] Hallucinated abstention detected!")
+                    print(f"  answer='{answer[:100]}'")
+                    print(f"  Forcing abstained=True and answer='ABSTAIN'")
+                answer = "ABSTAIN"
+                final_abstained = True
 
         return PipelineOutput(
             answer=answer,
