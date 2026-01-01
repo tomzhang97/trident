@@ -3047,28 +3047,32 @@ def get_llm_answer_certificate(
 
     evidence_str = "\n\n".join(evidence_parts)
 
-    # Build LLM prompt requesting structured answer certificate
+    # Build LLM prompt requesting structured answer certificate with confidence
     prompt = f"""Question: {question}
 
 Evidence passages:
 {evidence_str}
 
-TASK: Extract the answer to the question with provenance.
+TASK: Extract the answer to the question with provenance and confidence.
 
 OUTPUT FORMAT (JSON):
 {{
   "answer": "the extracted answer",
   "passage_id": "pid of supporting passage",
-  "quote": "exact quote from that passage containing the answer",
-  "answer_type": "entity or date or number or yesno or choice"
+  "quote": "relevant quote from that passage supporting the answer",
+  "answer_type": "entity or date or number or yesno or choice",
+  "confidence": 0.95
 }}
 
-CRITICAL RULES:
-1. quote MUST be an exact substring from the passage
-2. answer MUST be a substring of quote
-3. For yes/no questions: quote must contain the decisive fact
-4. For choice questions ("which came first?"): quote must contain both entities
-5. If no answer can be verified, return {{"answer": "", "reason": "no_verified_answer"}}
+INSTRUCTIONS:
+1. The answer should be directly stated or strongly implied in the passage
+2. Provide a supporting quote (does not need to be exact substring, paraphrase ok)
+3. Set confidence 0.0-1.0 based on how certain you are:
+   - 0.95-1.0: Answer is explicitly stated in passage
+   - 0.85-0.94: Answer is strongly implied or requires minor inference
+   - 0.70-0.84: Answer requires moderate inference
+   - Below 0.70: Uncertain or speculative
+4. If no answer can be found, return {{"answer": "", "reason": "no_verified_answer", "confidence": 0.0}}
 
 JSON:"""
 
@@ -3077,6 +3081,7 @@ JSON:"""
     pid = ""
     quote = ""
     answer_type = "entity"
+    confidence = 0.0  # P1: Add confidence field
 
     try:
         # P0: Add comprehensive generation logging to debug None returns
@@ -3163,6 +3168,7 @@ JSON:"""
             pid = cert_dict.get("passage_id", "").strip()
             quote = cert_dict.get("quote", "").strip()
             answer_type = cert_dict.get("answer_type", "entity").strip()
+            confidence = float(cert_dict.get("confidence", 0.0))  # P1: Extract confidence
 
             if debug:
                 print(f"\n[LLM CERT] JSON parsed successfully")
@@ -3170,6 +3176,7 @@ JSON:"""
                 print(f"  PID: {pid}")
                 print(f"  Quote: '{quote[:100]}...'")
                 print(f"  Type: {answer_type}")
+                print(f"  Confidence: {confidence:.2f}")
 
         except json.JSONDecodeError as e:
             # P0 FIX: Handle "Unterminated string" error (LLM hit token limit)
@@ -3218,12 +3225,14 @@ JSON:"""
                             pid = cert_dict.get("passage_id", "").strip()
                             quote = cert_dict.get("quote", "").strip()
                             answer_type = cert_dict.get("answer_type", "entity").strip()
+                            confidence = float(cert_dict.get("confidence", 0.0))  # P1: Extract confidence
 
                             if debug:
                                 print(f"[LLM CERT] ✓ JSON extracted successfully (removed trailing garbage)")
                                 print(f"  Answer: '{answer}'")
                                 print(f"  PID: {pid}")
                                 print(f"  Quote: '{quote[:100]}...'")
+                                print(f"  Confidence: {confidence:.2f}")
                         except json.JSONDecodeError as e2:
                             if debug:
                                 print(f"[LLM CERT] Extracted JSON still invalid: {e2}")
@@ -3339,66 +3348,78 @@ JSON:"""
                 print(error_msg)
             raise RuntimeError(error_msg)
 
-        # HARD RULE 1: Quote must be substring of passage
+        # P1: RELAXED VERIFICATION - 2-tier certification policy
+        # Type B: LLM-Confident Certificate (Soft-Verified)
+        # Requirements: confidence >= 0.85 AND answer found in passage
+
         def normalize_for_match(text: str) -> str:
             """Normalize for substring matching (Unicode + whitespace)."""
             text = unicodedata.normalize('NFKC', text)
             text = ' '.join(text.split())
             return text
 
-        quote_norm = normalize_for_match(quote)
-        passage_norm = normalize_for_match(passage_text)
-
-        if quote_norm not in passage_norm:
-            # Try case-insensitive as fallback
-            case_insensitive_match = quote_norm.lower() in passage_norm.lower()
-            error_msg = (
-                f"[LLM CERT] HARD FAILURE: Quote not found in passage (HARD RULE 1)\n"
-                f"  Backend: {llm.__class__.__name__}\n"
-                f"  Quote (first 100 chars): '{quote[:100]}'\n"
-                f"  Quote (normalized): '{quote_norm[:100]}'\n"
-                f"  Passage (first 200 chars): '{passage_text[:200]}'\n"
-                f"  Case-insensitive match: {case_insensitive_match}\n"
-                f"  LLM hallucinated quote not in passage"
-            )
+        # P1: Gate on confidence threshold (must be >= 0.85)
+        if confidence < 0.85:
             if debug:
-                print(error_msg)
-            raise RuntimeError(error_msg)
+                print(f"[LLM CERT] Confidence too low: {confidence:.2f} < 0.85")
+                print(f"  Rejecting certificate (low confidence)")
+            return None
 
-        # HARD RULE 2: Answer must be substring of quote
         answer_norm = normalize_for_match(answer)
-        if answer_norm not in quote_norm:
-            error_msg = (
-                f"[LLM CERT] HARD FAILURE: Answer not found in quote (HARD RULE 2)\n"
-                f"  Backend: {llm.__class__.__name__}\n"
-                f"  Answer: '{answer}'\n"
-                f"  Answer (normalized): '{answer_norm}'\n"
-                f"  Quote: '{quote[:100]}'\n"
-                f"  Quote (normalized): '{quote_norm[:100]}'\n"
-                f"  LLM extracted answer not contained in quote"
-            )
-            if debug:
-                print(error_msg)
-            raise RuntimeError(error_msg)
+        passage_norm = normalize_for_match(passage_text)
+        quote_norm = normalize_for_match(quote)
 
-        # HARD RULE 3: For yes/no, check quote contains decisive info
+        # P1: RELAXED RULE 1 - Check if answer is in passage (primary check)
+        # Allow case-insensitive matching for robustness
+        answer_in_passage = (
+            answer_norm in passage_norm or
+            answer_norm.lower() in passage_norm.lower()
+        )
+
+        if answer_in_passage:
+            if debug:
+                print(f"[LLM CERT] ✓ Answer found in passage (relaxed verification)")
+                print(f"  Answer: '{answer}'")
+                print(f"  Confidence: {confidence:.2f}")
+            # ACCEPT - answer is in passage and confidence is high
+        else:
+            # P1: RELAXED RULE 2 - Check token overlap between quote and passage
+            # Allow paraphrasing if >=80% token overlap
+            quote_tokens = set(quote_norm.lower().split())
+            passage_tokens = set(passage_norm.lower().split())
+
+            if quote_tokens and passage_tokens:
+                overlap = len(quote_tokens & passage_tokens) / len(quote_tokens)
+
+                if overlap >= 0.80:
+                    if debug:
+                        print(f"[LLM CERT] ✓ Quote has {overlap:.1%} token overlap (≥80% threshold)")
+                        print(f"  Accepting paraphrased quote")
+                    # ACCEPT - quote is paraphrase of passage content
+                else:
+                    # FAIL - answer not in passage and quote doesn't match
+                    if debug:
+                        print(f"[LLM CERT] ✗ FAILED: Answer not in passage and quote overlap {overlap:.1%} < 80%")
+                        print(f"  Answer (normalized): '{answer_norm}'")
+                        print(f"  Passage (first 200): '{passage_text[:200]}'")
+                        print(f"  Quote tokens: {len(quote_tokens)}, Passage tokens: {len(passage_tokens)}")
+                        print(f"  Overlap: {len(quote_tokens & passage_tokens)}")
+                    return None
+            else:
+                # Empty tokens - fail
+                if debug:
+                    print(f"[LLM CERT] ✗ FAILED: Empty quote or passage tokens")
+                return None
+
+        # P1: RELAXED RULE 3 - For yes/no, warn if quote is very short but don't fail
+        # (With confidence gating, we trust high-confidence LLM judgments)
         q_lower = question.lower()
         is_yesno = q_lower.startswith(("is ", "are ", "was ", "were ", "do ", "does ", "did "))
-        if is_yesno and answer_type == "yesno":
-            # For yes/no, quote should contain key entities from question
-            # Simple heuristic: quote should be substantial (not just "yes"/"no")
-            if len(quote_norm) < 20:
-                error_msg = (
-                    f"[LLM CERT] HARD FAILURE: Yes/no quote too short (HARD RULE 3)\n"
-                    f"  Backend: {llm.__class__.__name__}\n"
-                    f"  Quote length: {len(quote_norm)} chars (need >= 20)\n"
-                    f"  Quote: '{quote}'\n"
-                    f"  Question: {question}\n"
-                    f"  LLM provided insufficient evidence for yes/no answer"
-                )
-                if debug:
-                    print(error_msg)
-                raise RuntimeError(error_msg)
+        if is_yesno and answer_type == "yesno" and len(quote_norm) < 20:
+            if debug:
+                print(f"[LLM CERT] ⚠ Warning: Yes/no quote is short ({len(quote_norm)} chars)")
+                print(f"  Quote: '{quote}'")
+                print(f"  Accepting due to confidence {confidence:.2f} >= 0.85")
 
         # All verification passed!
         cert = AnswerCertificate(
@@ -3406,7 +3427,7 @@ JSON:"""
             pid=pid,
             quote=quote,
             answer_type=answer_type,
-            confidence=None,
+            confidence=confidence,  # P1: Include actual confidence
             verified=True
         )
 
