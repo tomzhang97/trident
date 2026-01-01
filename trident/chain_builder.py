@@ -2976,21 +2976,25 @@ def constrained_span_select(
 
     evidence_text = "\n\n".join(evidence_parts)
 
-    span_prompt = f"""Extract the answer as an EXACT substring from the evidence.
+    # P0-2: Stricter single-line JSON prompt (reduce PARSE_ERROR)
+    span_prompt = f"""You are a precise answer extractor. Extract the answer as an EXACT substring from the evidence.
 
 Question: {question}
 
 Evidence:
 {evidence_text}
 
-Rules:
-1. The answer_span must be copied VERBATIM from the evidence.
-2. Provide start_char and end_char offsets relative to the snippet shown for that pid.
-3. Return JSON only:
-{{ "pid": "...", "start_char": 0, "end_char": 0, "answer_span": "...", "confidence": 0.0 }}
-4. If not found, return {{ "answer_span": null }}
+CRITICAL INSTRUCTIONS:
+1. Output MUST be valid JSON on a SINGLE LINE
+2. The FIRST character must be '{{' and you must end immediately after '}}'
+3. Do NOT include markdown code fences, commentary, or extra text
+4. Format: {{"pid": "...", "answer": "...", "confidence": 0.95}}
+5. "answer" must be copied VERBATIM from one of the evidence passages
+6. "pid" must be one of the passage IDs shown above (e.g., "context_0")
+7. "confidence" is a number between 0 and 1
+8. If you cannot find an answer, output: {{"pid": "", "answer": "", "confidence": 0.0}}
 
-JSON:"""
+Output your JSON now (single line, no fences):"""
 
     def _norm_ws(s: str) -> str:
         return " ".join((s or "").split())
@@ -3002,17 +3006,68 @@ JSON:"""
         # Strip brackets and whitespace
         return pid.strip().strip("[]")
 
+    # P0-2: Try parsing with 2-step repair if needed
+    def _try_parse_css_json(raw_output: str, attempt_label: str = "") -> Optional[dict]:
+        """Try to parse CSS JSON with repair if needed."""
+        try:
+            # Step 1: Try strict JSON parse
+            json_str = _extract_first_json_object(raw_output)
+            data = json.loads(json_str)
+            if debug and attempt_label:
+                print(f"[CSS] {attempt_label}: Parsed successfully")
+            return data
+        except Exception as e:
+            if debug:
+                print(f"[CSS] {attempt_label}: Parse failed - {e}")
+                print(f"[CSS] Raw output: {raw_output[:200]}...")
+            return None
+
     try:
         resp = llm.generate(span_prompt, temperature=0.0)
         raw = resp.text if hasattr(resp, "text") else str(resp)
-        # Use robust JSON extraction to handle LLM commentary/fences
-        json_str = _extract_first_json_object(raw)
-        data = json.loads(json_str)
 
-        span = data.get("answer_span")
+        # Attempt 1: Direct parse
+        data = _try_parse_css_json(raw, "Attempt 1 (direct)")
+
+        # Attempt 2: Repair prompt if parse failed
+        if data is None:
+            if debug:
+                print(f"[CSS] Attempting JSON repair...")
+
+            repair_prompt = f"""The following text was supposed to be valid JSON but isn't. Fix it and return ONLY valid JSON (single line, no commentary).
+
+Required format: {{"pid": "...", "answer": "...", "confidence": 0.0}}
+
+Text to repair:
+{raw[:500]}
+
+Output the corrected JSON (single line, start with '{{'):"""
+
+            try:
+                repair_resp = llm.generate(repair_prompt, temperature=0.0, max_new_tokens=128)
+                repair_raw = repair_resp.text if hasattr(repair_resp, "text") else str(repair_resp)
+                data = _try_parse_css_json(repair_raw, "Attempt 2 (repair)")
+            except Exception as e:
+                if debug:
+                    print(f"[CSS] Repair attempt failed: {e}")
+                data = None
+
+        if data is None:
+            if debug:
+                print(f"[CSS] All parse attempts failed, abstaining")
+            return ConstrainedSelectionResult(
+                answer="",
+                candidate_index=-1,
+                confidence=0.0,
+                passage_id="",
+                candidates=[],
+                support_scores=[],
+                reason="PARSE_ERROR"
+            )
+
+        # P0-2: Updated to use simpler JSON schema (pid, answer, confidence)
+        span = data.get("answer", data.get("answer_span"))  # Support both old and new field names
         pid_raw = data.get("pid")
-        start_char = data.get("start_char")
-        end_char = data.get("end_char")
         conf = float(data.get("confidence", 0.0))
 
         # Normalize PID to handle [context_4] vs context_4 inconsistencies
@@ -3021,22 +3076,27 @@ JSON:"""
         # Also normalize snippet_map keys for comparison
         snippet_map_normalized = {_normalize_pid(k): v for k, v in snippet_map.items()}
 
-        if span and pid in snippet_map_normalized and isinstance(start_char, int) and isinstance(end_char, int):
+        # P0-2: Simplified verification (just check answer in passage, no offsets required)
+        if span and pid in snippet_map_normalized:
             snippet = snippet_map_normalized[pid]
 
+            # P0-3: Answer-in-passage normalized match (fix NO_SPAN)
+            # Try exact match first, then normalized match
             match = False
-            if 0 <= start_char < end_char <= len(snippet):
-                sliced = snippet[start_char:end_char]
-                if _norm_ws(sliced) == _norm_ws(span):
-                    match = True
 
-            # Deterministic repair: exact find in original snippet if offsets wrong
-            if not match:
-                idx = snippet.find(span)
-                if idx != -1:
-                    start_char, end_char = idx, idx + len(span)
-                    if _norm_ws(snippet[start_char:end_char]) == _norm_ws(span):
-                        match = True
+            # Direct substring check
+            if span in snippet:
+                match = True
+                if debug:
+                    print(f"[CSS] Exact match found for '{span}'")
+            else:
+                # Normalized match: Unicode-safe, whitespace-normalized
+                span_norm = _norm_ws(span).lower()
+                snippet_norm = _norm_ws(snippet).lower()
+                if span_norm in snippet_norm:
+                    match = True
+                    if debug:
+                        print(f"[CSS] Normalized match found for '{span}'")
 
             if match:
                 # Type sanity checks (lightweight)
