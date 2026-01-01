@@ -3153,8 +3153,11 @@ JSON:"""
                 print(f"[LLM CERT] Extracted from ``` block")
 
         # Try JSON parsing first
+        json_parse_success = False
+
         try:
             cert_dict = json.loads(response_text)
+            json_parse_success = True
 
             answer = cert_dict.get("answer", "").strip()
             pid = cert_dict.get("passage_id", "").strip()
@@ -3169,47 +3172,90 @@ JSON:"""
                 print(f"  Type: {answer_type}")
 
         except json.JSONDecodeError as e:
-            # STEP 5: Fallback parsing for non-JSON format
-            # Try to parse "ANSWER: ...\nPID: ...\nQUOTE: ..." format
-            if debug:
-                print(f"[LLM CERT] JSON parse error: {e}")
-                print(f"  Trying fallback parsing...")
-
-            # Parse line-by-line
-            for line in response_text.split('\n'):
-                line = line.strip()
-                if line.startswith("ANSWER:"):
-                    answer = line.split("ANSWER:", 1)[1].strip()
-                elif line.startswith("PID:") or line.startswith("PASSAGE_ID:"):
-                    pid = line.split(":", 1)[1].strip()
-                    # Clean up "context_X" to just the PID
-                    pid = pid.replace("context_", "")
-                elif line.startswith("QUOTE:"):
-                    quote = line.split("QUOTE:", 1)[1].strip()
-                    # Remove surrounding quotes if present
-                    quote = quote.strip('"\'')
-                elif line.startswith("TYPE:") or line.startswith("ANSWER_TYPE:"):
-                    answer_type = line.split(":", 1)[1].strip()
-
-            if debug:
-                print(f"[LLM CERT] Fallback parsed:")
-                print(f"  Answer: '{answer}'")
-                print(f"  PID: {pid}")
-                print(f"  Quote: '{quote[:100]}...'")
-
-            if not (answer and quote and pid):
-                error_msg = (
-                    f"[LLM CERT] HARD FAILURE: Fallback parsing incomplete\n"
-                    f"  Backend: {llm.__class__.__name__}\n"
-                    f"  Response text: {response_text}\n"
-                    f"  Parsed answer: '{answer}'\n"
-                    f"  Parsed pid: '{pid}'\n"
-                    f"  Parsed quote: '{quote}'\n"
-                    f"  LLM returned non-JSON and fallback extraction failed"
-                )
+            # P0 FIX: Handle "Extra data" error (trailing garbage after JSON)
+            # Try to extract just the JSON object by finding matching braces
+            if "Extra data" in str(e) and '{' in response_text:
                 if debug:
-                    print(error_msg)
-                raise RuntimeError(error_msg)
+                    print(f"[LLM CERT] JSON parse error (Extra data) - extracting first JSON object")
+
+                # Find the first complete JSON object
+                start_idx = response_text.find('{')
+                if start_idx != -1:
+                    brace_count = 0
+                    end_idx = -1
+                    for i in range(start_idx, len(response_text)):
+                        if response_text[i] == '{':
+                            brace_count += 1
+                        elif response_text[i] == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                end_idx = i + 1
+                                break
+
+                    if end_idx != -1:
+                        json_only = response_text[start_idx:end_idx]
+                        if debug:
+                            print(f"  Extracted JSON: {json_only[:100]}...")
+                        try:
+                            cert_dict = json.loads(json_only)
+                            json_parse_success = True
+
+                            answer = cert_dict.get("answer", "").strip()
+                            pid = cert_dict.get("passage_id", "").strip()
+                            quote = cert_dict.get("quote", "").strip()
+                            answer_type = cert_dict.get("answer_type", "entity").strip()
+
+                            if debug:
+                                print(f"[LLM CERT] ✓ JSON extracted successfully (removed trailing garbage)")
+                                print(f"  Answer: '{answer}'")
+                                print(f"  PID: {pid}")
+                                print(f"  Quote: '{quote[:100]}...'")
+                        except json.JSONDecodeError as e2:
+                            if debug:
+                                print(f"[LLM CERT] Extracted JSON still invalid: {e2}")
+                                print(f"  Will try line-by-line fallback...")
+
+            # If JSON parsing failed (including extraction), try line-by-line fallback
+            if not json_parse_success:
+                if debug and "Extra data" not in str(e):
+                    print(f"[LLM CERT] JSON parse error: {e}")
+                    print(f"  Trying line-by-line fallback...")
+
+                # Parse line-by-line
+                for line in response_text.split('\n'):
+                    line = line.strip()
+                    if line.startswith("ANSWER:"):
+                        answer = line.split("ANSWER:", 1)[1].strip()
+                    elif line.startswith("PID:") or line.startswith("PASSAGE_ID:"):
+                        pid = line.split(":", 1)[1].strip()
+                        # Clean up "context_X" to just the PID
+                        pid = pid.replace("context_", "")
+                    elif line.startswith("QUOTE:"):
+                        quote = line.split("QUOTE:", 1)[1].strip()
+                        # Remove surrounding quotes if present
+                        quote = quote.strip('"\'')
+                    elif line.startswith("TYPE:") or line.startswith("ANSWER_TYPE:"):
+                        answer_type = line.split(":", 1)[1].strip()
+
+                if debug:
+                    print(f"[LLM CERT] Fallback parsed:")
+                    print(f"  Answer: '{answer}'")
+                    print(f"  PID: {pid}")
+                    print(f"  Quote: '{quote[:100]}...'")
+
+                if not (answer and quote and pid):
+                    error_msg = (
+                        f"[LLM CERT] HARD FAILURE: Fallback parsing incomplete\n"
+                        f"  Backend: {llm.__class__.__name__}\n"
+                        f"  Response text: {response_text}\n"
+                        f"  Parsed answer: '{answer}'\n"
+                        f"  Parsed pid: '{pid}'\n"
+                        f"  Parsed quote: '{quote}'\n"
+                        f"  LLM returned non-JSON and fallback extraction failed"
+                    )
+                    if debug:
+                        print(error_msg)
+                    raise RuntimeError(error_msg)
 
         # Empty answer means LLM abstained
         if not answer or not quote or not pid:
