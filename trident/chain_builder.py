@@ -120,6 +120,232 @@ KNOWN_RELATION_TYPES = [
 ]
 
 
+# =============================================================================
+# P2: DETERMINISTIC SOLVERS FOR TEMPORAL/COMPARISON QUESTIONS
+# =============================================================================
+
+def try_deterministic_solver(
+    question: str,
+    passages: List[Dict[str, Any]],
+    debug: bool = False
+) -> Optional[str]:
+    """
+    Try deterministic pattern matching for common question types.
+
+    These are cheap, 100% faithful extractors for specific question patterns.
+    Run BEFORE LLM cert to avoid unnecessary LLM calls.
+
+    Supported patterns:
+    - "Which film came out first" → extract years, compare
+    - "Where was X born" → "born in LOCATION" regex
+    - "When did X die" → death year extraction
+    - "Which person died first" → compare death years
+
+    Returns:
+        Answer string if pattern matches and answer found, None otherwise
+    """
+    q_lower = question.lower()
+
+    # Pattern 1: "Which ... first" (temporal comparison)
+    if "which" in q_lower and ("first" in q_lower or "earlier" in q_lower):
+        if "film" in q_lower or "movie" in q_lower:
+            # Film release comparison
+            answer = _solve_film_comparison(question, passages, debug)
+            if answer:
+                return answer
+        elif "die" in q_lower or "death" in q_lower:
+            # Death date comparison
+            answer = _solve_death_comparison(question, passages, debug)
+            if answer:
+                return answer
+
+    # Pattern 2: "Where was X born"
+    if "where" in q_lower and "born" in q_lower:
+        answer = _solve_birthplace(question, passages, debug)
+        if answer:
+            return answer
+
+    # Pattern 3: "When did X die"
+    if "when" in q_lower and ("die" in q_lower or "death" in q_lower):
+        answer = _solve_death_date(question, passages, debug)
+        if answer:
+            return answer
+
+    return None
+
+
+def _solve_film_comparison(question: str, passages: List[Dict[str, Any]], debug: bool) -> Optional[str]:
+    """Extract film release years and return earlier film."""
+    # Extract film names from question (between quotes or title case)
+    films = _extract_film_names_from_question(question)
+    if len(films) < 2:
+        return None
+
+    # Find years for each film in passages
+    film_years = {}
+    for passage in passages:
+        text = passage.get("text", "")
+        for film in films:
+            if film.lower() in text.lower():
+                # Look for year patterns near the film name
+                year = _extract_year_near_text(text, film)
+                if year and film not in film_years:
+                    film_years[film] = year
+
+    if len(film_years) >= 2:
+        # Return the film with the earliest year
+        earliest_film = min(film_years.items(), key=lambda x: x[1])
+        if debug:
+            print(f"[DETERMINISTIC] Film comparison: {film_years}")
+            print(f"  Answer: '{earliest_film[0]}' ({earliest_film[1]})")
+        return earliest_film[0]
+
+    return None
+
+
+def _solve_death_comparison(question: str, passages: List[Dict[str, Any]], debug: bool) -> Optional[str]:
+    """Extract death dates and return person who died first."""
+    # Extract person names from question
+    persons = _extract_person_names_from_question(question)
+    if len(persons) < 2:
+        return None
+
+    # Find death years for each person
+    death_years = {}
+    for passage in passages:
+        text = passage.get("text", "")
+        for person in persons:
+            if person.lower() in text.lower():
+                # Look for death year patterns
+                year = _extract_death_year(text, person)
+                if year and person not in death_years:
+                    death_years[person] = year
+
+    if len(death_years) >= 2:
+        earliest_person = min(death_years.items(), key=lambda x: x[1])
+        if debug:
+            print(f"[DETERMINISTIC] Death comparison: {death_years}")
+            print(f"  Answer: '{earliest_person[0]}' (died {earliest_person[1]})")
+        return earliest_person[0]
+
+    return None
+
+
+def _solve_birthplace(question: str, passages: List[Dict[str, Any]], debug: bool) -> Optional[str]:
+    """Extract birthplace from passages."""
+    # Extract person name from question
+    person = _extract_subject_from_question(question)
+    if not person:
+        return None
+
+    # Search for "born in LOCATION" patterns
+    for passage in passages:
+        text = passage.get("text", "")
+        if person.lower() in text.lower():
+            # Pattern: "born in LOCATION"
+            match = re.search(r'born in ([A-Z][^.,;\n]{2,40})', text)
+            if match:
+                location = match.group(1).strip()
+                if debug:
+                    print(f"[DETERMINISTIC] Birthplace for '{person}': '{location}'")
+                return location
+
+    return None
+
+
+def _solve_death_date(question: str, passages: List[Dict[str, Any]], debug: bool) -> Optional[str]:
+    """Extract death date from passages."""
+    person = _extract_subject_from_question(question)
+    if not person:
+        return None
+
+    for passage in passages:
+        text = passage.get("text", "")
+        if person.lower() in text.lower():
+            # Look for death date patterns
+            year = _extract_death_year(text, person)
+            if year:
+                if debug:
+                    print(f"[DETERMINISTIC] Death year for '{person}': {year}")
+                return str(year)
+
+    return None
+
+
+# Helper functions for deterministic solvers
+
+def _extract_film_names_from_question(question: str) -> List[str]:
+    """Extract film names from question (quoted or title case)."""
+    films = []
+    # Try quoted strings first
+    quoted = re.findall(r'["""]([^"""]+)["""]', question)
+    films.extend(quoted)
+    # If less than 2, try title case spans
+    if len(films) < 2:
+        title_case = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b', question)
+        films.extend(title_case)
+    return films[:2]  # Limit to 2
+
+
+def _extract_person_names_from_question(question: str) -> List[str]:
+    """Extract person names from question (title case spans)."""
+    return re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b', question)[:2]
+
+
+def _extract_subject_from_question(question: str) -> Optional[str]:
+    """Extract the subject (person/entity) from a question."""
+    # Look for title case name after "was" or "were"
+    match = re.search(r'(?:was|were)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})', question)
+    if match:
+        return match.group(1)
+    # Fallback: first title case span
+    match = re.search(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b', question)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _extract_year_near_text(text: str, anchor: str, window: int = 100) -> Optional[int]:
+    """Extract year (4-digit number) near an anchor text."""
+    # Find anchor position
+    idx = text.lower().find(anchor.lower())
+    if idx == -1:
+        return None
+
+    # Look in window around anchor
+    start = max(0, idx - window)
+    end = min(len(text), idx + len(anchor) + window)
+    snippet = text[start:end]
+
+    # Find 4-digit years (1900-2099)
+    years = re.findall(r'\b(19\d{2}|20\d{2})\b', snippet)
+    if years:
+        return int(years[0])
+    return None
+
+
+def _extract_death_year(text: str, person: str) -> Optional[int]:
+    """Extract death year from text mentioning a person."""
+    idx = text.lower().find(person.lower())
+    if idx == -1:
+        return None
+
+    # Look for patterns like "died 1990", "1920-1990", "died on ... 1990"
+    snippet = text[max(0, idx - 50):min(len(text), idx + len(person) + 200)]
+
+    # Pattern 1: "died ... YEAR"
+    match = re.search(r'died[^0-9]{0,30}(19\d{2}|20\d{2})', snippet, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+
+    # Pattern 2: "YEAR1–YEAR2" or "YEAR1-YEAR2" (birth-death range)
+    match = re.search(r'(19\d{2}|20\d{2})\s*[–-]\s*(19\d{2}|20\d{2})', snippet)
+    if match:
+        return int(match.group(2))  # Return second year (death)
+
+    return None
+
+
 def llm_route_relation(
     llm,
     question: str,

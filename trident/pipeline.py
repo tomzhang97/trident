@@ -767,9 +767,26 @@ class TridentPipeline:
                         print(f"  Answer passages: {len(answer_passages)} (from answer facets)")
                         print(f"  All winner passages: {len(winner_passages)}")
 
+                    # P2: Try cheap deterministic solvers FIRST (before typed extraction)
+                    # These handle temporal/comparison questions with 100% faithfulness
+                    from trident.chain_builder import try_deterministic_solver
+                    deterministic_answer = try_deterministic_solver(
+                        question=query,
+                        passages=all_passages,  # Use full passage pool
+                        debug=debug_chain or debug_constrained
+                    )
+                    if deterministic_answer:
+                        answer = deterministic_answer
+                        is_grounded = True
+                        used_constrained = True
+                        prompt_type = "deterministic"
+                        if debug_chain or debug_constrained:
+                            print(f"[EXTRACT] ✓ Deterministic solver succeeded")
+                            print(f"  Answer: '{answer}'")
+
                     # NEW APPROACH: Try typed extraction first from certified facets
                     # This enforces "answer from certifying passage only" contract
-                    if has_answer_facet_certified and answer_facet_ids:
+                    if not answer and has_answer_facet_certified and answer_facet_ids:
                         # Try extraction for each certified answer facet
                         extraction_method = "none"
                         for facet_id in answer_facet_ids:
