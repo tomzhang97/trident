@@ -3061,21 +3061,59 @@ JSON:"""
     answer_type = "entity"
 
     try:
-        # Call LLM (CRITICAL FIX Step 0: use max_new_tokens not max_tokens)
-        response = llm.generate(prompt, max_new_tokens=200, temperature=0.0)
+        # P0: Add comprehensive generation logging to debug None returns
+        if debug:
+            print(f"\n[LLM CERT] Calling LLM.generate()")
+            print(f"  Backend: {llm.__class__.__name__}")
+            print(f"  Prompt length: {len(prompt)} chars")
+            print(f"  Prompt (first 200): {prompt[:200]}...")
+            print(f"  Parameters: max_new_tokens=128, temperature=0.0")
+
+        # Call LLM (P0: Fixed parameters, no sampling)
+        response = llm.generate(prompt, max_new_tokens=128, temperature=0.0)
+
+        # P0: Check if response is None or invalid BEFORE accessing attributes
+        if response is None:
+            if debug:
+                print(f"[LLM CERT] ✗ CRITICAL: LLM.generate() returned None!")
+                print(f"  Backend: {llm.__class__.__name__}")
+            return None
+
         # LLMOutput has .text attribute
-        response_text = response.text.strip()
+        if not hasattr(response, 'text'):
+            if debug:
+                print(f"[LLM CERT] ✗ CRITICAL: Response has no 'text' attribute!")
+                print(f"  Response type: {type(response)}")
+                print(f"  Response: {response}")
+            return None
+
+        response_text = response.text
+
+        # P0: Check for empty response BEFORE stripping
+        if not response_text:
+            if debug:
+                print(f"[LLM CERT] ✗ FAILED: Empty response from LLM")
+                print(f"  Backend: {llm.__class__.__name__}")
+            return None
+
+        response_text = response_text.strip()
 
         if debug:
             print(f"\n[LLM CERT] Raw LLM response:")
-            print(f"  {response_text[:300]}")
-            print(f"  ... (truncated, full length: {len(response_text)} chars)")
+            print(f"  Length: {len(response_text)} chars")
+            print(f"  First 300 chars: {response_text[:300]}")
+            if len(response_text) > 300:
+                print(f"  ... (truncated)")
 
         # Parse JSON (try to extract if wrapped in markdown)
         if "```json" in response_text:
             response_text = response_text.split("```json")[1].split("```")[0].strip()
+            if debug:
+                print(f"[LLM CERT] Extracted from ```json block")
         elif "```" in response_text:
             response_text = response_text.split("```")[1].split("```")[0].strip()
+            if debug:
+                print(f"[LLM CERT] Extracted from ``` block")
 
         # Try JSON parsing first
         try:
@@ -3217,8 +3255,17 @@ JSON:"""
         return cert
 
     except Exception as e:
+        # P0: Don't swallow exceptions - log full traceback in debug mode
         if debug:
-            print(f"[LLM CERT] Error: {e}")
+            import traceback
+            print(f"\n[LLM CERT] ✗ EXCEPTION:")
+            print(f"  Type: {type(e).__name__}")
+            print(f"  Message: {e}")
+            print(f"  Traceback:")
+            traceback.print_exc()
+        else:
+            # In production, log concisely
+            print(f"[LLM CERT] Exception: {type(e).__name__}: {e}")
         return None
 
 

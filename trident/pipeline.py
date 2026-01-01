@@ -849,9 +849,27 @@ class TridentPipeline:
                     # If answer still empty (no answer facets certified OR typed extraction failed),
                     # try LLM Answer Certificate as fallback before abstaining
                     if not answer or answer.strip() == "":
-                        # STEP 2 (CRITICAL): Feed LLM certificate enough passages
-                        # Use top K=6-10 from entire context pool, trim to 400-600 chars each
-                        all_passages = result.get('selected_passages', [])
+                        # P0: Feed LLM cert the FULL context pool, not just selected/certified passages
+                        # For 2Wiki/Hotpot, this is the full 10-context set from the sample
+                        # result['selected_passages'] is WRONG - it's only certified passages (1-2)
+                        # We need ALL retrieved passages
+                        all_passages_raw = passages  # This is the full list from retrieval (line 484)
+
+                        # Convert Passage objects to dicts for LLM cert
+                        all_passages = []
+                        for p in all_passages_raw:
+                            if hasattr(p, 'to_dict'):
+                                all_passages.append(p.to_dict())
+                            elif hasattr(p, 'pid') and hasattr(p, 'text'):
+                                # Passage object - convert to dict
+                                all_passages.append({
+                                    'pid': p.pid,
+                                    'text': p.text,
+                                    'title': p.metadata.get('title', '') if hasattr(p, 'metadata') and p.metadata else ''
+                                })
+                            elif isinstance(p, dict):
+                                # Already a dict
+                                all_passages.append(p)
 
                         # Build passage pool prioritizing certified winners
                         passage_pool = []
