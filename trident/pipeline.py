@@ -987,11 +987,52 @@ class TridentPipeline:
                                     print(f"  Quote: '{llm_cert.quote[:100]}...'")
                                     print(f"  Type: {llm_cert.answer_type}")
                             else:
+                                # P0-3: Tier-2 FAILOVER to deterministic solvers before abstaining
+                                # If Tier-2 LLM failed, try lightweight deterministic pass based on intent
                                 if debug_chain or debug_constrained or debug_llm_cert:
                                     reason = "llm_returned_none" if llm_cert is None else "verification_failed"
                                     print(f"[TIER 2: LLM HEURISTIC] ✗ FAILED: {reason}")
                                     if llm_cert and not llm_cert.verified:
                                         print(f"  Reason: LLM cert returned but failed verification")
+                                    print(f"[TIER 2 FAILOVER] Trying deterministic solvers as last resort...")
+
+                                # Try deterministic solvers as failover (already ran once, but try again with more passages)
+                                from trident.chain_builder import try_deterministic_solver
+
+                                # Convert passages to dicts for deterministic solver
+                                passages_as_dicts = []
+                                for p in llm_cert_passages:
+                                    if isinstance(p, dict):
+                                        passages_as_dicts.append(p)
+                                    elif hasattr(p, 'to_dict'):
+                                        passages_as_dicts.append(p.to_dict())
+                                    elif hasattr(p, 'pid') and hasattr(p, 'text'):
+                                        passages_as_dicts.append({
+                                            'pid': p.pid,
+                                            'text': p.text,
+                                            'title': p.metadata.get('title', '') if hasattr(p, 'metadata') and p.metadata else ''
+                                        })
+
+                                deterministic_failover = try_deterministic_solver(
+                                    question=query,
+                                    passages=passages_as_dicts,
+                                    debug=debug_chain or debug_constrained or debug_llm_cert
+                                )
+
+                                if deterministic_failover:
+                                    answer = deterministic_failover
+                                    answer_source = "deterministic_failover"  # Mark as failover
+                                    is_grounded = True
+                                    prompt_type = "deterministic_failover"
+
+                                    if debug_chain or debug_constrained or debug_llm_cert:
+                                        print(f"[TIER 2 FAILOVER] ✓ Deterministic solver succeeded")
+                                        print(f"  Answer: '{answer}'")
+                                        print(f"  This recovered a question that Tier-2 LLM couldn't handle")
+                                else:
+                                    if debug_chain or debug_constrained or debug_llm_cert:
+                                        print(f"[TIER 2 FAILOVER] ✗ Deterministic solver also failed")
+                                        print(f"  Will abstain")
                         elif debug_chain or debug_constrained or debug_llm_cert:
                             print(f"\n[TIER 2: LLM HEURISTIC ROUTING] Skipped (no passages or no LLM)")
                             print(f"  Has passages: {bool(llm_cert_passages)}")

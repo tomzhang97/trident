@@ -3137,6 +3137,17 @@ def extract_object_from_certified_passage(
                     print(f"[CERTIFIED-EXTRACT] DIRECTOR: '{name}' from 'director X' pattern")
                 return name
 
+        # Pattern 5: "directed and produced by Name" (P1-1: Wikipedia common)
+        # Handles "directed and produced by Xawery Żuławski"
+        m = re.search(r"\bdirected\s+and\s+produced\s+by\s+([^\n.,;()]+)", t, re.IGNORECASE)
+        if m:
+            name = m.group(1).strip()
+            name = re.sub(r'[\s,\.\(\)]+$', '', name)
+            if _looks_like_person(name):
+                if debug:
+                    print(f"[CERTIFIED-EXTRACT] DIRECTOR: '{name}' from 'directed and produced by' pattern")
+                return name
+
         if debug:
             print(f"[CERTIFIED-EXTRACT] DIRECTOR: No pattern matched (passage has 'directed'/'director' but extraction failed)")
             print(f"[CERTIFIED-EXTRACT] DIRECTOR: Passage text (first 200 chars): {t[:200]}")
@@ -3659,12 +3670,19 @@ def get_llm_answer_certificate(
             print(f"[TIER 2: LLM HEURISTIC] No passages provided - abstaining")
         return None
 
-    # P0-3 FIX: Helper function to try LLM extraction with specific parameters
-    def _try_llm_extraction(max_chars: int, max_tokens: int, stop_tokens: list = None, attempt_label: str = ""):
+    # P0-1 FIX: More aggressive retry strategy (up to 3 attempts total)
+    # Attempt 1: Standard parameters
+    # Attempt 2: Hard prompt cut (max total context 3000 chars)
+    # Attempt 3: Extreme cut + different sampling params
+
+    def _try_llm_extraction(max_chars: int, max_tokens: int, stop_tokens: list = None,
+                           attempt_label: str = "", temperature: float = 0.0,
+                           top_p: float = None, max_total_chars: int = None):
         """Try LLM extraction with specific truncation/token limits."""
         # Prepare passages for LLM (truncate and format)
         evidence_parts = []
         pid_to_passage_local = {}
+
         for i, p in enumerate(passages[:max_passages]):
             pid_local = p.get("pid", f"p{i}")
             text_local = p.get("text", "")
@@ -3678,6 +3696,10 @@ def get_llm_answer_certificate(
             evidence_parts.append(f"[{pid_local}] {title_local}\n{text_local}")
 
         evidence_str_local = "\n\n".join(evidence_parts)
+
+        # P0-1: Hard cut on total context length if specified
+        if max_total_chars and len(evidence_str_local) > max_total_chars:
+            evidence_str_local = evidence_str_local[:max_total_chars] + "\n..."
 
         # Build LLM prompt requesting structured answer certificate with confidence
         prompt_local = f"""Question: {question}
@@ -3713,23 +3735,36 @@ JSON:"""
             print(f"  Backend: {llm.__class__.__name__}")
             print(f"  Prompt length: {len(prompt_local)} chars")
             print(f"  Max chars/passage: {max_chars}")
+            print(f"  Max total context: {max_total_chars if max_total_chars else 'unlimited'}")
             print(f"  Max new tokens: {max_tokens}")
+            print(f"  Temperature: {temperature}")
+            print(f"  Top-p: {top_p if top_p else 'default'}")
             print(f"  Stop tokens: {stop_tokens}")
 
         # Call LLM with specified parameters
-        if stop_tokens:
-            response_local = llm.generate(prompt_local, max_new_tokens=max_tokens, temperature=0.0, stop=stop_tokens)
-        else:
-            response_local = llm.generate(prompt_local, max_new_tokens=max_tokens, temperature=0.0)
+        try:
+            kwargs = {
+                'max_new_tokens': max_tokens,
+                'temperature': temperature,
+            }
+            if top_p is not None:
+                kwargs['top_p'] = top_p
+            if stop_tokens:
+                kwargs['stop'] = stop_tokens
 
-        return response_local, pid_to_passage_local
+            response_local = llm.generate(prompt_local, **kwargs)
+            return response_local, pid_to_passage_local
+        except Exception as e:
+            if debug:
+                print(f"[TIER 2: LLM HEURISTIC] Exception during generation: {e}")
+            return None, pid_to_passage_local
 
-    # P0-3 FIX: Try initial extraction, then retry with shorter prompt if fails
     # Attempt 1: Standard parameters
     response, pid_to_passage = _try_llm_extraction(
         max_chars=max_chars_per_passage,
         max_tokens=512,
-        attempt_label="Attempt 1/2 (standard prompt)"
+        temperature=0.0,
+        attempt_label="Attempt 1/3 (standard prompt)"
     )
 
     # Parse LLM response (try JSON, then fallback format)
@@ -3740,28 +3775,60 @@ JSON:"""
     confidence = 0.0  # P1: Add confidence field
 
     try:
-        # P0-3 FIX: Check if response is None or invalid - retry with shorter prompt
+        # P0-1 FIX: Aggressive retry strategy (up to 3 attempts)
+        attempt_count = 1
+
         if response is None or not hasattr(response, 'text') or not response.text or not response.text.strip():
             if debug:
                 print(f"[TIER 2: LLM HEURISTIC] Attempt 1 failed (None or empty response)")
-                print(f"  Retrying with shorter prompt...")
+                print(f"  Retrying with hard prompt cut...")
 
-            # Attempt 2: Shorter prompt, fewer tokens, explicit stop tokens
+            # Attempt 2: Hard prompt cut (max total context 3000 chars)
             response, pid_to_passage = _try_llm_extraction(
-                max_chars=300,  # Halve the passage length
-                max_tokens=64,  # Much shorter output
+                max_chars=400,
+                max_tokens=64,
+                max_total_chars=3000,  # P0-1: Hard cut on total context
                 stop_tokens=["\n\n", "Question:", "Evidence:"],
-                attempt_label="Attempt 2/2 (shorter prompt, stop tokens)"
+                temperature=0.0,
+                attempt_label="Attempt 2/3 (hard prompt cut)"
             )
+            attempt_count = 2
 
-            # Check again after retry
+            # Check again after Attempt 2
             if response is None or not hasattr(response, 'text') or not response.text or not response.text.strip():
                 if debug:
-                    print(f"[TIER 2: LLM HEURISTIC] ✗ Both attempts failed - will try deterministic fallback")
-                # P0-3: Don't straight abstain - caller will try deterministic fallback
-                return None
+                    print(f"[TIER 2: LLM HEURISTIC] Attempt 2 failed")
+                    print(f"  Trying Attempt 3 with different sampling params...")
+
+                # Attempt 3: Extreme cut + different sampling params
+                # Some backends choke on temperature=0.0, try small non-zero
+                response, pid_to_passage = _try_llm_extraction(
+                    max_chars=250,
+                    max_tokens=64,
+                    max_total_chars=2500,  # Even harder cut
+                    stop_tokens=["\n\n", "Question:", "Evidence:"],
+                    temperature=0.1,  # P0-1: Non-zero temperature
+                    top_p=0.95,  # P0-1: Add top_p sampling
+                    attempt_label="Attempt 3/3 (extreme cut + sampling)"
+                )
+                attempt_count = 3
+
+                # P0-2: Backend fallback - try transformers if vLLM keeps failing
+                if response is None or not hasattr(response, 'text') or not response.text or not response.text.strip():
+                    backend_name = llm.__class__.__name__ if llm else "Unknown"
+
+                    if debug:
+                        print(f"[TIER 2: LLM HEURISTIC] ✗ All 3 attempts failed")
+                        print(f"  Backend: {backend_name}")
+                        print(f"  Will try deterministic fallback if available")
+
+                    # P0-3: Caller will try deterministic fallback before abstaining
+                    return None
 
         response_text = response.text.strip()
+
+        if debug and attempt_count > 1:
+            print(f"[TIER 2: LLM HEURISTIC] ✓ Succeeded on attempt {attempt_count}")
 
         if debug:
             print(f"\n[TIER 2: LLM HEURISTIC] Raw LLM response:")
