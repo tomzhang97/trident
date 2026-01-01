@@ -120,9 +120,39 @@ class LLMInterface:
         with torch.no_grad():
             outputs = self.model.generate(**generation_kwargs)
 
+        # P0: Add guards for empty outputs
+        import os
+        debug = os.environ.get("TRIDENT_DEBUG_LLM_CERT", "0") == "1"
+
+        if not hasattr(outputs, 'sequences') or outputs.sequences is None:
+            error_msg = (
+                f"Model generate returned no sequences!\n"
+                f"  Prompt length: {len(prompt)}\n"
+                f"  max_new_tokens: {max_tokens}"
+            )
+            if debug:
+                print(f"[MODEL ERROR] {error_msg}")
+            raise RuntimeError(error_msg)
+
+        if len(outputs.sequences) == 0:
+            error_msg = (
+                f"Model generated empty sequences list!\n"
+                f"  Prompt length: {len(prompt)}"
+            )
+            if debug:
+                print(f"[MODEL ERROR] {error_msg}")
+            # Return empty output rather than crashing
+            return LLMOutput(text="", tokens_used=input_length, latency_ms=(time.time() - start_time) * 1000)
+
         # Decode output
         generated_ids = outputs.sequences[0][input_length:]
         generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+        # P0: Warn if empty
+        if debug and not generated_text:
+            print(f"[MODEL WARNING] Generated empty text")
+            print(f"  Prompt length: {len(prompt)}")
+            print(f"  Generated IDs length: {len(generated_ids)}")
 
         if stop:
             for s in stop:
@@ -377,6 +407,7 @@ class VLLMInterface:
     
     def generate(self, prompt: str, **kwargs) -> LLMOutput:
         """Generate using vLLM."""
+        import os
         start_time = time.time()
 
         # Update sampling params if provided
@@ -392,15 +423,61 @@ class VLLMInterface:
             top_p=top_p,
             stop=stop,
         )
-        
+
+        # P0: Add guards and detailed logging
+        debug = os.environ.get("TRIDENT_DEBUG_LLM_CERT", "0") == "1"
+
         # Generate
         outputs = self.llm.generate([prompt], sampling_params)
+
+        # P0: Check if outputs is empty BEFORE accessing [0]
+        if not outputs:
+            error_msg = (
+                f"vLLM returned empty outputs list!\n"
+                f"  Prompt length: {len(prompt)}\n"
+                f"  Prompt (first 100): {prompt[:100]}\n"
+                f"  Sampling params: temp={temperature}, max_tokens={max_tokens}"
+            )
+            if debug:
+                print(f"[VLLM ERROR] {error_msg}")
+            raise RuntimeError(error_msg)
+
         output = outputs[0]
-        
+
+        # P0: Check if output.outputs is empty BEFORE accessing [0]
+        if not hasattr(output, 'outputs') or not output.outputs:
+            error_msg = (
+                f"vLLM output has no outputs!\n"
+                f"  Output type: {type(output)}\n"
+                f"  Has outputs attr: {hasattr(output, 'outputs')}\n"
+                f"  Prompt length: {len(prompt)}"
+            )
+            if debug:
+                print(f"[VLLM ERROR] {error_msg}")
+            raise RuntimeError(error_msg)
+
         generated_text = output.outputs[0].text
-        tokens_used = len(output.outputs[0].token_ids)
+
+        # P0: Check if generated text is None or empty
+        if generated_text is None:
+            error_msg = (
+                f"vLLM generated None text!\n"
+                f"  Output: {output}\n"
+                f"  Prompt length: {len(prompt)}"
+            )
+            if debug:
+                print(f"[VLLM ERROR] {error_msg}")
+            # Return empty string instead of None to avoid crashes
+            generated_text = ""
+
+        tokens_used = len(output.outputs[0].token_ids) if hasattr(output.outputs[0], 'token_ids') else 0
         latency_ms = (time.time() - start_time) * 1000
-        
+
+        if debug and not generated_text:
+            print(f"[VLLM WARNING] Generated empty text (length=0)")
+            print(f"  Tokens used: {tokens_used}")
+            print(f"  Latency: {latency_ms:.1f}ms")
+
         return LLMOutput(
             text=generated_text,
             tokens_used=tokens_used,
