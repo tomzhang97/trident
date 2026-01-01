@@ -1758,29 +1758,42 @@ def typed_extract_from_winning_passage(
         if "directed" not in t_lower and "director" not in t_lower:
             return None
 
+        # P0-4: Unicode-safe DIRECTOR extraction
+        # Problem: [A-Z] only matches ASCII uppercase, missing Polish Ż, French É, etc.
+        # Solution: Use \w+ to capture words, then validate first char with .isupper()
+
         # Extract PERSON name after "directed by" (most reliable pattern)
-        m = re.search(r"(?i)\bdirected\s+by\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$|\s+(?:is|was|and|who))", t)
+        # Pattern: "directed by <Name>" where Name is 1-4 title-case words
+        m = re.search(r"(?i)\bdirected\s+by\s+([\w\u00C0-\u024F]+(?:\s+[\w\u00C0-\u024F]+){0,3})(?:\s*[,\.\(\)]|$|\s+(?:is|was|and|who))", t)
         if m:
             name = m.group(1).strip()
-            # Validate: should be 2-4 words, not start with common non-name words
             words = name.split()
-            if 1 <= len(words) <= 4 and words[0].lower() not in {'the', 'a', 'an', 'this', 'that', 'film', 'movie', 'polish', 'australian'}:
+            # Validate: 1-4 words, first word starts with uppercase letter, not a common word
+            if (1 <= len(words) <= 4 and
+                words[0] and words[0][0].isalpha() and words[0][0].isupper() and
+                words[0].lower() not in {'the', 'a', 'an', 'this', 'that', 'film', 'movie', 'polish', 'australian'}):
                 return name
 
         # Pattern: "Name directed the film" or "Name, who directed"
-        m = re.search(r"(?i)([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})\s+(?:,\s*who\s+)?directed\b", t)
+        m = re.search(r"(?i)([\w\u00C0-\u024F]+(?:\s+[\w\u00C0-\u024F]+){0,3})\s+(?:,\s*who\s+)?directed\b", t)
         if m:
             name = m.group(1).strip()
             words = name.split()
-            if 1 <= len(words) <= 4 and words[0].lower() not in {'the', 'a', 'an', 'this', 'that', 'film', 'movie'}:
+            # Validate: 1-4 words, first word starts with uppercase letter
+            if (1 <= len(words) <= 4 and
+                words[0] and words[0][0].isalpha() and words[0][0].isupper() and
+                words[0].lower() not in {'the', 'a', 'an', 'this', 'that', 'film', 'movie'}):
                 return name
 
         # Pattern: "director Name" (less common but valid)
-        m = re.search(r"(?i)\bdirector\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$)", t)
+        m = re.search(r"(?i)\bdirector\s+([\w\u00C0-\u024F]+(?:\s+[\w\u00C0-\u024F]+){0,3})(?:\s*[,\.\(\)]|$)", t)
         if m:
             name = m.group(1).strip()
             words = name.split()
-            if 1 <= len(words) <= 4 and words[0].lower() not in {'of', 'the', 'a', 'an', 'is', 'was'}:
+            # Validate: 1-4 words, first word starts with uppercase letter
+            if (1 <= len(words) <= 4 and
+                words[0] and words[0][0].isalpha() and words[0][0].isupper() and
+                words[0].lower() not in {'of', 'the', 'a', 'an', 'is', 'was'}):
                 return name
 
     elif relation_kind == "BORN":
@@ -1788,22 +1801,26 @@ def typed_extract_from_winning_passage(
             # Birthplace - must have "born" to extract
             if "born" not in t_lower:
                 return None
+            # P0-4: Unicode-safe birthplace extraction
             # Pattern: "born in Location"
-            m = re.search(r"(?i)\bborn\s+in\s+([A-Z][a-zA-ZÀ-ÿ\s\-]+?)(?:\s*[,\.\(\)]|on\s|$)", t)
+            m = re.search(r"(?i)\bborn\s+in\s+([\w\u00C0-\u024F\s\-]+?)(?:\s*[,\.\(\)]|on\s|$)", t)
             if m:
                 loc = m.group(1).strip().rstrip(",")
-                # Validate: should be 1-4 words, look like a place
-                if 1 <= len(loc.split()) <= 4:
+                # Validate: should be 1-4 words, first word starts with uppercase letter
+                words = loc.split()
+                if (1 <= len(words) <= 4 and
+                    words[0] and words[0][0].isalpha() and words[0][0].isupper()):
                     return loc
         else:
             # Birth date - must have "born" and a year
             if "born" not in t_lower or not re.search(r'\d{4}', t):
                 return None
+            # P0-4: Unicode-safe birth date extraction
             # Pattern: "born on/in Month Day, Year" or "born on Day Month Year"
-            m = re.search(r"(?i)\bborn\s+(?:on\s+)?([A-Z]?[a-zA-Z]+\s+\d{1,2},?\s+\d{4})", t)
+            m = re.search(r"(?i)\bborn\s+(?:on\s+)?([a-zA-Z]+\s+\d{1,2},?\s+\d{4})", t)
             if m:
                 return m.group(1).strip()
-            m = re.search(r"(?i)\bborn\s+(?:on\s+)?(\d{1,2}\s+[A-Z]?[a-zA-Z]+\s+\d{4})", t)
+            m = re.search(r"(?i)\bborn\s+(?:on\s+)?(\d{1,2}\s+[a-zA-Z]+\s+\d{4})", t)
             if m:
                 return m.group(1).strip()
 
@@ -1813,18 +1830,29 @@ def typed_extract_from_winning_passage(
         if not any(ind in t_lower for ind in award_indicators):
             return None  # Don't extract - passage doesn't contain award info
 
+        # P0-4: Unicode-safe award extraction
         # Pattern: "won the X Award/Prize"
-        m = re.search(r"(?i)\bwon\s+(?:the\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-]+?(?:Award|Prize|Medal|Oscar|Emmy|Grammy|Trophy))", t)
+        m = re.search(r"(?i)\bwon\s+(?:the\s+)?([\w\u00C0-\u024F\s\-]+?(?:Award|Prize|Medal|Oscar|Emmy|Grammy|Trophy))", t)
         if m:
-            return m.group(1).strip()
+            award = m.group(1).strip()
+            # Validate: first word should start with uppercase
+            words = award.split()
+            if words and words[0] and words[0][0].isalpha() and words[0][0].isupper():
+                return award
         # Pattern: "received the X Award"
-        m = re.search(r"(?i)\breceived\s+(?:the\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-]+?(?:Award|Prize|Medal))", t)
+        m = re.search(r"(?i)\breceived\s+(?:the\s+)?([\w\u00C0-\u024F\s\-]+?(?:Award|Prize|Medal))", t)
         if m:
-            return m.group(1).strip()
+            award = m.group(1).strip()
+            words = award.split()
+            if words and words[0] and words[0][0].isalpha() and words[0][0].isupper():
+                return award
         # Pattern: "awarded the X"
-        m = re.search(r"(?i)\bawarded\s+(?:the\s+)?([A-Z][a-zA-ZÀ-ÿ\s\-]+?(?:Award|Prize|Medal))", t)
+        m = re.search(r"(?i)\bawarded\s+(?:the\s+)?([\w\u00C0-\u024F\s\-]+?(?:Award|Prize|Medal))", t)
         if m:
-            return m.group(1).strip()
+            award = m.group(1).strip()
+            words = award.split()
+            if words and words[0] and words[0][0].isalpha() and words[0][0].isupper():
+                return award
 
     elif relation_kind == "LOCATION":
         # Must have location-related words
