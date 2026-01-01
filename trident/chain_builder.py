@@ -898,6 +898,8 @@ class AnswerCertificate:
     answer_type: str  # entity/date/number/yesno/choice
     confidence: Optional[float] = None  # Optional, don't trust alone
     verified: bool = False  # Set to True after verification passes
+    tier2_backend: Optional[str] = None  # P0-2: Track backend used (vllm, hf)
+    tier2_fail_reason: Optional[str] = None  # P0-2: Track why vLLM failed (if HF was used)
 
 
 def extract_entities(text: str, doc_title: Optional[str] = None) -> Set[str]:
@@ -3774,6 +3776,11 @@ JSON:"""
     answer_type = "entity"
     confidence = 0.0  # P1: Add confidence field
 
+    # P0-2: Track backend used for metrics
+    backend_class = llm.__class__.__name__ if llm else "Unknown"
+    backend_used = "vllm" if backend_class == "VLLMInterface" else backend_class.lower()
+    fail_reason = None
+
     try:
         # P0-1 FIX: Aggressive retry strategy (up to 3 attempts)
         attempt_count = 1
@@ -3818,12 +3825,137 @@ JSON:"""
                     backend_name = llm.__class__.__name__ if llm else "Unknown"
 
                     if debug:
-                        print(f"[TIER 2: LLM HEURISTIC] ✗ All 3 attempts failed")
+                        print(f"[TIER 2: LLM HEURISTIC] ✗ All 3 vLLM attempts failed")
                         print(f"  Backend: {backend_name}")
-                        print(f"  Will try deterministic fallback if available")
 
-                    # P0-3: Caller will try deterministic fallback before abstaining
-                    return None
+                    # P0-2: Try HF transformers backend as fallback if vLLM failed
+                    if backend_name == "VLLMInterface":
+                        if debug:
+                            print(f"[TIER 2: HF FALLBACK] Switching from vLLM to HuggingFace transformers...")
+
+                        try:
+                            # Import LLMInterface (HF backend)
+                            from trident.llm_interface import LLMInterface
+
+                            # Get model name from vLLM backend (or use default)
+                            model_name = getattr(llm, 'model_name', 'meta-llama/Llama-3.1-8B-Instruct')
+
+                            if debug:
+                                print(f"[TIER 2: HF FALLBACK] Instantiating HF backend with model: {model_name}")
+
+                            # Instantiate HF backend (8-bit quantization for memory efficiency)
+                            hf_llm = LLMInterface(
+                                model_name=model_name,
+                                device="cuda:0",
+                                temperature=0.0,
+                                max_new_tokens=64,
+                                load_in_8bit=True  # Use 8-bit to save memory
+                            )
+
+                            if debug:
+                                print(f"[TIER 2: HF FALLBACK] HF backend loaded successfully")
+                                print(f"[TIER 2: HF FALLBACK] Retrying with short prompt (3000 chars max, 64 tokens)...")
+
+                            # Retry with HF backend (attempt-2 style: short prompt)
+                            # Use a temporary closure to capture hf_llm
+                            def _try_hf_extraction():
+                                """Try extraction with HF backend."""
+                                evidence_parts = []
+                                pid_to_passage_local = {}
+
+                                for i, p in enumerate(passages[:max_passages]):
+                                    pid_local = p.get("pid", f"p{i}")
+                                    text_local = p.get("text", "")
+                                    title_local = p.get("title", "")
+
+                                    # Truncate to 400 chars per passage
+                                    if len(text_local) > 400:
+                                        text_local = text_local[:400] + "..."
+
+                                    pid_to_passage_local[pid_local] = p
+                                    evidence_parts.append(f"[{pid_local}] {title_local}\n{text_local}")
+
+                                evidence_str_local = "\n\n".join(evidence_parts)
+
+                                # Hard cut at 3000 chars total
+                                if len(evidence_str_local) > 3000:
+                                    evidence_str_local = evidence_str_local[:3000] + "\n..."
+
+                                # Build prompt (same format as vLLM attempts)
+                                prompt_local = f"""Question: {question}
+
+Evidence passages:
+{evidence_str_local}
+
+TASK: Extract the answer to the question with provenance and confidence.
+
+OUTPUT FORMAT (JSON):
+{{
+  "answer": "the extracted answer",
+  "passage_id": "pid of supporting passage",
+  "quote": "relevant quote from that passage supporting the answer",
+  "answer_type": "entity or date or number or yesno or choice",
+  "confidence": 0.95
+}}
+
+INSTRUCTIONS:
+1. The answer should be directly stated or strongly implied in the passage
+2. Provide a supporting quote (does not need to be exact substring, paraphrase ok)
+3. Set confidence 0.0-1.0 based on how certain you are:
+   - 0.95-1.0: Answer is explicitly stated in passage
+   - 0.85-0.94: Answer is strongly implied or requires minor inference
+   - 0.70-0.84: Answer requires moderate inference
+   - Below 0.70: Uncertain or speculative
+4. If no answer can be found, return {{"answer": "", "reason": "no_verified_answer", "confidence": 0.0}}
+
+JSON:"""
+
+                                if debug:
+                                    print(f"  Prompt length: {len(prompt_local)} chars")
+
+                                # Call HF backend
+                                try:
+                                    response_local = hf_llm.generate(
+                                        prompt_local,
+                                        max_new_tokens=64,
+                                        temperature=0.0,
+                                        stop=["\n\n", "Question:", "Evidence:"]
+                                    )
+                                    return response_local, pid_to_passage_local
+                                except Exception as e:
+                                    if debug:
+                                        print(f"[TIER 2: HF FALLBACK] Exception during HF generation: {e}")
+                                    return None, pid_to_passage_local
+
+                            response, pid_to_passage = _try_hf_extraction()
+                            attempt_count = 4  # Mark as attempt 4 (HF fallback)
+
+                            if response and hasattr(response, 'text') and response.text and response.text.strip():
+                                if debug:
+                                    print(f"[TIER 2: HF FALLBACK] ✓ HF backend succeeded!")
+                                # P0-2: Track that HF backend was used
+                                backend_used = "hf"
+                                fail_reason = "vllm_returned_none_3x"
+                                # Continue to parse the response (don't return here)
+                            else:
+                                if debug:
+                                    print(f"[TIER 2: HF FALLBACK] ✗ HF backend also failed")
+                                    print(f"  Will try deterministic fallback if available")
+                                # P0-3: Caller will try deterministic fallback before abstaining
+                                return None
+
+                        except Exception as e:
+                            if debug:
+                                print(f"[TIER 2: HF FALLBACK] Failed to instantiate HF backend: {e}")
+                                print(f"  Will try deterministic fallback if available")
+                            # P0-3: Caller will try deterministic fallback before abstaining
+                            return None
+                    else:
+                        # Not vLLM backend, just return None
+                        if debug:
+                            print(f"  Will try deterministic fallback if available")
+                        # P0-3: Caller will try deterministic fallback before abstaining
+                        return None
 
         response_text = response.text.strip()
 
@@ -4193,7 +4325,9 @@ JSON:"""
             quote=quote,
             answer_type=answer_type,
             confidence=calibrated_confidence,  # CHANGE 3: Use calibrated confidence
-            verified=True
+            verified=True,
+            tier2_backend=backend_used,  # P0-2: Track backend used
+            tier2_fail_reason=fail_reason  # P0-2: Track why vLLM failed (if HF was used)
         )
 
         if debug:
@@ -4202,6 +4336,9 @@ JSON:"""
             print(f"  PID: {pid[:12]}...")
             print(f"  Quote length: {len(quote)} chars")
             print(f"  Confidence: {calibrated_confidence:.2f} [{confidence_band}]")
+            print(f"  Backend: {backend_used}")  # P0-2: Show backend used
+            if fail_reason:
+                print(f"  Fail reason: {fail_reason}")  # P0-2: Show why vLLM failed
             if low_confidence_flag:
                 print(f"  ⚠ LOW CONFIDENCE FLAG: Answer accepted but marked for review")
 

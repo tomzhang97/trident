@@ -384,24 +384,27 @@ Answer:"""
 
 class VLLMInterface:
     """Interface for vLLM backend (for high-throughput serving)."""
-    
+
     def __init__(self, model_name: str, **kwargs):
+        # P0-2: Store model_name for HF fallback
+        self.model_name = model_name
+
         try:
             from vllm import LLM, SamplingParams
-            
+
             self.llm = LLM(
                 model=model_name,
                 tensor_parallel_size=kwargs.get('tensor_parallel_size', 1),
                 gpu_memory_utilization=kwargs.get('gpu_memory_utilization', 0.9),
                 trust_remote_code=kwargs.get('trust_remote_code', True)
             )
-            
+
             self.sampling_params = SamplingParams(
                 temperature=kwargs.get('temperature', 0.0),
                 max_tokens=kwargs.get('max_new_tokens', 256),
                 top_p=kwargs.get('top_p', 1.0)
             )
-            
+
         except ImportError:
             raise ImportError("vLLM not installed. Install with: pip install vllm")
     
