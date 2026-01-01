@@ -1279,6 +1279,73 @@ def build_certificate_aware_prompt(
     return "\n".join(prompt_parts), best_relation_info, facet_id_map
 
 
+def _expand_name_span(text: str, initial_match: str, passage_title: str = "") -> str:
+    """
+    P0-1 FIX: Expand a partial name match to the longest plausible person-name span.
+
+    This fixes CSS binding expansion failures like "Xawery" → "Xawery Żuławski".
+
+    Args:
+        text: The full passage text
+        initial_match: The initially matched name substring (e.g., "Xawery")
+        passage_title: Optional passage title to prefer spans from
+
+    Returns:
+        The expanded name (e.g., "Xawery Żuławski")
+    """
+    # Find the token index where initial_match occurs
+    idx = text.find(initial_match)
+    if idx == -1:
+        return initial_match
+
+    # Expand left over contiguous name tokens (Unicode letters, apostrophes, hyphens, spaces)
+    start = idx
+    while start > 0:
+        char = text[start - 1]
+        # Stop at non-name characters
+        if not (char.isalpha() or char in "'-\u00C0-\u024F\u1E00-\u1EFF" or (char == ' ' and start > 1 and text[start - 2].isalpha())):
+            break
+        start -= 1
+
+    # Expand right over contiguous name tokens
+    end = idx + len(initial_match)
+    while end < len(text):
+        char = text[end]
+        # Stop at sentence delimiters or non-name characters
+        if char in '.,;()\n':
+            break
+        # Continue over letters, accented chars, apostrophes, hyphens, and spaces between name parts
+        if not (char.isalpha() or char in "'-\u00C0-\u024F\u1E00-\u1EFF" or (char == ' ' and end + 1 < len(text) and (text[end + 1].isalpha() or text[end + 1] in '\u00C0-\u024F\u1E00-\u1EFF'))):
+            break
+        end += 1
+
+    expanded = text[start:end].strip()
+
+    # Prefer spans with ≥2 tokens
+    words = expanded.split()
+    if len(words) < 2:
+        # Try to find a better match in title or first sentence
+        if passage_title:
+            title_words = passage_title.split()
+            for i in range(len(title_words) - 1):
+                candidate = ' '.join(title_words[i:i+2])
+                if initial_match in candidate:
+                    expanded = candidate
+                    break
+
+        # If still single-word, try first sentence
+        if len(expanded.split()) < 2:
+            first_sent = text.split('.')[0] if '.' in text else text[:200]
+            # Look for multi-word name containing initial_match
+            name_matches = re.findall(r'[A-ZÀ-Ÿ][a-zà-ÿ]+(?:\s+[A-ZÀ-Ÿ][a-zà-ÿ]+)+', first_sent)
+            for candidate in name_matches:
+                if initial_match in candidate:
+                    expanded = candidate
+                    break
+
+    return expanded
+
+
 def bind_entity_from_hop1_winner(
     relation_type: str,
     passage_text: str
@@ -1288,6 +1355,8 @@ def bind_entity_from_hop1_winner(
 
     This is NOT answer extraction - it's binding a variable for hop-2.
     Much easier because we're extracting a named entity from one known relation.
+
+    P0-1 FIX: Now expands partial names to full names (e.g., "Xawery" → "Xawery Żuławski")
 
     Args:
         relation_type: The inner relation type (DIRECTOR, AUTHOR, etc.)
@@ -1302,31 +1371,39 @@ def bind_entity_from_hop1_winner(
     t = passage_text
     t_lower = t.lower()
 
+    # P0-1: Extract passage title if available (often in first line before newline or period)
+    passage_title = t.split('\n')[0] if '\n' in t else t.split('.')[0]
+
     if relation_type == "DIRECTOR":
         # Must have "directed" to extract director name
         if "directed" not in t_lower and "director" not in t_lower:
             return None
 
+        # P0-1 FIX: Use simpler patterns + expand to longest plausible name
         # Pattern: "directed by Name" (most reliable)
-        m = re.search(r"(?i)\bdirected\s+by\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$|\s+(?:is|was|and|who))", t)
+        m = re.search(r"\bdirected\s+by\s+([A-ZÀ-Ÿ][^\n.,;()]*)", t, re.IGNORECASE)
         if m:
-            name = m.group(1).strip()
+            initial_name = m.group(1).strip()
+            # Expand to full name (e.g., "Xawery" → "Xawery Żuławski")
+            name = _expand_name_span(t, initial_name, passage_title)
             words = name.split()
             if 1 <= len(words) <= 4:
                 return name
 
         # Pattern: "Name directed" or "Name, who directed"
-        m = re.search(r"(?i)([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})\s+(?:,\s*who\s+)?directed\b", t)
+        m = re.search(r"([A-ZÀ-Ÿ][^\n.,;()]*?)\s+(?:,\s*who\s+)?directed\b", t, re.IGNORECASE)
         if m:
-            name = m.group(1).strip()
+            initial_name = m.group(1).strip()
+            name = _expand_name_span(t, initial_name, passage_title)
             words = name.split()
             if 1 <= len(words) <= 4 and words[0].lower() not in {'the', 'a', 'an', 'film', 'movie'}:
                 return name
 
         # Pattern: "X is an Australian director" -> extract X
-        m = re.search(r"(?i)([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})\s+(?:is|was)\s+(?:an?\s+)?(?:\w+\s+)?director", t)
+        m = re.search(r"([A-ZÀ-Ÿ][^\n.,;()]*?)\s+(?:is|was)\s+(?:an?\s+)?(?:\w+\s+)?director", t, re.IGNORECASE)
         if m:
-            name = m.group(1).strip()
+            initial_name = m.group(1).strip()
+            name = _expand_name_span(t, initial_name, passage_title)
             words = name.split()
             if 1 <= len(words) <= 4:
                 return name
@@ -1335,49 +1412,56 @@ def bind_entity_from_hop1_winner(
         if "written" not in t_lower and "wrote" not in t_lower and "author" not in t_lower:
             return None
 
-        m = re.search(r"(?i)\bwritten\s+by\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$)", t)
+        m = re.search(r"\bwritten\s+by\s+([A-ZÀ-Ÿ][^\n.,;()]*)", t, re.IGNORECASE)
         if m:
-            return m.group(1).strip()
+            initial_name = m.group(1).strip()
+            return _expand_name_span(t, initial_name, passage_title)
 
-        m = re.search(r"(?i)([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})\s+wrote\b", t)
+        m = re.search(r"([A-ZÀ-Ÿ][^\n.,;()]*?)\s+wrote\b", t, re.IGNORECASE)
         if m:
-            return m.group(1).strip()
+            initial_name = m.group(1).strip()
+            return _expand_name_span(t, initial_name, passage_title)
 
     elif relation_type == "CREATOR":
         if "created" not in t_lower and "founder" not in t_lower:
             return None
 
-        m = re.search(r"(?i)\bcreated\s+by\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$)", t)
+        m = re.search(r"\bcreated\s+by\s+([A-ZÀ-Ÿ][^\n.,;()]*)", t, re.IGNORECASE)
         if m:
-            return m.group(1).strip()
+            initial_name = m.group(1).strip()
+            return _expand_name_span(t, initial_name, passage_title)
 
-        m = re.search(r"(?i)\bfounded\s+by\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$)", t)
+        m = re.search(r"\bfounded\s+by\s+([A-ZÀ-Ÿ][^\n.,;()]*)", t, re.IGNORECASE)
         if m:
-            return m.group(1).strip()
+            initial_name = m.group(1).strip()
+            return _expand_name_span(t, initial_name, passage_title)
 
     elif relation_type == "PRODUCER":
         if "produced" not in t_lower and "producer" not in t_lower:
             return None
 
-        m = re.search(r"(?i)\bproduced\s+by\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$)", t)
+        m = re.search(r"\bproduced\s+by\s+([A-ZÀ-Ÿ][^\n.,;()]*)", t, re.IGNORECASE)
         if m:
-            return m.group(1).strip()
+            initial_name = m.group(1).strip()
+            return _expand_name_span(t, initial_name, passage_title)
 
     elif relation_type == "COMPOSER":
         if "composed" not in t_lower and "composer" not in t_lower:
             return None
 
-        m = re.search(r"(?i)\bcomposed\s+by\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$)", t)
+        m = re.search(r"\bcomposed\s+by\s+([A-ZÀ-Ÿ][^\n.,;()]*)", t, re.IGNORECASE)
         if m:
-            return m.group(1).strip()
+            initial_name = m.group(1).strip()
+            return _expand_name_span(t, initial_name, passage_title)
 
     elif relation_type == "PERFORMER":
         if "starred" not in t_lower and "performed" not in t_lower and "starring" not in t_lower:
             return None
 
-        m = re.search(r"(?i)\bstarring\s+([A-Z][a-zA-ZÀ-ÿ]+(?:\s+[A-Z][a-zA-ZÀ-ÿ]+){0,3})(?:\s*[,\.\(\)]|$)", t)
+        m = re.search(r"\bstarring\s+([A-ZÀ-Ÿ][^\n.,;()]*)", t, re.IGNORECASE)
         if m:
-            return m.group(1).strip()
+            initial_name = m.group(1).strip()
+            return _expand_name_span(t, initial_name, passage_title)
 
     return None
 
@@ -2809,17 +2893,19 @@ def extract_object_from_certified_passage(
         relation_kind = relation_kind.upper().replace("REL_", "").replace("_HOP1", "").replace("_HOP2", "")
 
     # DIRECTOR: "directed by X" or "film directed by X"
+    # P0-2 FIX: Run on raw text, fully case-insensitive, Unicode-safe patterns
     if relation_kind == "DIRECTOR":
         if "directed" not in t_lower and "director" not in t_lower:
             if debug:
                 print(f"[CERTIFIED-EXTRACT] DIRECTOR: No 'directed'/'director' in passage")
             return None
 
-        # STEP 3 FIX: More robust patterns with better whitespace handling
+        # P0-2 FIX: Removed [A-Z] gating - now matches regardless of capitalization
+        # Uses re.IGNORECASE and captures any non-delimiter characters
+        # This fixes failures on "directed by xawery żuławski" (lowercase) or mid-sentence
+
         # Pattern 1: "directed by Name" (most common)
-        # Capture full name including extended Unicode (Polish Ż, etc.)
-        # Stops at sentence delimiters: . , ; ( or newline
-        m = re.search(r"(?i)\bdirected\s+by\s+([A-Z][^.,;(\n]+)", t)
+        m = re.search(r"\bdirected\s+by\s+([^\n.,;()]+)", t, re.IGNORECASE)
         if m:
             name = m.group(1).strip()
             # Clean up trailing punctuation/whitespace
@@ -2830,7 +2916,7 @@ def extract_object_from_certified_passage(
                 return name
 
         # Pattern 2: "film directed by Name" (Wikipedia common)
-        m = re.search(r"(?i)\bfilm\s+directed\s+by\s+([A-Z][^.,;(\n]+)", t)
+        m = re.search(r"\bfilm\s+directed\s+by\s+([^\n.,;()]+)", t, re.IGNORECASE)
         if m:
             name = m.group(1).strip()
             name = re.sub(r'[\s,\.\(\)]+$', '', name)
@@ -2839,9 +2925,9 @@ def extract_object_from_certified_passage(
                     print(f"[CERTIFIED-EXTRACT] DIRECTOR: '{name}' from 'film directed by' pattern")
                 return name
 
-        # Pattern 3: "is a ... film directed by Name" (handles adjectives/descriptions)
-        # STEP 3 FIX: Allow multiple words between "a" and "film" (e.g., "1985 Polish")
-        m = re.search(r"(?i)is\s+a\s+[\w\s]+film\s+directed\s+by\s+([A-Z][^.,;(\n]+)", t)
+        # Pattern 3: "is a ... film directed by Name" (P0-2: explicit pattern for Wikipedia)
+        # Handles "is a 1985 Polish horror film directed by Xawery Żuławski"
+        m = re.search(r"is\s+a\s+[^.,;()]*?film\s+directed\s+by\s+([^\n.,;()]+)", t, re.IGNORECASE)
         if m:
             name = m.group(1).strip()
             name = re.sub(r'[\s,\.\(\)]+$', '', name)
@@ -2851,7 +2937,7 @@ def extract_object_from_certified_passage(
                 return name
 
         # Pattern 4: "director Name" (e.g., "director Xawery Żuławski")
-        m = re.search(r"(?i)\bdirector\s+([A-Z][^.,;(\n]+)", t)
+        m = re.search(r"\bdirector\s+([^\n.,;()]+)", t, re.IGNORECASE)
         if m:
             name = m.group(1).strip()
             name = re.sub(r'[\s,\.\(\)]+$', '', name)
@@ -2862,6 +2948,7 @@ def extract_object_from_certified_passage(
 
         if debug:
             print(f"[CERTIFIED-EXTRACT] DIRECTOR: No pattern matched (passage has 'directed'/'director' but extraction failed)")
+            print(f"[CERTIFIED-EXTRACT] DIRECTOR: Passage text (first 200 chars): {t[:200]}")
 
     # MOTHER: "mother of X" or "X is the son/daughter of"
     elif relation_kind in ["MOTHER", "PARENT"]:
@@ -3381,28 +3468,31 @@ def get_llm_answer_certificate(
             print(f"[TIER 2: LLM HEURISTIC] No passages provided - abstaining")
         return None
 
-    # Prepare passages for LLM (truncate and format)
-    evidence_parts = []
-    pid_to_passage = {}
-    for i, p in enumerate(passages[:max_passages]):
-        pid = p.get("pid", f"p{i}")
-        text = p.get("text", "")
-        title = p.get("title", "")
+    # P0-3 FIX: Helper function to try LLM extraction with specific parameters
+    def _try_llm_extraction(max_chars: int, max_tokens: int, stop_tokens: list = None, attempt_label: str = ""):
+        """Try LLM extraction with specific truncation/token limits."""
+        # Prepare passages for LLM (truncate and format)
+        evidence_parts = []
+        pid_to_passage_local = {}
+        for i, p in enumerate(passages[:max_passages]):
+            pid_local = p.get("pid", f"p{i}")
+            text_local = p.get("text", "")
+            title_local = p.get("title", "")
 
-        # Truncate text
-        if len(text) > max_chars_per_passage:
-            text = text[:max_chars_per_passage] + "..."
+            # Truncate text
+            if len(text_local) > max_chars:
+                text_local = text_local[:max_chars] + "..."
 
-        pid_to_passage[pid] = p
-        evidence_parts.append(f"[{pid}] {title}\n{text}")
+            pid_to_passage_local[pid_local] = p
+            evidence_parts.append(f"[{pid_local}] {title_local}\n{text_local}")
 
-    evidence_str = "\n\n".join(evidence_parts)
+        evidence_str_local = "\n\n".join(evidence_parts)
 
-    # Build LLM prompt requesting structured answer certificate with confidence
-    prompt = f"""Question: {question}
+        # Build LLM prompt requesting structured answer certificate with confidence
+        prompt_local = f"""Question: {question}
 
 Evidence passages:
-{evidence_str}
+{evidence_str_local}
 
 TASK: Extract the answer to the question with provenance and confidence.
 
@@ -3427,6 +3517,30 @@ INSTRUCTIONS:
 
 JSON:"""
 
+        if debug:
+            print(f"\n[TIER 2: LLM HEURISTIC] {attempt_label}")
+            print(f"  Backend: {llm.__class__.__name__}")
+            print(f"  Prompt length: {len(prompt_local)} chars")
+            print(f"  Max chars/passage: {max_chars}")
+            print(f"  Max new tokens: {max_tokens}")
+            print(f"  Stop tokens: {stop_tokens}")
+
+        # Call LLM with specified parameters
+        if stop_tokens:
+            response_local = llm.generate(prompt_local, max_new_tokens=max_tokens, temperature=0.0, stop=stop_tokens)
+        else:
+            response_local = llm.generate(prompt_local, max_new_tokens=max_tokens, temperature=0.0)
+
+        return response_local, pid_to_passage_local
+
+    # P0-3 FIX: Try initial extraction, then retry with shorter prompt if fails
+    # Attempt 1: Standard parameters
+    response, pid_to_passage = _try_llm_extraction(
+        max_chars=max_chars_per_passage,
+        max_tokens=512,
+        attempt_label="Attempt 1/2 (standard prompt)"
+    )
+
     # Parse LLM response (try JSON, then fallback format)
     answer = ""
     pid = ""
@@ -3435,54 +3549,28 @@ JSON:"""
     confidence = 0.0  # P1: Add confidence field
 
     try:
-        # P0: Add comprehensive generation logging to debug None returns
-        if debug:
-            print(f"\n[TIER 2: LLM HEURISTIC] Calling LLM.generate()")
-            print(f"  Backend: {llm.__class__.__name__}")
-            print(f"  Prompt length: {len(prompt)} chars")
-            print(f"  Prompt (first 200): {prompt[:200]}...")
-            print(f"  Parameters: max_new_tokens=512, temperature=0.0")
+        # P0-3 FIX: Check if response is None or invalid - retry with shorter prompt
+        if response is None or not hasattr(response, 'text') or not response.text or not response.text.strip():
+            if debug:
+                print(f"[TIER 2: LLM HEURISTIC] Attempt 1 failed (None or empty response)")
+                print(f"  Retrying with shorter prompt...")
 
-        # Call LLM (P0: Fixed parameters, increased tokens to avoid truncation)
-        response = llm.generate(prompt, max_new_tokens=512, temperature=0.0)
-
-        # P0: Check if response is None or invalid BEFORE accessing attributes
-        if response is None:
-            error_msg = (
-                f"[TIER 2: LLM HEURISTIC] HARD FAILURE: LLM.generate() returned None!\n"
-                f"  Backend: {llm.__class__.__name__}\n"
-                f"  Prompt length: {len(prompt)} chars\n"
-                f"  Prompt (first 200): {prompt[:200]}\n"
-                f"  Parameters: max_new_tokens=512, temperature=0.0\n"
-                f"  This means the LLM interface itself is broken"
+            # Attempt 2: Shorter prompt, fewer tokens, explicit stop tokens
+            response, pid_to_passage = _try_llm_extraction(
+                max_chars=300,  # Halve the passage length
+                max_tokens=64,  # Much shorter output
+                stop_tokens=["\n\n", "Question:", "Evidence:"],
+                attempt_label="Attempt 2/2 (shorter prompt, stop tokens)"
             )
-            if debug:
-                print(error_msg)
-            raise RuntimeError(error_msg)
 
-        # LLMOutput has .text attribute
-        if not hasattr(response, 'text'):
-            error_msg = (
-                f"[TIER 2: LLM HEURISTIC] HARD FAILURE: Response has no 'text' attribute!\n"
-                f"  Backend: {llm.__class__.__name__}\n"
-                f"  Response type: {type(response)}\n"
-                f"  Response: {response}\n"
-                f"  Prompt length: {len(prompt)} chars\n"
-                f"  This means LLMOutput structure is wrong"
-            )
-            if debug:
-                print(error_msg)
-            raise RuntimeError(error_msg)
+            # Check again after retry
+            if response is None or not hasattr(response, 'text') or not response.text or not response.text.strip():
+                if debug:
+                    print(f"[TIER 2: LLM HEURISTIC] ✗ Both attempts failed - will try deterministic fallback")
+                # P0-3: Don't straight abstain - caller will try deterministic fallback
+                return None
 
-        response_text = response.text
-
-        # CHANGE 2: Abstain-friendly - empty response means abstain
-        if not response_text:
-            if debug:
-                print(f"[TIER 2: LLM HEURISTIC] Empty response from LLM - abstaining")
-            return None
-
-        response_text = response_text.strip()
+        response_text = response.text.strip()
 
         if debug:
             print(f"\n[TIER 2: LLM HEURISTIC] Raw LLM response:")
