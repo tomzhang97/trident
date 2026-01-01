@@ -1529,8 +1529,32 @@ def _expand_name_span(text: str, initial_match: str, passage_title: str = "") ->
         # If still single-word, try first sentence
         if len(expanded.split()) < 2:
             first_sent = text.split('.')[0] if '.' in text else text[:200]
-            # Look for multi-word name containing initial_match
-            name_matches = re.findall(r'[A-ZÀ-Ÿ][a-zà-ÿ]+(?:\s+[A-ZÀ-Ÿ][a-zà-ÿ]+)+', first_sent)
+            # P0-3: Unicode-safe multi-word name extraction using .isupper() and .isalpha()
+            # This handles Polish (Ż), French (É), etc. that fall outside ASCII or À-Ÿ range
+            tokens = first_sent.split()
+            name_matches = []
+            i = 0
+            while i < len(tokens):
+                # Start of a potential name: first char is uppercase letter
+                if tokens[i] and tokens[i][0].isalpha() and tokens[i][0].isupper():
+                    # Greedily collect subsequent title-case tokens
+                    name_parts = [tokens[i]]
+                    j = i + 1
+                    while j < len(tokens):
+                        # Continue if token starts with uppercase letter (handles diacritics)
+                        if tokens[j] and tokens[j][0].isalpha() and tokens[j][0].isupper():
+                            name_parts.append(tokens[j])
+                            j += 1
+                        else:
+                            break
+                    # Only keep multi-word names (≥2 tokens)
+                    if len(name_parts) >= 2:
+                        name_matches.append(' '.join(name_parts))
+                    i = j
+                else:
+                    i += 1
+
+            # Find candidate containing initial_match
             for candidate in name_matches:
                 if initial_match in candidate:
                     expanded = candidate
