@@ -3423,11 +3423,16 @@ JSON:"""
             # Try to extract just the JSON object by finding matching braces
             if "Extra data" in str(e) and '{' in response_text:
                 if debug:
-                    print(f"[LLM CERT] JSON parse error (Extra data) - extracting first JSON object")
+                    print(f"[LLM CERT] JSON parse error (Extra data) - extracting JSON objects")
 
-                # Find the first complete JSON object
-                start_idx = response_text.find('{')
-                if start_idx != -1:
+                # Find ALL complete JSON objects in the response
+                json_objects = []
+                search_start = 0
+                while True:
+                    start_idx = response_text.find('{', search_start)
+                    if start_idx == -1:
+                        break
+
                     brace_count = 0
                     end_idx = -1
                     for i in range(start_idx, len(response_text)):
@@ -3440,29 +3445,54 @@ JSON:"""
                                 break
 
                     if end_idx != -1:
-                        json_only = response_text[start_idx:end_idx]
-                        if debug:
-                            print(f"  Extracted JSON: {json_only[:100]}...")
+                        json_str = response_text[start_idx:end_idx]
                         try:
-                            cert_dict = json.loads(json_only)
-                            json_parse_success = True
+                            parsed = json.loads(json_str)
+                            json_objects.append(parsed)
+                        except json.JSONDecodeError:
+                            pass  # Skip invalid JSON
+                        search_start = end_idx
+                    else:
+                        break
 
-                            answer = cert_dict.get("answer", "").strip()
-                            pid = cert_dict.get("passage_id", "").strip()
-                            quote = cert_dict.get("quote", "").strip()
-                            answer_type = cert_dict.get("answer_type", "entity").strip()
-                            confidence = float(cert_dict.get("confidence", 0.0))  # P1: Extract confidence
+                if debug:
+                    print(f"  Found {len(json_objects)} valid JSON objects")
 
-                            if debug:
-                                print(f"[LLM CERT] ✓ JSON extracted successfully (removed trailing garbage)")
-                                print(f"  Answer: '{answer}'")
-                                print(f"  PID: {pid}")
-                                print(f"  Quote: '{quote[:100]}...'")
-                                print(f"  Confidence: {confidence:.2f}")
-                        except json.JSONDecodeError as e2:
-                            if debug:
-                                print(f"[LLM CERT] Extracted JSON still invalid: {e2}")
-                                print(f"  Will try line-by-line fallback...")
+                # Prefer non-empty JSON objects (skip all-empty fields)
+                selected_dict = None
+                for obj in json_objects:
+                    ans = obj.get("answer", "").strip()
+                    p = obj.get("passage_id", "").strip()
+                    q = obj.get("quote", "").strip()
+                    # If this object has at least one non-empty field, prefer it
+                    if ans or p or q:
+                        selected_dict = obj
+                        if debug:
+                            print(f"  Selected non-empty JSON: answer='{ans[:50] if ans else ''}', pid={p}, quote_len={len(q)}")
+                        break
+
+                # If all objects are empty, just use the first one
+                if not selected_dict and json_objects:
+                    selected_dict = json_objects[0]
+                    if debug:
+                        print(f"  All JSON objects empty, using first one")
+
+                if selected_dict:
+                    json_parse_success = True
+                    cert_dict = selected_dict
+
+                    answer = cert_dict.get("answer", "").strip()
+                    pid = cert_dict.get("passage_id", "").strip()
+                    quote = cert_dict.get("quote", "").strip()
+                    answer_type = cert_dict.get("answer_type", "entity").strip()
+                    confidence = float(cert_dict.get("confidence", 0.0))  # P1: Extract confidence
+
+                    if debug:
+                        print(f"[LLM CERT] ✓ JSON extracted successfully (removed trailing garbage)")
+                        print(f"  Answer: '{answer}'")
+                        print(f"  PID: {pid}")
+                        print(f"  Quote: '{quote[:100]}...'")
+                        print(f"  Confidence: {confidence:.2f}")
 
             # If JSON parsing failed (including extraction), try line-by-line fallback
             if not json_parse_success:
