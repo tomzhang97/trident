@@ -3976,12 +3976,21 @@ JSON:"""
             text = ' '.join(text.split())
             return text
 
-        # P1: Gate on confidence threshold (must be >= 0.85)
-        if confidence < 0.85:
+        # STEP 3: Introduce Tier-2 confidence bands (instead of hard reject)
+        # ≥ 0.85 → accept (high confidence)
+        # 0.70–0.85 → accept but mark low_confidence
+        # < 0.70 → abstain
+        low_confidence_flag = False
+        if confidence < 0.70:
             if debug:
-                print(f"[TIER 2: LLM HEURISTIC] Confidence too low: {confidence:.2f} < 0.85")
-                print(f"  Rejecting certificate (low confidence)")
+                print(f"[TIER 2: LLM HEURISTIC] Confidence too low: {confidence:.2f} < 0.70")
+                print(f"  Rejecting (below minimum threshold)")
             return None
+        elif confidence < 0.85:
+            low_confidence_flag = True
+            if debug:
+                print(f"[TIER 2: LLM HEURISTIC] ⚠ Low confidence: {confidence:.2f} (0.70-0.85 band)")
+                print(f"  Will accept but mark as low_confidence")
 
         # CHANGE 1: Gate on question-intent → answer-type consistency
         intent = detect_question_intent(question)
@@ -3999,57 +4008,38 @@ JSON:"""
         passage_norm = normalize_for_match(passage_text)
         quote_norm = normalize_for_match(quote)
 
-        # P1: RELAXED RULE 1 - Check if answer is in passage (primary check)
-        # Allow case-insensitive matching for robustness
+        # STEP 2: RELAXED acceptance criteria (safely)
+        # Changed from: answer ⊂ quote ⊂ passage
+        # To: answer ⊂ passage AND quote_length ≥ 15 chars
+        # Why: Many valid answers appear without clean contiguous quotes
+        #      Especially comparisons and yes/no questions
+        # We still prevent hallucination and keep provenance
+
+        # Check 1: Answer must appear in passage (prevents hallucination)
         answer_in_passage = (
             answer_norm in passage_norm or
             answer_norm.lower() in passage_norm.lower()
         )
 
-        if answer_in_passage:
+        if not answer_in_passage:
             if debug:
-                print(f"[TIER 2: LLM HEURISTIC] ✓ Answer found in passage (relaxed verification)")
-                print(f"  Answer: '{answer}'")
-                print(f"  Confidence: {confidence:.2f}")
-            # ACCEPT - answer is in passage and confidence is high
-        else:
-            # P1: RELAXED RULE 2 - Check token overlap between quote and passage
-            # Allow paraphrasing if >=80% token overlap
-            quote_tokens = set(quote_norm.lower().split())
-            passage_tokens = set(passage_norm.lower().split())
+                print(f"[TIER 2: LLM HEURISTIC] ✗ FAILED: Answer not in passage")
+                print(f"  Answer (normalized): '{answer_norm}'")
+                print(f"  Passage (first 200): '{passage_text[:200]}'")
+            return None
 
-            if quote_tokens and passage_tokens:
-                overlap = len(quote_tokens & passage_tokens) / len(quote_tokens)
-
-                if overlap >= 0.80:
-                    if debug:
-                        print(f"[TIER 2: LLM HEURISTIC] ✓ Quote has {overlap:.1%} token overlap (≥80% threshold)")
-                        print(f"  Accepting paraphrased quote")
-                    # ACCEPT - quote is paraphrase of passage content
-                else:
-                    # FAIL - answer not in passage and quote doesn't match
-                    if debug:
-                        print(f"[TIER 2: LLM HEURISTIC] ✗ FAILED: Answer not in passage and quote overlap {overlap:.1%} < 80%")
-                        print(f"  Answer (normalized): '{answer_norm}'")
-                        print(f"  Passage (first 200): '{passage_text[:200]}'")
-                        print(f"  Quote tokens: {len(quote_tokens)}, Passage tokens: {len(passage_tokens)}")
-                        print(f"  Overlap: {len(quote_tokens & passage_tokens)}")
-                    return None
-            else:
-                # Empty tokens - fail
-                if debug:
-                    print(f"[TIER 2: LLM HEURISTIC] ✗ FAILED: Empty quote or passage tokens")
-                return None
-
-        # P1: RELAXED RULE 3 - For yes/no, warn if quote is very short but don't fail
-        # (With confidence gating, we trust high-confidence LLM judgments)
-        q_lower = question.lower()
-        is_yesno = q_lower.startswith(("is ", "are ", "was ", "were ", "do ", "does ", "did "))
-        if is_yesno and answer_type == "yesno" and len(quote_norm) < 20:
+        # Check 2: Quote must be meaningful (≥15 chars)
+        if len(quote_norm) < 15:
             if debug:
-                print(f"[TIER 2: LLM HEURISTIC] ⚠ Warning: Yes/no quote is short ({len(quote_norm)} chars)")
+                print(f"[TIER 2: LLM HEURISTIC] ✗ FAILED: Quote too short ({len(quote_norm)} chars < 15)")
                 print(f"  Quote: '{quote}'")
-                print(f"  Accepting due to confidence {confidence:.2f} >= 0.85")
+            return None
+
+        if debug:
+            print(f"[TIER 2: LLM HEURISTIC] ✓ Verification passed")
+            print(f"  Answer in passage: YES")
+            print(f"  Quote length: {len(quote_norm)} chars (≥15)")
+            print(f"  Confidence: {confidence:.2f}")
 
         # CHANGE 3: STRENGTHENED self-consistency checks
         # Don't trust self-reported confidence blindly - verify answer appears in multiple passages
@@ -4091,11 +4081,14 @@ JSON:"""
                 print(f"[TIER 2: LLM HEURISTIC] ⚠ Confidence penalty: answer only in supporting passage")
                 print(f"  No corroboration from other passages")
             # If calibrated confidence drops below threshold, reject
-            if calibrated_confidence < 0.75:
+            # STEP 3: Updated threshold to 0.70 to match confidence bands
+            if calibrated_confidence < 0.70:
                 if debug:
-                    print(f"[TIER 2: LLM HEURISTIC] ✗ FAILED: Calibrated confidence {calibrated_confidence:.2f} < 0.75")
+                    print(f"[TIER 2: LLM HEURISTIC] ✗ FAILED: Calibrated confidence {calibrated_confidence:.2f} < 0.70")
                     print(f"  Answer lacks cross-passage validation")
                 return None
+            elif calibrated_confidence < 0.85:
+                low_confidence_flag = True  # Mark as low confidence after calibration
         elif passages_with_answer == 0:
             # Answer not found in ANY passage - major red flag
             if debug:
@@ -4118,6 +4111,14 @@ JSON:"""
         if debug and calibrated_confidence != confidence:
             print(f"[TIER 2: LLM HEURISTIC] Confidence calibrated: {confidence:.2f} → {calibrated_confidence:.2f}")
 
+        # STEP 3: Determine final confidence band
+        if calibrated_confidence >= 0.85:
+            confidence_band = "high (≥0.85)"
+        elif calibrated_confidence >= 0.70:
+            confidence_band = "low (0.70-0.85)"
+        else:
+            confidence_band = "too low (<0.70)"
+
         # All verification passed!
         cert = AnswerCertificate(
             answer=answer,
@@ -4133,6 +4134,9 @@ JSON:"""
             print(f"  Answer: '{answer}'")
             print(f"  PID: {pid[:12]}...")
             print(f"  Quote length: {len(quote)} chars")
+            print(f"  Confidence: {calibrated_confidence:.2f} [{confidence_band}]")
+            if low_confidence_flag:
+                print(f"  ⚠ LOW CONFIDENCE FLAG: Answer accepted but marked for review")
 
         return cert
 

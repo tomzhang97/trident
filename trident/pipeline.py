@@ -872,22 +872,41 @@ class TridentPipeline:
                                     if constrained_result.candidates:
                                         print(f"[CONSTRAINED] Had {len(constrained_result.candidates)} candidates")
 
-                    # STEP 1 FIX: Removed "certified-only attempt" on ENTITY-only certificates
-                    # This was the #1 source of NO_VERIFIED_SPAN / empty outputs when
-                    # has_answer_facet_certified=False
-                    # Now we skip extraction here and will use LLM Answer Certificate (Step 3)
-                    # or abstain
-                    if not has_answer_facet_certified:
-                        if debug_chain or debug_constrained:
-                            certified_types = [facet_type_by_id.get(c.get("facet_id")) for c in certificates]
-                            print(f"\n[STEP 1] No answer facets certified (only {certified_types})")
-                            print(f"  Skipping constrained extraction entirely")
-                            print(f"  Will route to LLM Answer Certificate fallback")
+                    # STEP 1 (MANDATORY): Make Tier-2 the DEFAULT for non-certifiable questions
+                    # Changed routing from: Safe-Cover → LLM Heuristic → Abstain
+                    # To: Use Tier-1 ONLY if answer facets certified + extracted successfully
+                    #     Otherwise use Tier-2 as DEFAULT
+                    # Key rule: ENTITY-only certification should NOT block Tier-2
 
-                    # STEP 4: LLM Answer Certificate fallback (routing policy)
-                    # If answer still empty (no answer facets certified OR typed extraction failed),
-                    # try LLM Answer Certificate as fallback before abstaining
-                    if not answer or answer.strip() == "":
+                    # Determine if we should use Tier-1 answer (Safe-Cover certified or deterministic)
+                    tier1_answer_valid = (
+                        answer and
+                        answer.strip() != "" and
+                        (
+                            # Safe-Cover with answer facets certified
+                            (has_answer_facet_certified and answer_source == "safe_cover") or
+                            # Deterministic solver (always valid)
+                            answer_source == "deterministic"
+                        )
+                    )
+
+                    # Determine if we should route to Tier-2
+                    should_use_tier2 = not tier1_answer_valid
+
+                    if debug_chain or debug_constrained:
+                        print(f"\n[ROUTING DECISION]")
+                        print(f"  Has answer: {bool(answer)}")
+                        print(f"  Has answer facet certified: {has_answer_facet_certified}")
+                        print(f"  Answer source: {answer_source}")
+                        print(f"  Tier-1 valid: {tier1_answer_valid}")
+                        print(f"  → Route to: {'Tier-1 (Safe-Cover)' if tier1_answer_valid else 'Tier-2 (LLM Heuristic)'}")
+
+                    # STEP 4: LLM Answer Certificate (Tier-2) - now the DEFAULT for non-certifiable questions
+                    # Use Tier-2 for:
+                    # - Questions where no answer facets were certified (ENTITY-only)
+                    # - Questions where typed extraction failed
+                    # - Comparison, temporal, yes/no, quantity questions (where facets don't help)
+                    if should_use_tier2:
                         # P0: Feed LLM cert the FULL context pool, not just selected/certified passages
                         # For 2Wiki/Hotpot, this is the full 10-context set from the sample
                         # result['selected_passages'] is WRONG - it's only certified passages (1-2)
