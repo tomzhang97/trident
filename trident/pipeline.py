@@ -849,29 +849,46 @@ class TridentPipeline:
                     # If answer still empty (no answer facets certified OR typed extraction failed),
                     # try LLM Answer Certificate as fallback before abstaining
                     if not answer or answer.strip() == "":
-                        # STEP 1 FIX: Use top 6-10 passages from context pool, not just 1-2 winners
-                        # Start with all retrieved passages (not just certified winners)
-                        llm_cert_passages = result.get('selected_passages', [])
+                        # STEP 2 (CRITICAL): Feed LLM certificate enough passages
+                        # Use top K=6-10 from entire context pool, trim to 400-600 chars each
+                        all_passages = result.get('selected_passages', [])
 
-                        # Prioritize certified passages if available, but ensure we have at least 6-10 total
-                        if winner_passages and len(winner_passages) < 6:
-                            # Add certified winners to front, then fill with rest
-                            winner_pids = {p.get('pid') for p in winner_passages}
-                            other_passages = [p for p in llm_cert_passages if p.get('pid') not in winner_pids]
-                            llm_cert_passages = winner_passages + other_passages[:max(0, 10 - len(winner_passages))]
-                        elif winner_passages and len(winner_passages) >= 6:
-                            # Have enough certified winners
-                            llm_cert_passages = winner_passages[:10]
-                        # else: use all selected_passages (already set above)
+                        # Build passage pool prioritizing certified winners
+                        passage_pool = []
+                        seen_pids = set()
 
-                        # Ensure we have a reasonable number
-                        llm_cert_passages = llm_cert_passages[:10]  # Cap at 10
+                        # First: add certified winners (if any)
+                        if winner_passages:
+                            for p in winner_passages[:10]:  # Cap certified at 10
+                                pid = p.get('pid')
+                                if pid and pid not in seen_pids:
+                                    passage_pool.append(p)
+                                    seen_pids.add(pid)
 
+                        # Second: fill from full context pool to reach 6-10 passages
+                        if len(passage_pool) < 10 and all_passages:
+                            for p in all_passages:
+                                if len(passage_pool) >= 10:
+                                    break
+                                pid = p.get('pid')
+                                if pid and pid not in seen_pids:
+                                    passage_pool.append(p)
+                                    seen_pids.add(pid)
+
+                        # Ensure minimum of 6 passages (use whatever we have if less)
+                        llm_cert_passages = passage_pool[:10] if len(passage_pool) >= 6 else passage_pool
+
+                        # Log passage selection details
+                        debug_llm_cert = os.environ.get("TRIDENT_DEBUG_LLM_CERT", "0") == "1"
                         if llm_cert_passages and self.llm:
-                            if debug_chain or debug_constrained:
-                                print(f"\n[STEP 4] Trying LLM Answer Certificate fallback")
-                                print(f"  Passages: {len(llm_cert_passages)} (STEP 1: using top N from pool)")
-                                print(f"  Reason: {'no_answer_facets' if not has_answer_facet_certified else 'typed_extraction_failed'}")
+                            if debug_chain or debug_constrained or debug_llm_cert:
+                                print(f"\n[LLM CERT ROUTING]")
+                                print(f"  Total context pool: {len(all_passages)}")
+                                print(f"  Certified winners: {len(winner_passages) if winner_passages else 0}")
+                                print(f"  Selected for LLM cert: {len(llm_cert_passages)}")
+                                print(f"  Reason: {'no_answer_facets_certified' if not has_answer_facet_certified else 'typed_extraction_failed'}")
+                                if len(llm_cert_passages) < 6:
+                                    print(f"  ⚠ WARNING: Only {len(llm_cert_passages)} passages (recommend 6-10)")
 
                             llm_cert = get_llm_answer_certificate(
                                 llm=self.llm,
@@ -886,14 +903,22 @@ class TridentPipeline:
                                 is_grounded = True
                                 prompt_type = "llm_answer_certificate"
 
-                                if debug_chain or debug_constrained:
-                                    print(f"[STEP 4] ✓ LLM Answer Certificate succeeded")
+                                if debug_chain or debug_constrained or debug_llm_cert:
+                                    print(f"[LLM CERT] ✓ SUCCESS")
                                     print(f"  Answer: '{answer}'")
-                                    print(f"  PID: {llm_cert.pid[:12]}...")
+                                    print(f"  Supporting PID: {llm_cert.pid[:12] if len(llm_cert.pid) > 12 else llm_cert.pid}...")
                                     print(f"  Quote: '{llm_cert.quote[:100]}...'")
                                     print(f"  Type: {llm_cert.answer_type}")
-                            elif debug_chain or debug_constrained:
-                                print(f"[STEP 4] ✗ LLM Answer Certificate failed (will abstain)")
+                            else:
+                                if debug_chain or debug_constrained or debug_llm_cert:
+                                    reason = "llm_returned_none" if llm_cert is None else "verification_failed"
+                                    print(f"[LLM CERT] ✗ FAILED: {reason}")
+                                    if llm_cert and not llm_cert.verified:
+                                        print(f"  Reason: LLM cert returned but failed verification")
+                        elif debug_chain or debug_constrained or debug_llm_cert:
+                            print(f"\n[LLM CERT ROUTING] Skipped (no passages or no LLM)")
+                            print(f"  Has passages: {bool(llm_cert_passages)}")
+                            print(f"  Has LLM: {bool(self.llm)}")
 
             # ANSWER VALIDATION: ensure we only keep grounded, non-empty answers
             def _is_garbage_answer(ans: str) -> bool:

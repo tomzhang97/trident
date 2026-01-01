@@ -3066,6 +3066,11 @@ JSON:"""
         # LLMOutput has .text attribute
         response_text = response.text.strip()
 
+        if debug:
+            print(f"\n[LLM CERT] Raw LLM response:")
+            print(f"  {response_text[:300]}")
+            print(f"  ... (truncated, full length: {len(response_text)} chars)")
+
         # Parse JSON (try to extract if wrapped in markdown)
         if "```json" in response_text:
             response_text = response_text.split("```json")[1].split("```")[0].strip()
@@ -3125,16 +3130,25 @@ JSON:"""
         # Empty answer means LLM abstained
         if not answer or not quote or not pid:
             if debug:
-                print(f"[LLM CERT] Empty answer/quote/pid - LLM abstained")
+                print(f"[LLM CERT] ✗ FAILED: Empty fields")
+                print(f"  answer={bool(answer)}, quote={bool(quote)}, pid={bool(pid)}")
             return None
 
         # Get passage text for verification
         if pid not in pid_to_passage:
             if debug:
-                print(f"[LLM CERT] Invalid PID {pid} - not in passage set")
+                print(f"[LLM CERT] ✗ FAILED: Invalid PID")
+                print(f"  PID '{pid}' not found in passage set")
+                print(f"  Available PIDs: {list(pid_to_passage.keys())[:5]}...")
             return None
 
         passage_text = pid_to_passage[pid].get("text", "")
+
+        if not passage_text:
+            if debug:
+                print(f"[LLM CERT] ✗ FAILED: Passage has no text")
+                print(f"  PID: {pid}")
+            return None
 
         # HARD RULE 1: Quote must be substring of passage
         def normalize_for_match(text: str) -> str:
@@ -3148,17 +3162,27 @@ JSON:"""
 
         if quote_norm not in passage_norm:
             if debug:
-                print(f"[LLM CERT] REJECTED: Quote not found in passage")
-                print(f"  Quote (norm): '{quote_norm[:100]}'")
+                print(f"[LLM CERT] ✗ FAILED: Quote not found in passage (HARD RULE 1)")
+                print(f"  Quote (first 100 chars): '{quote[:100]}'")
+                print(f"  Quote (normalized): '{quote_norm[:100]}'")
+                print(f"  Passage (first 200 chars): '{passage_text[:200]}'")
+                print(f"  Trying case-insensitive fallback...")
+                # Try case-insensitive as fallback
+                if quote_norm.lower() not in passage_norm.lower():
+                    print(f"  Fallback also failed")
+                else:
+                    print(f"  Fallback would have worked (case mismatch)")
             return None
 
         # HARD RULE 2: Answer must be substring of quote
         answer_norm = normalize_for_match(answer)
         if answer_norm not in quote_norm:
             if debug:
-                print(f"[LLM CERT] REJECTED: Answer not found in quote")
-                print(f"  Answer (norm): '{answer_norm}'")
-                print(f"  Quote (norm): '{quote_norm[:100]}'")
+                print(f"[LLM CERT] ✗ FAILED: Answer not found in quote (HARD RULE 2)")
+                print(f"  Answer: '{answer}'")
+                print(f"  Answer (normalized): '{answer_norm}'")
+                print(f"  Quote: '{quote[:100]}'")
+                print(f"  Quote (normalized): '{quote_norm[:100]}'")
             return None
 
         # HARD RULE 3: For yes/no, check quote contains decisive info
@@ -3169,7 +3193,9 @@ JSON:"""
             # Simple heuristic: quote should be substantial (not just "yes"/"no")
             if len(quote_norm) < 20:
                 if debug:
-                    print(f"[LLM CERT] REJECTED: Yes/no quote too short ({len(quote_norm)} chars)")
+                    print(f"[LLM CERT] ✗ FAILED: Yes/no quote too short (HARD RULE 3)")
+                    print(f"  Quote length: {len(quote_norm)} chars (need >= 20)")
+                    print(f"  Quote: '{quote}'")
                 return None
 
         # All verification passed!
