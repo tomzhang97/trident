@@ -3009,8 +3009,26 @@ def get_llm_answer_certificate(
 
     debug = os.environ.get("TRIDENT_DEBUG_LLM_CERT", "0") == "1"
 
+    # STEP 1: Print version banner to prove we're running patched code
+    if debug:
+        import trident.chain_builder
+        print(f"\n{'='*80}")
+        print(f"[LLM CERT] USING PATCHED CODE")
+        print(f"  File: {trident.chain_builder.__file__}")
+        print(f"  Patch ID: 2026-01-01-P0-FINAL")
+        print(f"  Backend: {llm.__class__.__name__}")
+        print(f"{'='*80}")
+
     if not passages:
-        return None
+        error_msg = (
+            f"[LLM CERT] HARD FAILURE: No passages provided\n"
+            f"  Question: {question}\n"
+            f"  Backend: {llm.__class__.__name__}\n"
+            f"  This should never happen - passages list is empty"
+        )
+        if debug:
+            print(error_msg)
+        raise RuntimeError(error_msg)
 
     # Prepare passages for LLM (truncate and format)
     evidence_parts = []
@@ -3074,27 +3092,46 @@ JSON:"""
 
         # P0: Check if response is None or invalid BEFORE accessing attributes
         if response is None:
+            error_msg = (
+                f"[LLM CERT] HARD FAILURE: LLM.generate() returned None!\n"
+                f"  Backend: {llm.__class__.__name__}\n"
+                f"  Prompt length: {len(prompt)} chars\n"
+                f"  Prompt (first 200): {prompt[:200]}\n"
+                f"  Parameters: max_new_tokens=128, temperature=0.0\n"
+                f"  This means the LLM interface itself is broken"
+            )
             if debug:
-                print(f"[LLM CERT] ✗ CRITICAL: LLM.generate() returned None!")
-                print(f"  Backend: {llm.__class__.__name__}")
-            return None
+                print(error_msg)
+            raise RuntimeError(error_msg)
 
         # LLMOutput has .text attribute
         if not hasattr(response, 'text'):
+            error_msg = (
+                f"[LLM CERT] HARD FAILURE: Response has no 'text' attribute!\n"
+                f"  Backend: {llm.__class__.__name__}\n"
+                f"  Response type: {type(response)}\n"
+                f"  Response: {response}\n"
+                f"  Prompt length: {len(prompt)} chars\n"
+                f"  This means LLMOutput structure is wrong"
+            )
             if debug:
-                print(f"[LLM CERT] ✗ CRITICAL: Response has no 'text' attribute!")
-                print(f"  Response type: {type(response)}")
-                print(f"  Response: {response}")
-            return None
+                print(error_msg)
+            raise RuntimeError(error_msg)
 
         response_text = response.text
 
         # P0: Check for empty response BEFORE stripping
         if not response_text:
+            error_msg = (
+                f"[LLM CERT] HARD FAILURE: Empty response from LLM\n"
+                f"  Backend: {llm.__class__.__name__}\n"
+                f"  Prompt length: {len(prompt)} chars\n"
+                f"  Prompt (first 200): {prompt[:200]}\n"
+                f"  Response text is empty or None"
+            )
             if debug:
-                print(f"[LLM CERT] ✗ FAILED: Empty response from LLM")
-                print(f"  Backend: {llm.__class__.__name__}")
-            return None
+                print(error_msg)
+            raise RuntimeError(error_msg)
 
         response_text = response_text.strip()
 
@@ -3161,32 +3198,61 @@ JSON:"""
                 print(f"  Quote: '{quote[:100]}...'")
 
             if not (answer and quote and pid):
+                error_msg = (
+                    f"[LLM CERT] HARD FAILURE: Fallback parsing incomplete\n"
+                    f"  Backend: {llm.__class__.__name__}\n"
+                    f"  Response text: {response_text}\n"
+                    f"  Parsed answer: '{answer}'\n"
+                    f"  Parsed pid: '{pid}'\n"
+                    f"  Parsed quote: '{quote}'\n"
+                    f"  LLM returned non-JSON and fallback extraction failed"
+                )
                 if debug:
-                    print(f"[LLM CERT] Fallback parsing incomplete")
-                return None
+                    print(error_msg)
+                raise RuntimeError(error_msg)
 
         # Empty answer means LLM abstained
         if not answer or not quote or not pid:
+            error_msg = (
+                f"[LLM CERT] HARD FAILURE: Empty fields in parsed response\n"
+                f"  Backend: {llm.__class__.__name__}\n"
+                f"  answer={bool(answer)} ('{answer}')\n"
+                f"  quote={bool(quote)} ('{quote}')\n"
+                f"  pid={bool(pid)} ('{pid}')\n"
+                f"  Response text: {response_text}\n"
+                f"  LLM returned incomplete certificate"
+            )
             if debug:
-                print(f"[LLM CERT] ✗ FAILED: Empty fields")
-                print(f"  answer={bool(answer)}, quote={bool(quote)}, pid={bool(pid)}")
-            return None
+                print(error_msg)
+            raise RuntimeError(error_msg)
 
         # Get passage text for verification
         if pid not in pid_to_passage:
+            error_msg = (
+                f"[LLM CERT] HARD FAILURE: Invalid PID\n"
+                f"  Backend: {llm.__class__.__name__}\n"
+                f"  PID '{pid}' not found in passage set\n"
+                f"  Available PIDs: {list(pid_to_passage.keys())[:5]}...\n"
+                f"  Total passages: {len(pid_to_passage)}\n"
+                f"  LLM hallucinated a passage ID"
+            )
             if debug:
-                print(f"[LLM CERT] ✗ FAILED: Invalid PID")
-                print(f"  PID '{pid}' not found in passage set")
-                print(f"  Available PIDs: {list(pid_to_passage.keys())[:5]}...")
-            return None
+                print(error_msg)
+            raise RuntimeError(error_msg)
 
         passage_text = pid_to_passage[pid].get("text", "")
 
         if not passage_text:
+            error_msg = (
+                f"[LLM CERT] HARD FAILURE: Passage has no text\n"
+                f"  Backend: {llm.__class__.__name__}\n"
+                f"  PID: {pid}\n"
+                f"  Passage object: {pid_to_passage[pid]}\n"
+                f"  This should never happen - passage data is corrupted"
+            )
             if debug:
-                print(f"[LLM CERT] ✗ FAILED: Passage has no text")
-                print(f"  PID: {pid}")
-            return None
+                print(error_msg)
+            raise RuntimeError(error_msg)
 
         # HARD RULE 1: Quote must be substring of passage
         def normalize_for_match(text: str) -> str:
@@ -3199,29 +3265,36 @@ JSON:"""
         passage_norm = normalize_for_match(passage_text)
 
         if quote_norm not in passage_norm:
+            # Try case-insensitive as fallback
+            case_insensitive_match = quote_norm.lower() in passage_norm.lower()
+            error_msg = (
+                f"[LLM CERT] HARD FAILURE: Quote not found in passage (HARD RULE 1)\n"
+                f"  Backend: {llm.__class__.__name__}\n"
+                f"  Quote (first 100 chars): '{quote[:100]}'\n"
+                f"  Quote (normalized): '{quote_norm[:100]}'\n"
+                f"  Passage (first 200 chars): '{passage_text[:200]}'\n"
+                f"  Case-insensitive match: {case_insensitive_match}\n"
+                f"  LLM hallucinated quote not in passage"
+            )
             if debug:
-                print(f"[LLM CERT] ✗ FAILED: Quote not found in passage (HARD RULE 1)")
-                print(f"  Quote (first 100 chars): '{quote[:100]}'")
-                print(f"  Quote (normalized): '{quote_norm[:100]}'")
-                print(f"  Passage (first 200 chars): '{passage_text[:200]}'")
-                print(f"  Trying case-insensitive fallback...")
-                # Try case-insensitive as fallback
-                if quote_norm.lower() not in passage_norm.lower():
-                    print(f"  Fallback also failed")
-                else:
-                    print(f"  Fallback would have worked (case mismatch)")
-            return None
+                print(error_msg)
+            raise RuntimeError(error_msg)
 
         # HARD RULE 2: Answer must be substring of quote
         answer_norm = normalize_for_match(answer)
         if answer_norm not in quote_norm:
+            error_msg = (
+                f"[LLM CERT] HARD FAILURE: Answer not found in quote (HARD RULE 2)\n"
+                f"  Backend: {llm.__class__.__name__}\n"
+                f"  Answer: '{answer}'\n"
+                f"  Answer (normalized): '{answer_norm}'\n"
+                f"  Quote: '{quote[:100]}'\n"
+                f"  Quote (normalized): '{quote_norm[:100]}'\n"
+                f"  LLM extracted answer not contained in quote"
+            )
             if debug:
-                print(f"[LLM CERT] ✗ FAILED: Answer not found in quote (HARD RULE 2)")
-                print(f"  Answer: '{answer}'")
-                print(f"  Answer (normalized): '{answer_norm}'")
-                print(f"  Quote: '{quote[:100]}'")
-                print(f"  Quote (normalized): '{quote_norm[:100]}'")
-            return None
+                print(error_msg)
+            raise RuntimeError(error_msg)
 
         # HARD RULE 3: For yes/no, check quote contains decisive info
         q_lower = question.lower()
@@ -3230,11 +3303,17 @@ JSON:"""
             # For yes/no, quote should contain key entities from question
             # Simple heuristic: quote should be substantial (not just "yes"/"no")
             if len(quote_norm) < 20:
+                error_msg = (
+                    f"[LLM CERT] HARD FAILURE: Yes/no quote too short (HARD RULE 3)\n"
+                    f"  Backend: {llm.__class__.__name__}\n"
+                    f"  Quote length: {len(quote_norm)} chars (need >= 20)\n"
+                    f"  Quote: '{quote}'\n"
+                    f"  Question: {question}\n"
+                    f"  LLM provided insufficient evidence for yes/no answer"
+                )
                 if debug:
-                    print(f"[LLM CERT] ✗ FAILED: Yes/no quote too short (HARD RULE 3)")
-                    print(f"  Quote length: {len(quote_norm)} chars (need >= 20)")
-                    print(f"  Quote: '{quote}'")
-                return None
+                    print(error_msg)
+                raise RuntimeError(error_msg)
 
         # All verification passed!
         cert = AnswerCertificate(
@@ -3255,7 +3334,7 @@ JSON:"""
         return cert
 
     except Exception as e:
-        # P0: Don't swallow exceptions - log full traceback in debug mode
+        # P0: Don't swallow exceptions - ALWAYS re-raise to get full traceback
         if debug:
             import traceback
             print(f"\n[LLM CERT] ✗ EXCEPTION:")
@@ -3264,9 +3343,10 @@ JSON:"""
             print(f"  Traceback:")
             traceback.print_exc()
         else:
-            # In production, log concisely
+            # In production, still log before re-raising
             print(f"[LLM CERT] Exception: {type(e).__name__}: {e}")
-        return None
+        # Re-raise the exception to force hard failure with traceback
+        raise
 
 
 def looks_generic(entity: str) -> bool:
