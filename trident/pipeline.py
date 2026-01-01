@@ -770,9 +770,24 @@ class TridentPipeline:
                     # P2: Try cheap deterministic solvers FIRST (before typed extraction)
                     # These handle temporal/comparison questions with 100% faithfulness
                     from trident.chain_builder import try_deterministic_solver
+
+                    # Convert passages to dicts for deterministic solver
+                    passages_as_dicts = []
+                    for p in passages:
+                        if hasattr(p, 'to_dict'):
+                            passages_as_dicts.append(p.to_dict())
+                        elif hasattr(p, 'pid') and hasattr(p, 'text'):
+                            passages_as_dicts.append({
+                                'pid': p.pid,
+                                'text': p.text,
+                                'title': p.metadata.get('title', '') if hasattr(p, 'metadata') and p.metadata else ''
+                            })
+                        elif isinstance(p, dict):
+                            passages_as_dicts.append(p)
+
                     deterministic_answer = try_deterministic_solver(
                         question=query,
-                        passages=all_passages,  # Use full passage pool
+                        passages=passages_as_dicts,  # Use full passage pool
                         debug=debug_chain or debug_constrained
                     )
                     if deterministic_answer:
