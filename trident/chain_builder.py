@@ -171,6 +171,12 @@ def try_deterministic_solver(
         if answer:
             return answer
 
+    # Pattern 4: "Who is the X of Y" (explicit relation extraction)
+    if "who" in q_lower and " is the " in q_lower and " of " in q_lower:
+        answer = _solve_who_is_x_of_y(question, passages, debug)
+        if answer:
+            return answer
+
     return None
 
 
@@ -268,6 +274,52 @@ def _solve_death_date(question: str, passages: List[Dict[str, Any]], debug: bool
                 if debug:
                     print(f"[DETERMINISTIC] Death year for '{person}': {year}")
                 return str(year)
+
+    return None
+
+
+def _solve_who_is_x_of_y(question: str, passages: List[Dict[str, Any]], debug: bool) -> Optional[str]:
+    """Extract answer to 'Who is the X of Y' questions."""
+    # Parse question to extract relation and subject
+    # Example: "Who is the mother of John?" → relation="mother", subject="John"
+    q_lower = question.lower()
+
+    # Extract relation type (between "is the" and "of")
+    match = re.search(r'who\s+is\s+the\s+(\w+)\s+of\s+([^?]+)', q_lower)
+    if not match:
+        return None
+
+    relation = match.group(1).strip()
+    subject = match.group(2).strip()
+
+    # Map common relations to extraction patterns
+    relation_patterns = {
+        "mother": [r"mother[^.]*?([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})", r"son of [^,]*and ([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})"],
+        "father": [r"father[^.]*?([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})", r"son of ([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})"],
+        "director": [r"directed by ([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})", r"director ([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})"],
+        "spouse": [r"married (?:to )?([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})", r"spouse ([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})"],
+        "founder": [r"founded by ([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})", r"founder ([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})"],
+    }
+
+    patterns = relation_patterns.get(relation, [])
+    if not patterns:
+        return None
+
+    # Search passages for the relation near the subject
+    for passage in passages:
+        text = passage.get("text", "")
+        if subject.lower() not in text.lower():
+            continue
+
+        # Try each pattern
+        for pattern in patterns:
+            matches = re.findall(pattern, text)
+            if matches:
+                # Return first match (most prominent)
+                answer = matches[0].strip()
+                if debug:
+                    print(f"[DETERMINISTIC] '{relation}' of '{subject}': '{answer}'")
+                return answer
 
     return None
 

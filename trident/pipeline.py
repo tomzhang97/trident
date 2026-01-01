@@ -58,6 +58,7 @@ class PipelineOutput:
     mode: str
     facets: List[Dict[str, Any]]
     trace: Dict[str, Any] = field(default_factory=dict)
+    answer_source: str = "unknown"  # CHANGE 5: Track answer source ("safe_cover", "deterministic", "llm_cert")
 
 
 @dataclass
@@ -463,6 +464,7 @@ class TridentPipeline:
             latency_ms = (time.time() - start_time) * 1000
             return PipelineOutput(
                 answer="ABSTAIN",
+                answer_source="abstain",  # CHANGE 5
                 selected_passages=[],
                 certificates=None,
                 abstained=True,
@@ -489,6 +491,7 @@ class TridentPipeline:
             latency_ms = (time.time() - start_time) * 1000
             return PipelineOutput(
                 answer="ABSTAIN",
+                answer_source="abstain",  # CHANGE 5
                 selected_passages=[],
                 certificates=None,
                 abstained=True,
@@ -616,6 +619,7 @@ class TridentPipeline:
         # CRITICAL: Build candidate set from evidence, LLM picks by index.
         # This ensures verbatim answers and enables support-based ranking.
         answer = ""
+        answer_source = "abstain"  # CHANGE 5: Track answer source
         chain = None
         is_grounded = False
         used_regex_fallback = False
@@ -747,6 +751,7 @@ class TridentPipeline:
 
                         return PipelineOutput(
                             answer="ABSTAIN",
+                            answer_source="abstain",  # CHANGE 5
                             selected_passages=result['selected_passages'],
                             certificates=result.get('certificates'),
                             abstained=True,
@@ -792,6 +797,7 @@ class TridentPipeline:
                     )
                     if deterministic_answer:
                         answer = deterministic_answer
+                        answer_source = "deterministic"  # CHANGE 5
                         is_grounded = True
                         used_constrained = True
                         prompt_type = "deterministic"
@@ -815,6 +821,7 @@ class TridentPipeline:
                             )
                             if extracted:
                                 answer = extracted
+                                answer_source = "safe_cover"  # CHANGE 5
                                 is_grounded = True
                                 used_constrained = True  # Mark as constrained (from certified passage)
                                 prompt_type = "typed_from_cert"
@@ -950,6 +957,7 @@ class TridentPipeline:
 
                             if llm_cert and llm_cert.verified:
                                 answer = llm_cert.answer
+                                answer_source = "llm_cert"  # CHANGE 5
                                 is_grounded = True
                                 prompt_type = "llm_answer_certificate"
 
@@ -1114,7 +1122,8 @@ class TridentPipeline:
             metrics=metrics,
             mode=mode,
             facets=[f.to_dict() for f in facets],
-            trace=self.telemetry.get_trace()
+            trace=self.telemetry.get_trace(),
+            answer_source=answer_source  # CHANGE 5
         )
 
     def _retrieve_passages(
