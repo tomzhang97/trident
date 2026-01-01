@@ -177,6 +177,18 @@ def try_deterministic_solver(
         if answer:
             return answer
 
+    # P1-4: Pattern 5: Family relations (grandfather, grandmother, parent)
+    if "who" in q_lower and any(rel in q_lower for rel in ["grandfather", "grandmother", "mother", "father", "parent"]):
+        answer = _solve_family_relation(question, passages, debug)
+        if answer:
+            return answer
+
+    # P1-4: Pattern 6: YES/NO same country comparison
+    if q_lower.startswith(("is ", "are ", "was ", "were ", "do ", "did ")) and "same country" in q_lower:
+        answer = _solve_yesno_same_country(question, passages, debug)
+        if answer:
+            return answer
+
     return None
 
 
@@ -320,6 +332,185 @@ def _solve_who_is_x_of_y(question: str, passages: List[Dict[str, Any]], debug: b
                 if debug:
                     print(f"[DETERMINISTIC] '{relation}' of '{subject}': '{answer}'")
                 return answer
+
+    return None
+
+
+def _solve_family_relation(question: str, passages: List[Dict[str, Any]], debug: bool) -> Optional[str]:
+    """
+    P1-4: Extract family relations (grandfather, grandmother, father, mother).
+
+    Handles patterns like:
+    - "Who is the maternal grandfather of X"
+    - "Who is the father of X"
+    - "Who is X's grandmother"
+    """
+    q_lower = question.lower()
+
+    # Extract subject (person whose relative we're looking for)
+    subject = _extract_subject_from_question(question)
+    if not subject:
+        return None
+
+    # Determine relation type
+    relation_type = None
+    if "paternal grandfather" in q_lower or "father's father" in q_lower:
+        relation_type = "paternal_grandfather"
+    elif "maternal grandfather" in q_lower or "mother's father" in q_lower:
+        relation_type = "maternal_grandfather"
+    elif "grandfather" in q_lower:
+        relation_type = "grandfather"
+    elif "grandmother" in q_lower:
+        relation_type = "grandmother"
+    elif "father" in q_lower:
+        relation_type = "father"
+    elif "mother" in q_lower:
+        relation_type = "mother"
+    elif "parent" in q_lower:
+        relation_type = "parent"
+    else:
+        return None
+
+    # Search passages for family relation mentions
+    for passage in passages:
+        text = passage.get("text", "")
+        if subject.lower() not in text.lower():
+            continue
+
+        # Try different patterns based on relation type
+        if relation_type in ["father", "paternal_grandfather"]:
+            # "son/daughter of FATHER_NAME"
+            match = re.search(r'(?:son|daughter|child) of ([A-ZÀ-Ÿ][^\n.,;()]*)', text, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                name = re.sub(r'[\s,\.\(\)]+$', '', name)
+                if _looks_like_person(name):
+                    if debug:
+                        print(f"[DETERMINISTIC] {relation_type} of '{subject}': '{name}'")
+                    return name
+
+            # "father was NAME"
+            match = re.search(r'father\s+(?:was|is)\s+([A-ZÀ-Ÿ][^\n.,;()]*)', text, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                name = re.sub(r'[\s,\.\(\)]+$', '', name)
+                if _looks_like_person(name):
+                    if debug:
+                        print(f"[DETERMINISTIC] {relation_type} of '{subject}': '{name}'")
+                    return name
+
+        if relation_type in ["mother", "maternal_grandfather"]:
+            # "mother was NAME"
+            match = re.search(r'mother\s+(?:was|is)\s+([A-ZÀ-Ÿ][^\n.,;()]*)', text, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                name = re.sub(r'[\s,\.\(\)]+$', '', name)
+                if _looks_like_person(name):
+                    if debug:
+                        print(f"[DETERMINISTIC] {relation_type} of '{subject}': '{name}'")
+                    return name
+
+            # "son/daughter of X and MOTHER_NAME"
+            match = re.search(r'(?:son|daughter|child) of [^,]+ and ([A-ZÀ-Ÿ][^\n.,;()]*)', text, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                name = re.sub(r'[\s,\.\(\)]+$', '', name)
+                if _looks_like_person(name):
+                    if debug:
+                        print(f"[DETERMINISTIC] {relation_type} of '{subject}': '{name}'")
+                    return name
+
+        if relation_type in ["grandfather", "paternal_grandfather", "maternal_grandfather"]:
+            # "grandfather was NAME"
+            match = re.search(r'grandfather\s+(?:was|is)\s+([A-ZÀ-Ÿ][^\n.,;()]*)', text, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                name = re.sub(r'[\s,\.\(\)]+$', '', name)
+                if _looks_like_person(name):
+                    if debug:
+                        print(f"[DETERMINISTIC] {relation_type} of '{subject}': '{name}'")
+                    return name
+
+        if relation_type == "grandmother":
+            # "grandmother was NAME"
+            match = re.search(r'grandmother\s+(?:was|is)\s+([A-ZÀ-Ÿ][^\n.,;()]*)', text, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                name = re.sub(r'[\s,\.\(\)]+$', '', name)
+                if _looks_like_person(name):
+                    if debug:
+                        print(f"[DETERMINISTIC] {relation_type} of '{subject}': '{name}'")
+                    return name
+
+    return None
+
+
+def _solve_yesno_same_country(question: str, passages: List[Dict[str, Any]], debug: bool) -> Optional[str]:
+    """
+    P1-4: YES/NO questions about whether two entities are from the same country.
+
+    Example: "Are X and Y from the same country?"
+    """
+    q_lower = question.lower()
+
+    # Extract two entity names from question
+    entities = _extract_person_names_from_question(question)
+    if len(entities) < 2:
+        # Try extracting from "X and Y" pattern
+        match = re.search(r'are\s+([A-ZÀ-Ÿ][^\s]+(?:\s+[A-ZÀ-Ÿ][^\s]+)*)\s+and\s+([A-ZÀ-Ÿ][^\s]+(?:\s+[A-ZÀ-Ÿ][^\s]+)*)\s+from', question, re.IGNORECASE)
+        if match:
+            entities = [match.group(1).strip(), match.group(2).strip()]
+        else:
+            return None
+
+    if len(entities) < 2:
+        return None
+
+    # Extract countries for each entity from passages
+    entity_countries = {}
+    for passage in passages:
+        text = passage.get("text", "")
+
+        for entity in entities:
+            if entity.lower() in text.lower() and entity not in entity_countries:
+                # Look for country patterns near entity name
+                # Pattern 1: "from COUNTRY"
+                match = re.search(rf'{re.escape(entity)}[^.]*?from\s+([A-Z][a-zA-Z\s]{{2,30}})', text, re.IGNORECASE)
+                if match:
+                    country = match.group(1).strip()
+                    # Clean up (remove trailing words like "where", "in", etc.)
+                    country = re.split(r'\s+(?:where|in|and|,)', country)[0].strip()
+                    entity_countries[entity] = country
+                    continue
+
+                # Pattern 2: "born in COUNTRY"
+                match = re.search(rf'{re.escape(entity)}[^.]*?born in\s+([A-Z][a-zA-Z\s]{{2,30}})', text, re.IGNORECASE)
+                if match:
+                    country = match.group(1).strip()
+                    country = re.split(r'\s+(?:where|in|and|,)', country)[0].strip()
+                    entity_countries[entity] = country
+                    continue
+
+                # Pattern 3: "COUNTRY-born" or "COUNTRY native"
+                match = re.search(r'([A-Z][a-zA-Z\s]{2,30})-born', text)
+                if match and entity.lower() in text[max(0, match.start() - 100):match.end() + 50].lower():
+                    country = match.group(1).strip()
+                    entity_countries[entity] = country
+                    continue
+
+    if debug:
+        print(f"[DETERMINISTIC] Country extraction: {entity_countries}")
+
+    # Check if we found countries for both entities
+    if len(entity_countries) >= 2:
+        countries = list(entity_countries.values())
+        same_country = countries[0].lower() == countries[1].lower()
+        answer = "yes" if same_country else "no"
+
+        if debug:
+            print(f"[DETERMINISTIC] Same country? {entities[0]} ({countries[0]}) vs {entities[1]} ({countries[1]}) = {answer}")
+
+        return answer
 
     return None
 
