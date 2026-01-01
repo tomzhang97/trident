@@ -189,6 +189,12 @@ def try_deterministic_solver(
         if answer:
             return answer
 
+    # P1-5: Pattern 7: Director born earlier/later (2-hop comparison)
+    if "director" in q_lower and ("born" in q_lower or "birth" in q_lower) and ("first" in q_lower or "earlier" in q_lower or "later" in q_lower):
+        answer = _solve_director_birth_comparison(question, passages, debug)
+        if answer:
+            return answer
+
     return None
 
 
@@ -513,6 +519,118 @@ def _solve_yesno_same_country(question: str, passages: List[Dict[str, Any]], deb
         return answer
 
     return None
+
+
+def _solve_director_birth_comparison(question: str, passages: List[Dict[str, Any]], debug: bool) -> Optional[str]:
+    """
+    P1-5: Director born earlier/later comparison (2-hop extraction).
+
+    Example: "Which film's director was born first, X or Y?"
+
+    2-hop logic:
+    1. Extract film names from question
+    2. For each film, find its director in passages
+    3. For each director, find their birth year in passages
+    4. Compare birth years and return the film whose director was born earlier/later
+    """
+    q_lower = question.lower()
+
+    # Extract film names from question
+    films = _extract_film_names_from_question(question)
+    if len(films) < 2:
+        if debug:
+            print(f"[DETERMINISTIC] Director birth comparison: need 2 films, found {len(films)}")
+        return None
+
+    # HOP 1: Extract director for each film
+    film_directors = {}
+    for passage in passages:
+        text = passage.get("text", "")
+
+        for film in films:
+            if film.lower() in text.lower() and film not in film_directors:
+                # Look for "directed by" pattern near film name
+                # Create a context window around the film mention
+                film_idx = text.lower().find(film.lower())
+                if film_idx != -1:
+                    # Get 200 chars before and after film mention
+                    context_start = max(0, film_idx - 200)
+                    context_end = min(len(text), film_idx + len(film) + 200)
+                    context = text[context_start:context_end]
+
+                    # Pattern: "directed by Name"
+                    match = re.search(r'directed\s+by\s+([\w\u00C0-\u024F]+(?:\s+[\w\u00C0-\u024F]+){0,3})', context, re.IGNORECASE)
+                    if match:
+                        director = match.group(1).strip()
+                        # Validate: first word starts with uppercase
+                        words = director.split()
+                        if words and words[0] and words[0][0].isalpha() and words[0][0].isupper():
+                            film_directors[film] = director
+                            if debug:
+                                print(f"[DETERMINISTIC] Found director for '{film}': '{director}'")
+                            continue
+
+    if len(film_directors) < 2:
+        if debug:
+            print(f"[DETERMINISTIC] Director birth comparison: found directors for {len(film_directors)}/2 films")
+        return None
+
+    # HOP 2: Extract birth year for each director
+    director_birth_years = {}
+    for passage in passages:
+        text = passage.get("text", "")
+
+        for film, director in film_directors.items():
+            if director.lower() in text.lower() and director not in director_birth_years:
+                # Look for birth year patterns near director name
+                director_idx = text.lower().find(director.lower())
+                if director_idx != -1:
+                    # Get 300 chars before and after director mention
+                    context_start = max(0, director_idx - 300)
+                    context_end = min(len(text), director_idx + len(director) + 300)
+                    context = text[context_start:context_end]
+
+                    # Pattern: "born ... YEAR" or "born in ... YEAR"
+                    match = re.search(r'born[^.]*?(\d{4})', context, re.IGNORECASE)
+                    if match:
+                        year = int(match.group(1))
+                        # Sanity check: year should be reasonable (1800-2020)
+                        if 1800 <= year <= 2020:
+                            director_birth_years[director] = year
+                            if debug:
+                                print(f"[DETERMINISTIC] Found birth year for '{director}': {year}")
+                            continue
+
+    if len(director_birth_years) < 2:
+        if debug:
+            print(f"[DETERMINISTIC] Director birth comparison: found birth years for {len(director_birth_years)}/2 directors")
+        return None
+
+    # Compare birth years and return appropriate film
+    # Determine if question asks for "first" (earlier) or "later"
+    want_earlier = "first" in q_lower or "earlier" in q_lower
+
+    # Map directors back to films
+    film_years = {film: director_birth_years[director]
+                  for film, director in film_directors.items()
+                  if director in director_birth_years}
+
+    if len(film_years) < 2:
+        return None
+
+    # Return film with earlier or later director birth year
+    if want_earlier:
+        result_film = min(film_years.items(), key=lambda x: x[1])
+    else:
+        result_film = max(film_years.items(), key=lambda x: x[1])
+
+    if debug:
+        print(f"[DETERMINISTIC] Director birth comparison:")
+        for film, year in film_years.items():
+            print(f"  {film}: director born {year}")
+        print(f"  Answer: '{result_film[0]}' (director born {result_film[1]})")
+
+    return result_film[0]
 
 
 # Helper functions for deterministic solvers
