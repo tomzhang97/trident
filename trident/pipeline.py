@@ -58,7 +58,7 @@ class PipelineOutput:
     mode: str
     facets: List[Dict[str, Any]]
     trace: Dict[str, Any] = field(default_factory=dict)
-    answer_source: str = "unknown"  # CHANGE 5: Track answer source ("safe_cover", "deterministic", "llm_cert")
+    answer_source: str = "unknown"  # CHANGE 5: Track answer source ("safe_cover", "deterministic", "llm_heuristic")
 
 
 @dataclass
@@ -939,10 +939,10 @@ class TridentPipeline:
                         debug_llm_cert = os.environ.get("TRIDENT_DEBUG_LLM_CERT", "0") == "1"
                         if llm_cert_passages and self.llm:
                             if debug_chain or debug_constrained or debug_llm_cert:
-                                print(f"\n[LLM CERT ROUTING]")
+                                print(f"\n[TIER 2: LLM HEURISTIC ROUTING]")
                                 print(f"  Total context pool: {len(all_passages)}")
                                 print(f"  Certified winners: {len(winner_passages) if winner_passages else 0}")
-                                print(f"  Selected for LLM cert: {len(llm_cert_passages)}")
+                                print(f"  Selected for heuristic: {len(llm_cert_passages)}")
                                 print(f"  Reason: {'no_answer_facets_certified' if not has_answer_facet_certified else 'typed_extraction_failed'}")
                                 if len(llm_cert_passages) < 6:
                                     print(f"  ⚠ WARNING: Only {len(llm_cert_passages)} passages (recommend 6-10)")
@@ -957,24 +957,24 @@ class TridentPipeline:
 
                             if llm_cert and llm_cert.verified:
                                 answer = llm_cert.answer
-                                answer_source = "llm_cert"  # CHANGE 5
+                                answer_source = "llm_heuristic"  # TIER 2: Plausible, not certified
                                 is_grounded = True
-                                prompt_type = "llm_answer_certificate"
+                                prompt_type = "llm_heuristic_answer"
 
                                 if debug_chain or debug_constrained or debug_llm_cert:
-                                    print(f"[LLM CERT] ✓ SUCCESS")
-                                    print(f"  Answer: '{answer}'")
+                                    print(f"[TIER 2: LLM HEURISTIC] ✓ SUCCESS")
+                                    print(f"  Answer: '{answer}' (plausible, not certified)")
                                     print(f"  Supporting PID: {llm_cert.pid[:12] if len(llm_cert.pid) > 12 else llm_cert.pid}...")
                                     print(f"  Quote: '{llm_cert.quote[:100]}...'")
                                     print(f"  Type: {llm_cert.answer_type}")
                             else:
                                 if debug_chain or debug_constrained or debug_llm_cert:
                                     reason = "llm_returned_none" if llm_cert is None else "verification_failed"
-                                    print(f"[LLM CERT] ✗ FAILED: {reason}")
+                                    print(f"[TIER 2: LLM HEURISTIC] ✗ FAILED: {reason}")
                                     if llm_cert and not llm_cert.verified:
                                         print(f"  Reason: LLM cert returned but failed verification")
                         elif debug_chain or debug_constrained or debug_llm_cert:
-                            print(f"\n[LLM CERT ROUTING] Skipped (no passages or no LLM)")
+                            print(f"\n[TIER 2: LLM HEURISTIC ROUTING] Skipped (no passages or no LLM)")
                             print(f"  Has passages: {bool(llm_cert_passages)}")
                             print(f"  Has LLM: {bool(self.llm)}")
 

@@ -411,14 +411,18 @@ def detect_question_intent(question: str) -> str:
     - "Which film came first?" returning date instead of film title
 
     Returns:
-        Intent category: "temporal", "comparison", "award", "person",
-                        "location", "yesno", "entity", "other"
+        Intent category: "temporal", "quantity", "comparison", "award", "person",
+                        "location", "yesno", "entity"
     """
     q_lower = question.lower()
 
     # Temporal questions: when, what year, what date
     if any(word in q_lower for word in ["when did", "what year", "what date"]):
         return "temporal"
+
+    # Quantity questions: how many, how much
+    if any(phrase in q_lower for phrase in ["how many", "how much"]):
+        return "quantity"
 
     # Comparison questions: which ... first, which ... earlier
     if "which" in q_lower and any(word in q_lower for word in ["first", "earlier", "later", "before", "after"]):
@@ -452,12 +456,13 @@ def get_allowed_answer_types(intent: str) -> Set[str]:
     returning wrong answer category.
     """
     INTENT_TO_TYPES = {
-        "temporal": {"date", "year", "entity"},  # Allow entity for "2020" etc.
+        "temporal": {"date", "number", "entity"},  # Date or year (as number/entity)
         "comparison": {"entity", "choice"},  # For "which X" questions
-        "award": {"entity"},  # Award names are entities (but check this matches)
+        "award": {"entity"},  # Award names are entities
         "person": {"entity"},
-        "location": {"entity", "location"},
+        "location": {"entity"},  # Locations are entities (cities, countries, etc.)
         "yesno": {"yesno"},
+        "quantity": {"number", "entity"},  # For "how many" questions
         "entity": {"entity", "date", "number"},  # Generic fallback
         "other": {"entity", "date", "number", "yesno", "choice"}  # Permissive
     }
@@ -3327,15 +3332,21 @@ def get_llm_answer_certificate(
     max_chars_per_passage: int = 600
 ) -> Optional[AnswerCertificate]:
     """
-    STEP 3: LLM Answer Certificate fallback.
+    🟨 TIER 2: LLM HEURISTIC ANSWER (not a formal certificate!).
 
     Get LLM to extract answer with provenance (quote from passage).
-    This is used when Safe-Cover has no answer facets certified.
+    This is used when Safe-Cover has no answer facets certified (Tier 1 fails).
 
-    Hard acceptance rules (non-negotiable):
-    - quote must be a substring of passage_text(pid)
-    - answer must be a substring of quote
-    - for yes/no or choice: quote must contain both entities/candidates
+    ⚠️  CRITICAL: This is a HEURISTIC, not a CERTIFIED answer:
+    - Answer is plausible, evidence-quoted, but NOT formally verified
+    - Must be labeled separately from Tier 1 (Safe-Cover/Deterministic)
+    - Used to improve EM/F1, but not counted as "certified" in research metrics
+
+    Acceptance rules:
+    - Confidence ≥ 0.85
+    - Answer type matches question intent
+    - Answer found in at least one passage (consistency check)
+    - Preferably found in ≥2 passages (higher confidence)
 
     Args:
         llm: LLM interface
@@ -3345,7 +3356,7 @@ def get_llm_answer_certificate(
         max_chars_per_passage: Truncate passages to this length
 
     Returns:
-        AnswerCertificate if verification passes, None otherwise
+        AnswerCertificate (misnomer - actually HeuristicAnswer) if verification passes, None otherwise
     """
     import json
     import os
@@ -3357,16 +3368,17 @@ def get_llm_answer_certificate(
     if debug:
         import trident.chain_builder
         print(f"\n{'='*80}")
-        print(f"[LLM CERT] USING PATCHED CODE")
+        print(f"[TIER 2: LLM HEURISTIC] USING PATCHED CODE")
         print(f"  File: {trident.chain_builder.__file__}")
         print(f"  Patch ID: 2026-01-01-P0-FINAL")
         print(f"  Backend: {llm.__class__.__name__}")
+        print(f"  NOTE: This is HEURISTIC, not certified")
         print(f"{'='*80}")
 
     # CHANGE 2: Abstain-friendly - no passages means abstain, not error
     if not passages:
         if debug:
-            print(f"[LLM CERT] No passages provided - abstaining")
+            print(f"[TIER 2: LLM HEURISTIC] No passages provided - abstaining")
         return None
 
     # Prepare passages for LLM (truncate and format)
@@ -3425,7 +3437,7 @@ JSON:"""
     try:
         # P0: Add comprehensive generation logging to debug None returns
         if debug:
-            print(f"\n[LLM CERT] Calling LLM.generate()")
+            print(f"\n[TIER 2: LLM HEURISTIC] Calling LLM.generate()")
             print(f"  Backend: {llm.__class__.__name__}")
             print(f"  Prompt length: {len(prompt)} chars")
             print(f"  Prompt (first 200): {prompt[:200]}...")
@@ -3437,7 +3449,7 @@ JSON:"""
         # P0: Check if response is None or invalid BEFORE accessing attributes
         if response is None:
             error_msg = (
-                f"[LLM CERT] HARD FAILURE: LLM.generate() returned None!\n"
+                f"[TIER 2: LLM HEURISTIC] HARD FAILURE: LLM.generate() returned None!\n"
                 f"  Backend: {llm.__class__.__name__}\n"
                 f"  Prompt length: {len(prompt)} chars\n"
                 f"  Prompt (first 200): {prompt[:200]}\n"
@@ -3451,7 +3463,7 @@ JSON:"""
         # LLMOutput has .text attribute
         if not hasattr(response, 'text'):
             error_msg = (
-                f"[LLM CERT] HARD FAILURE: Response has no 'text' attribute!\n"
+                f"[TIER 2: LLM HEURISTIC] HARD FAILURE: Response has no 'text' attribute!\n"
                 f"  Backend: {llm.__class__.__name__}\n"
                 f"  Response type: {type(response)}\n"
                 f"  Response: {response}\n"
@@ -3467,13 +3479,13 @@ JSON:"""
         # CHANGE 2: Abstain-friendly - empty response means abstain
         if not response_text:
             if debug:
-                print(f"[LLM CERT] Empty response from LLM - abstaining")
+                print(f"[TIER 2: LLM HEURISTIC] Empty response from LLM - abstaining")
             return None
 
         response_text = response_text.strip()
 
         if debug:
-            print(f"\n[LLM CERT] Raw LLM response:")
+            print(f"\n[TIER 2: LLM HEURISTIC] Raw LLM response:")
             print(f"  Length: {len(response_text)} chars")
             print(f"  First 300 chars: {response_text[:300]}")
             if len(response_text) > 300:
@@ -3483,11 +3495,11 @@ JSON:"""
         if "```json" in response_text:
             response_text = response_text.split("```json")[1].split("```")[0].strip()
             if debug:
-                print(f"[LLM CERT] Extracted from ```json block")
+                print(f"[TIER 2: LLM HEURISTIC] Extracted from ```json block")
         elif "```" in response_text:
             response_text = response_text.split("```")[1].split("```")[0].strip()
             if debug:
-                print(f"[LLM CERT] Extracted from ``` block")
+                print(f"[TIER 2: LLM HEURISTIC] Extracted from ``` block")
 
         # Try JSON parsing first
         json_parse_success = False
@@ -3503,7 +3515,7 @@ JSON:"""
             confidence = float(cert_dict.get("confidence", 0.0))  # P1: Extract confidence
 
             if debug:
-                print(f"\n[LLM CERT] JSON parsed successfully")
+                print(f"\n[TIER 2: LLM HEURISTIC] JSON parsed successfully")
                 print(f"  Answer: '{answer}'")
                 print(f"  PID: {pid}")
                 print(f"  Quote: '{quote[:100]}...'")
@@ -3514,14 +3526,14 @@ JSON:"""
             # CHANGE 2: Abstain-friendly - truncated JSON means abstain
             if "Unterminated string" in str(e):
                 if debug:
-                    print(f"[LLM CERT] JSON truncated (hit token limit) - abstaining")
+                    print(f"[TIER 2: LLM HEURISTIC] JSON truncated (hit token limit) - abstaining")
                 return None
 
             # P0 FIX: Handle "Extra data" error (trailing garbage after JSON)
             # Try to extract just the JSON object by finding matching braces
             if "Extra data" in str(e) and '{' in response_text:
                 if debug:
-                    print(f"[LLM CERT] JSON parse error (Extra data) - extracting JSON objects")
+                    print(f"[TIER 2: LLM HEURISTIC] JSON parse error (Extra data) - extracting JSON objects")
 
                 # Find ALL complete JSON objects in the response
                 json_objects = []
@@ -3586,7 +3598,7 @@ JSON:"""
                     confidence = float(cert_dict.get("confidence", 0.0))  # P1: Extract confidence
 
                     if debug:
-                        print(f"[LLM CERT] ✓ JSON extracted successfully (removed trailing garbage)")
+                        print(f"[TIER 2: LLM HEURISTIC] ✓ JSON extracted successfully (removed trailing garbage)")
                         print(f"  Answer: '{answer}'")
                         print(f"  PID: {pid}")
                         print(f"  Quote: '{quote[:100]}...'")
@@ -3595,7 +3607,7 @@ JSON:"""
             # If JSON parsing failed (including extraction), try line-by-line fallback
             if not json_parse_success:
                 if debug and "Extra data" not in str(e):
-                    print(f"[LLM CERT] JSON parse error: {e}")
+                    print(f"[TIER 2: LLM HEURISTIC] JSON parse error: {e}")
                     print(f"  Trying line-by-line fallback...")
 
                 # Parse line-by-line
@@ -3615,7 +3627,7 @@ JSON:"""
                         answer_type = line.split(":", 1)[1].strip()
 
                 if debug:
-                    print(f"[LLM CERT] Fallback parsed:")
+                    print(f"[TIER 2: LLM HEURISTIC] Fallback parsed:")
                     print(f"  Answer: '{answer}'")
                     print(f"  PID: {pid}")
                     print(f"  Quote: '{quote[:100]}...'")
@@ -3623,7 +3635,7 @@ JSON:"""
                 # CHANGE 2: Abstain-friendly - incomplete parsing means abstain
                 if not (answer and quote and pid):
                     if debug:
-                        print(f"[LLM CERT] Fallback parsing incomplete - abstaining")
+                        print(f"[TIER 2: LLM HEURISTIC] Fallback parsing incomplete - abstaining")
                         print(f"  Parsed answer: '{answer}', pid: '{pid}', quote length: {len(quote) if quote else 0}")
                     return None
 
@@ -3649,20 +3661,20 @@ JSON:"""
             # If LLM explicitly provided a reason for abstention, return None gracefully
             if abstention_reason:
                 if debug:
-                    print(f"[LLM CERT] LLM abstained (reason: '{abstention_reason}')")
+                    print(f"[TIER 2: LLM HEURISTIC] LLM abstained (reason: '{abstention_reason}')")
                     print(f"  This is expected for unanswerable questions")
                 return None
 
             # CHANGE 2: Abstain-friendly - incomplete response means abstain
             if debug:
-                print(f"[LLM CERT] Empty fields in response - abstaining")
+                print(f"[TIER 2: LLM HEURISTIC] Empty fields in response - abstaining")
                 print(f"  answer={bool(answer)}, quote={bool(quote)}, pid={bool(pid)}")
             return None
 
         # CHANGE 2: Abstain-friendly - invalid PID means abstain (hallucination)
         if pid not in pid_to_passage:
             if debug:
-                print(f"[LLM CERT] Invalid PID '{pid}' - abstaining (LLM hallucinated)")
+                print(f"[TIER 2: LLM HEURISTIC] Invalid PID '{pid}' - abstaining (LLM hallucinated)")
                 print(f"  Available PIDs: {list(pid_to_passage.keys())[:5]}...")
             return None
 
@@ -3671,7 +3683,7 @@ JSON:"""
         # CHANGE 2: Abstain-friendly - no passage text means abstain
         if not passage_text:
             if debug:
-                print(f"[LLM CERT] Passage has no text - abstaining")
+                print(f"[TIER 2: LLM HEURISTIC] Passage has no text - abstaining")
                 print(f"  PID: {pid}")
             return None
 
@@ -3688,7 +3700,7 @@ JSON:"""
         # P1: Gate on confidence threshold (must be >= 0.85)
         if confidence < 0.85:
             if debug:
-                print(f"[LLM CERT] Confidence too low: {confidence:.2f} < 0.85")
+                print(f"[TIER 2: LLM HEURISTIC] Confidence too low: {confidence:.2f} < 0.85")
                 print(f"  Rejecting certificate (low confidence)")
             return None
 
@@ -3697,7 +3709,7 @@ JSON:"""
         allowed_types = get_allowed_answer_types(intent)
         if answer_type not in allowed_types:
             if debug:
-                print(f"[LLM CERT] Answer type mismatch")
+                print(f"[TIER 2: LLM HEURISTIC] Answer type mismatch")
                 print(f"  Question intent: '{intent}'")
                 print(f"  Answer type: '{answer_type}'")
                 print(f"  Allowed types: {allowed_types}")
@@ -3717,7 +3729,7 @@ JSON:"""
 
         if answer_in_passage:
             if debug:
-                print(f"[LLM CERT] ✓ Answer found in passage (relaxed verification)")
+                print(f"[TIER 2: LLM HEURISTIC] ✓ Answer found in passage (relaxed verification)")
                 print(f"  Answer: '{answer}'")
                 print(f"  Confidence: {confidence:.2f}")
             # ACCEPT - answer is in passage and confidence is high
@@ -3732,13 +3744,13 @@ JSON:"""
 
                 if overlap >= 0.80:
                     if debug:
-                        print(f"[LLM CERT] ✓ Quote has {overlap:.1%} token overlap (≥80% threshold)")
+                        print(f"[TIER 2: LLM HEURISTIC] ✓ Quote has {overlap:.1%} token overlap (≥80% threshold)")
                         print(f"  Accepting paraphrased quote")
                     # ACCEPT - quote is paraphrase of passage content
                 else:
                     # FAIL - answer not in passage and quote doesn't match
                     if debug:
-                        print(f"[LLM CERT] ✗ FAILED: Answer not in passage and quote overlap {overlap:.1%} < 80%")
+                        print(f"[TIER 2: LLM HEURISTIC] ✗ FAILED: Answer not in passage and quote overlap {overlap:.1%} < 80%")
                         print(f"  Answer (normalized): '{answer_norm}'")
                         print(f"  Passage (first 200): '{passage_text[:200]}'")
                         print(f"  Quote tokens: {len(quote_tokens)}, Passage tokens: {len(passage_tokens)}")
@@ -3747,7 +3759,7 @@ JSON:"""
             else:
                 # Empty tokens - fail
                 if debug:
-                    print(f"[LLM CERT] ✗ FAILED: Empty quote or passage tokens")
+                    print(f"[TIER 2: LLM HEURISTIC] ✗ FAILED: Empty quote or passage tokens")
                 return None
 
         # P1: RELAXED RULE 3 - For yes/no, warn if quote is very short but don't fail
@@ -3756,47 +3768,76 @@ JSON:"""
         is_yesno = q_lower.startswith(("is ", "are ", "was ", "were ", "do ", "does ", "did "))
         if is_yesno and answer_type == "yesno" and len(quote_norm) < 20:
             if debug:
-                print(f"[LLM CERT] ⚠ Warning: Yes/no quote is short ({len(quote_norm)} chars)")
+                print(f"[TIER 2: LLM HEURISTIC] ⚠ Warning: Yes/no quote is short ({len(quote_norm)} chars)")
                 print(f"  Quote: '{quote}'")
                 print(f"  Accepting due to confidence {confidence:.2f} >= 0.85")
 
-        # CHANGE 3: Calibrate LLM confidence internally
-        # Don't trust self-reported confidence blindly - check consistency
+        # CHANGE 3: STRENGTHENED self-consistency checks
+        # Don't trust self-reported confidence blindly - verify answer appears in multiple passages
         passages_with_answer = 0
         answer_occurrences = 0
+        passages_with_answer_list = []
         for p in passages:
             p_text = p.get("text", "")
+            p_id = p.get("pid", "")
             if not p_text:
                 continue
             p_norm = normalize_for_match(p_text).lower()
             if answer_norm.lower() in p_norm:
                 passages_with_answer += 1
+                passages_with_answer_list.append(p_id)
                 # Count how many times answer appears in this passage
                 answer_occurrences += p_norm.count(answer_norm.lower())
 
+        # STRENGTHENED: Check if answer appears in passages OTHER than the supporting passage
+        other_passages_with_answer = [p_id for p_id in passages_with_answer_list if p_id != pid]
+
         # Calibrate confidence based on consistency
         calibrated_confidence = confidence
-        if passages_with_answer >= 2:
-            # Answer found in multiple passages - boost confidence
+        if passages_with_answer >= 3:
+            # Answer found in many passages - strong boost
+            calibrated_confidence = min(1.0, confidence + 0.08)
+            if debug:
+                print(f"[TIER 2: LLM HEURISTIC] Strong confidence boost: answer in {passages_with_answer} passages")
+        elif passages_with_answer >= 2:
+            # Answer found in multiple passages - modest boost
             calibrated_confidence = min(1.0, confidence + 0.05)
             if debug:
-                print(f"[LLM CERT] Confidence boost: answer in {passages_with_answer} passages")
+                print(f"[TIER 2: LLM HEURISTIC] Confidence boost: answer in {passages_with_answer} passages")
+        elif passages_with_answer == 1 and not other_passages_with_answer:
+            # STRENGTHENED: Answer ONLY in supporting passage, not corroborated elsewhere
+            # This is suspicious - lower confidence
+            calibrated_confidence = max(0.0, confidence - 0.10)
+            if debug:
+                print(f"[TIER 2: LLM HEURISTIC] ⚠ Confidence penalty: answer only in supporting passage")
+                print(f"  No corroboration from other passages")
+            # If calibrated confidence drops below threshold, reject
+            if calibrated_confidence < 0.75:
+                if debug:
+                    print(f"[TIER 2: LLM HEURISTIC] ✗ FAILED: Calibrated confidence {calibrated_confidence:.2f} < 0.75")
+                    print(f"  Answer lacks cross-passage validation")
+                return None
         elif passages_with_answer == 0:
             # Answer not found in ANY passage - major red flag
             if debug:
-                print(f"[LLM CERT] ✗ FAILED: Answer not found in any passage (confidence check)")
+                print(f"[TIER 2: LLM HEURISTIC] ✗ FAILED: Answer not found in any passage (confidence check)")
                 print(f"  Answer: '{answer}'")
                 print(f"  This is likely hallucination")
             return None
 
-        if answer_occurrences >= 3:
+        if answer_occurrences >= 5:
+            # Answer appears many times across passages - strong signal
+            calibrated_confidence = min(1.0, calibrated_confidence + 0.05)
+            if debug:
+                print(f"[TIER 2: LLM HEURISTIC] Confidence boost: answer appears {answer_occurrences} times")
+        elif answer_occurrences >= 3:
             # Answer appears multiple times across passages
             calibrated_confidence = min(1.0, calibrated_confidence + 0.03)
             if debug:
-                print(f"[LLM CERT] Confidence boost: answer appears {answer_occurrences} times")
+                print(f"[TIER 2: LLM HEURISTIC] Confidence boost: answer appears {answer_occurrences} times")
 
         if debug and calibrated_confidence != confidence:
-            print(f"[LLM CERT] Confidence calibrated: {confidence:.2f} → {calibrated_confidence:.2f}")
+            print(f"[TIER 2: LLM HEURISTIC] Confidence calibrated: {confidence:.2f} → {calibrated_confidence:.2f}")
 
         # All verification passed!
         cert = AnswerCertificate(
@@ -3809,7 +3850,7 @@ JSON:"""
         )
 
         if debug:
-            print(f"[LLM CERT] ✓ VERIFIED Answer Certificate")
+            print(f"[TIER 2: LLM HEURISTIC] ✓ VERIFIED Answer Certificate")
             print(f"  Answer: '{answer}'")
             print(f"  PID: {pid[:12]}...")
             print(f"  Quote length: {len(quote)} chars")
@@ -3820,14 +3861,14 @@ JSON:"""
         # P0: Don't swallow exceptions - ALWAYS re-raise to get full traceback
         if debug:
             import traceback
-            print(f"\n[LLM CERT] ✗ EXCEPTION:")
+            print(f"\n[TIER 2: LLM HEURISTIC] ✗ EXCEPTION:")
             print(f"  Type: {type(e).__name__}")
             print(f"  Message: {e}")
             print(f"  Traceback:")
             traceback.print_exc()
         else:
             # In production, still log before re-raising
-            print(f"[LLM CERT] Exception: {type(e).__name__}: {e}")
+            print(f"[TIER 2: LLM HEURISTIC] Exception: {type(e).__name__}: {e}")
         # Re-raise the exception to force hard failure with traceback
         raise
 
