@@ -3085,10 +3085,10 @@ JSON:"""
             print(f"  Backend: {llm.__class__.__name__}")
             print(f"  Prompt length: {len(prompt)} chars")
             print(f"  Prompt (first 200): {prompt[:200]}...")
-            print(f"  Parameters: max_new_tokens=128, temperature=0.0")
+            print(f"  Parameters: max_new_tokens=512, temperature=0.0")
 
-        # Call LLM (P0: Fixed parameters, no sampling)
-        response = llm.generate(prompt, max_new_tokens=128, temperature=0.0)
+        # Call LLM (P0: Fixed parameters, increased tokens to avoid truncation)
+        response = llm.generate(prompt, max_new_tokens=512, temperature=0.0)
 
         # P0: Check if response is None or invalid BEFORE accessing attributes
         if response is None:
@@ -3172,6 +3172,20 @@ JSON:"""
                 print(f"  Type: {answer_type}")
 
         except json.JSONDecodeError as e:
+            # P0 FIX: Handle "Unterminated string" error (LLM hit token limit)
+            if "Unterminated string" in str(e):
+                error_msg = (
+                    f"[LLM CERT] HARD FAILURE: JSON truncated (unterminated string)\n"
+                    f"  Backend: {llm.__class__.__name__}\n"
+                    f"  Error: {e}\n"
+                    f"  Response text: {response_text}\n"
+                    f"  Root cause: LLM hit max_new_tokens limit mid-quote\n"
+                    f"  Solution: Increase max_new_tokens (currently 512)"
+                )
+                if debug:
+                    print(error_msg)
+                raise RuntimeError(error_msg)
+
             # P0 FIX: Handle "Extra data" error (trailing garbage after JSON)
             # Try to extract just the JSON object by finding matching braces
             if "Extra data" in str(e) and '{' in response_text:
@@ -3257,8 +3271,33 @@ JSON:"""
                         print(error_msg)
                     raise RuntimeError(error_msg)
 
-        # Empty answer means LLM abstained
+        # Check for empty answer - could be abstention or error
         if not answer or not quote or not pid:
+            # Check if this is a valid abstention (has "reason" field)
+            # Parse cert_dict if we haven't already (might only have answer/pid/quote vars)
+            abstention_reason = None
+            try:
+                # Try to get reason from already-parsed dict if available
+                if json_parse_success and 'cert_dict' in locals():
+                    abstention_reason = cert_dict.get("reason", "").strip()
+                elif not json_parse_success:
+                    # Try parsing response_text one more time to check for reason field
+                    try:
+                        temp_dict = json.loads(response_text)
+                        abstention_reason = temp_dict.get("reason", "").strip()
+                    except:
+                        pass
+            except:
+                pass
+
+            # If LLM explicitly provided a reason for abstention, return None gracefully
+            if abstention_reason:
+                if debug:
+                    print(f"[LLM CERT] LLM abstained (reason: '{abstention_reason}')")
+                    print(f"  This is expected for unanswerable questions")
+                return None
+
+            # Otherwise, this is an incomplete response - raise error
             error_msg = (
                 f"[LLM CERT] HARD FAILURE: Empty fields in parsed response\n"
                 f"  Backend: {llm.__class__.__name__}\n"
@@ -3266,7 +3305,7 @@ JSON:"""
                 f"  quote={bool(quote)} ('{quote}')\n"
                 f"  pid={bool(pid)} ('{pid}')\n"
                 f"  Response text: {response_text}\n"
-                f"  LLM returned incomplete certificate"
+                f"  LLM returned incomplete certificate (no reason for abstention)"
             )
             if debug:
                 print(error_msg)
