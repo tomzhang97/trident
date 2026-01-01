@@ -2512,7 +2512,7 @@ def extract_object_from_certified_passage(
                 return name
 
         if debug:
-            print(f"[CERTIFIED-EXTRACT] DIRECTOR: No pattern matched (passage has 'directed'/'director' but extraction failed)"
+            print(f"[CERTIFIED-EXTRACT] DIRECTOR: No pattern matched (passage has 'directed'/'director' but extraction failed)")
 
     # MOTHER: "mother of X" or "X is the son/daughter of"
     elif relation_kind in ["MOTHER", "PARENT"]:
