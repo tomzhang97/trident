@@ -854,7 +854,12 @@ class FacetMiner:
         seen: Set[str] = set()
         unique: List[Facet] = []
         for f in facets:
-            sig = f"{f.facet_type.value}:{_clean_text(f.to_hypothesis()).lower()}"
+            # P0-4: Drop facets with empty hypothesis text at mining time
+            hypothesis = f.to_hypothesis()
+            if not hypothesis or not hypothesis.strip():
+                continue  # Skip facets with empty text
+
+            sig = f"{f.facet_type.value}:{_clean_text(hypothesis).lower()}"
             if sig in seen: continue
             seen.add(sig)
             unique.append(f)
