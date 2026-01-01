@@ -2421,6 +2421,8 @@ class ConstrainedSelectionResult:
     reason: str  # OK, NO_PASSAGES, NO_VERIFIED_SPAN, etc.
     tokens_used: int = 0
     prompt_tokens: int = 0
+    answer_in_winners: bool = False  # P0-1: Track if answer came from certified winner
+    answer_support_strength: float = 0.0  # P0-1: How many required facets the passage certified
     completion_tokens: int = 0
 
 
@@ -2904,10 +2906,25 @@ def constrained_span_select(
     max_candidates: int = 10,
     max_chars_per_passage: int = 600,
     certificates: Optional[List[Dict[str, Any]]] = None,
+    full_context_pool: Optional[List[Dict[str, Any]]] = None,  # P0-1: Add full context pool
 ) -> ConstrainedSelectionResult:
     """
-    Primary: Frozen span extraction (pid + offsets + verbatim check) from winner_passages.
-    Secondary: candidate-index selection (legacy) but still certified-only if certificates provided.
+    Primary: Frozen span extraction (pid + offsets + verbatim check) from passages.
+
+    P0-1 FIX: No longer hard-rejects answers from non-winner passages.
+    Instead, uses full_context_pool if provided, with winners as highlights.
+
+    Args:
+        llm: LLM interface
+        question: Question to answer
+        winner_passages: Certified winner passages (highlighted, but not exclusive)
+        max_candidates: Max candidates to extract
+        max_chars_per_passage: Max chars per passage
+        certificates: Optional certificate list
+        full_context_pool: P0-1: Full retrieved context (all passages). If None, falls back to winner_passages.
+
+    Returns:
+        ConstrainedSelectionResult with answer and metadata
 
     Fail-closed: returns empty answer if nothing can be machine-verified.
     """
@@ -2917,7 +2934,11 @@ def constrained_span_select(
 
     debug = os.environ.get("TRIDENT_DEBUG_CONSTRAINED", "0") == "1"
 
-    if not winner_passages:
+    # P0-1: Build answer pool from full context if available, otherwise use winners
+    # Winners are highlighted but not exclusive
+    answer_pool = full_context_pool if full_context_pool else winner_passages
+
+    if not answer_pool:
         return ConstrainedSelectionResult(
             answer="",
             candidate_index=-1,
@@ -2928,32 +2949,30 @@ def constrained_span_select(
             reason="NO_PASSAGES"
         )
 
-    if certificates:
-        certified_pids = _cert_pid(certificates)
-        winner_passages = [p for p in winner_passages if p.get("pid") in certified_pids]
-        if not winner_passages:
-            return ConstrainedSelectionResult(
-                answer="",
-                candidate_index=-1,
-                confidence=0.0,
-                passage_id="",
-                candidates=[],
-                support_scores=[],
-                reason="NO_CERTIFIED_PASSAGES"
-            )
+    # P0-1: Track which PIDs are winners for metadata (don't filter!)
+    winner_pids = {p.get("pid") for p in winner_passages} if winner_passages else set()
+
+    if debug:
+        print(f"[CONSTRAINED] Answer pool: {len(answer_pool)} passages")
+        print(f"[CONSTRAINED] Winners: {len(winner_pids)} passages")
+        print(f"[CONSTRAINED] Winner PIDs: {winner_pids}")
 
     # -----------------------------
     # Frozen span extraction prompt
     # -----------------------------
     snippet_map: Dict[str, str] = {}
     evidence_parts = []
-    for p in winner_passages:
+    # P0-1: Use answer_pool (full context) instead of only winner_passages
+    for p in answer_pool:
         pid = p.get("pid")
         if not pid:
             continue
         snip = (p.get("text") or "")[:max_chars_per_passage]
         snippet_map[pid] = snip
-        evidence_parts.append(f"[{pid}] {snip}")
+        # P0-1: Highlight winners in the prompt (but don't restrict to them)
+        is_winner = pid in winner_pids
+        prefix = f"[{pid}]{'*' if is_winner else ''}"  # Mark winners with *
+        evidence_parts.append(f"{prefix} {snip}")
 
     evidence_text = "\n\n".join(evidence_parts)
 
@@ -3031,8 +3050,11 @@ JSON:"""
                     ok = _norm_ws(span).lower() in {"yes", "no"}
 
                 if ok:
+                    # P0-1: Track whether answer came from winner
+                    answer_in_winners = pid in winner_pids
                     if debug:
                         print(f"[FROZEN-SPAN] pid={pid} span='{span}' [{start_char}:{end_char}] conf={conf:.2f}")
+                        print(f"[FROZEN-SPAN] Answer from winner: {answer_in_winners}")
                     return ConstrainedSelectionResult(
                         answer=span,
                         candidate_index=0,
@@ -3040,7 +3062,9 @@ JSON:"""
                         passage_id=pid,
                         candidates=[span],
                         support_scores=[1.0],
-                        reason="OK_FROZEN_SPAN"
+                        reason="OK_FROZEN_SPAN",
+                        answer_in_winners=answer_in_winners,  # P0-1
+                        answer_support_strength=1.0 if answer_in_winners else 0.0  # P0-1
                     )
     except Exception as ex:
         if debug:

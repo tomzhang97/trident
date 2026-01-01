@@ -837,13 +837,29 @@ class TridentPipeline:
                         if not answer and answer_passages:
                             if debug_chain or debug_constrained:
                                 print(f"[EXTRACT] Typed extraction failed, trying legacy constrained selection...")
+                                print(f"[EXTRACT] P0-1: Providing full context pool ({len(passages)} passages) to CSS")
+
+                            # P0-1: Convert full passages to dicts for CSS
+                            passages_as_dicts = []
+                            for p in passages:
+                                if isinstance(p, dict):
+                                    passages_as_dicts.append(p)
+                                elif hasattr(p, 'to_dict'):
+                                    passages_as_dicts.append(p.to_dict())
+                                elif hasattr(p, 'pid') and hasattr(p, 'text'):
+                                    passages_as_dicts.append({
+                                        'pid': p.pid,
+                                        'text': p.text,
+                                        'title': p.metadata.get('title', '') if hasattr(p, 'metadata') and p.metadata else ''
+                                    })
 
                             constrained_result = constrained_span_select(
                                 llm=self.llm,
                                 question=query,
                                 winner_passages=answer_passages,
                                 max_candidates=10,
-                                max_chars_per_passage=600
+                                max_chars_per_passage=600,
+                                full_context_pool=passages_as_dicts  # P0-1: Provide full context pool
                             )
 
                             if constrained_result.reason == "OK":
