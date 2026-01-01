@@ -825,9 +825,24 @@ class FacetMiner:
     def _extract_causal_facets(self, query: str) -> List[Facet]:
         facets: List[Facet] = []
         q = query.lower()
-        causal_patterns = [r"\bwhy\b", r"\bwhat\s+(?:was|is|are)\s+the\s+caus(?:e|es)\b", r"\bwhat\s+led\s+to\b", r"\bwhat\s+resulted\s+in\b", r"\breason\s+for\b"]
-        if any(re.search(p, q) for p in causal_patterns):
-            facets.append(Facet(facet_id="causal_0", facet_type=FacetType.CAUSAL, template={"trigger": "causal"}))
+
+        # P2-6 FIX: Only generate CAUSAL facets for explicit causal questions
+        # Strict patterns: must start with "why" or explicitly mention cause/reason
+        explicit_causal_patterns = [
+            r"^\s*why\b",  # Starts with "why"
+            r"\bbecause\b",  # Mentions "because"
+            r"\bcaused\s+by\b",  # Mentions "caused by"
+            r"\bwhat\s+(?:was|is|are)\s+the\s+caus(?:e|es)\b",  # "what was the cause"
+            r"\bwhat\s+led\s+to\b",  # "what led to"
+            r"\bwhat\s+resulted\s+in\b",  # "what resulted in"
+            r"\breason\s+for\b",  # "reason for"
+        ]
+
+        # P2-6: Only create CAUSAL facet if explicitly causal
+        if any(re.search(p, q) for p in explicit_causal_patterns):
+            # Create as non-required by default (required=False is default)
+            facets.append(Facet(facet_id="causal_0", facet_type=FacetType.CAUSAL, template={"trigger": "causal"}, required=False))
+
         return facets
 
     def _extract_temporal_event(self, query: str, time_span: Tuple[int, int]) -> str:
