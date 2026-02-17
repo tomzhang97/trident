@@ -14,7 +14,7 @@ Runs experiments in the recommended order for maximum rebuttal impact:
 The "score moving" minimal subset is: E1 + E2 + E1.5 + E1.6.
 
 Usage:
-    # Run everything:
+    # Run everything on 4 GPUs:
     python -m experiments.rebuttal.run_all \
         --hotpot_path data/hotpotqa_dev.json \
         --musique_path data/musique_dev.jsonl \
@@ -22,20 +22,20 @@ Usage:
         --calibration_dir data/calibration \
         --output_root runs/rebuttal \
         --model meta-llama/Meta-Llama-3-8B-Instruct \
-        --device 0
+        --num_gpus 4 --gpu_ids 0,1,2,3
 
-    # Run minimal "score moving" subset:
+    # Run minimal "score moving" subset (single GPU):
     python -m experiments.rebuttal.run_all \
         --hotpot_path data/hotpotqa_dev.json \
         --output_root runs/rebuttal \
         --model meta-llama/Meta-Llama-3-8B-Instruct \
         --device 0 --minimal
 
-    # Run only specific tiers:
+    # Run only specific tiers on 2 GPUs:
     python -m experiments.rebuttal.run_all \
         --hotpot_path data/hotpotqa_dev.json \
         --output_root runs/rebuttal \
-        --tiers 0 1
+        --num_gpus 2 --tiers 0 1
 """
 
 from __future__ import annotations
@@ -208,6 +208,12 @@ def build_cmd(
         ]
         if args.load_in_8bit:
             cmd.append("--load_in_8bit")
+
+    # Append multi-GPU flags for GPU-using experiments
+    if exp_id not in ("e0_1", "e0_2") and args.num_gpus > 1:
+        cmd += ["--num_gpus", str(args.num_gpus)]
+        if args.gpu_ids:
+            cmd += ["--gpu_ids", args.gpu_ids]
 
     return cmd
 
@@ -538,10 +544,14 @@ def main():
     # Output
     parser.add_argument("--output_root", type=str, default="runs/rebuttal")
 
-    # Model
+    # Model / GPU
     parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
     parser.add_argument("--backbones", nargs="+", default=[])
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--num_gpus", type=int, default=1,
+                        help="Number of GPUs to distribute arms across within each experiment")
+    parser.add_argument("--gpu_ids", type=str, default="",
+                        help="Comma-separated GPU ids (e.g. '0,1,2,3')")
     parser.add_argument("--load_in_8bit", action="store_true")
     parser.add_argument("--budget", type=int, default=500)
 
