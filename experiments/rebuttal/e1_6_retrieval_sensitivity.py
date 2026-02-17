@@ -71,7 +71,7 @@ def run_retrieval_arm(
         LLMConfig, RetrievalConfig, EvaluationConfig,
         NLIConfig, CalibrationConfig, TelemetryConfig,
     )
-    from trident.pipeline import TridentPipeline
+    from experiments.rebuttal._pipeline_helpers import create_pipeline
 
     device = f"cuda:{args.device}" if args.device >= 0 else "cpu"
     encoder = args.encoder_model if retriever_type == "dense" else "facebook/contriever"
@@ -93,7 +93,7 @@ def run_retrieval_arm(
         evaluation=EvaluationConfig(dataset=args.dataset),
         telemetry=TelemetryConfig(enable=True),
     )
-    pipeline = TridentPipeline(config)
+    pipeline = create_pipeline(config, device=device)
 
     trident_results = []
     topk_results = []

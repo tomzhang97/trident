@@ -109,7 +109,7 @@ def run_backbone_condition(
         LLMConfig, RetrievalConfig, EvaluationConfig,
         NLIConfig, CalibrationConfig, TelemetryConfig,
     )
-    from trident.pipeline import TridentPipeline
+    from experiments.rebuttal._pipeline_helpers import create_pipeline
 
     device = f"cuda:{args.device}" if args.device >= 0 else "cpu"
 
@@ -131,7 +131,7 @@ def run_backbone_condition(
         evaluation=EvaluationConfig(dataset=args.dataset),
         telemetry=TelemetryConfig(enable=True),
     )
-    pipeline = TridentPipeline(config)
+    pipeline = create_pipeline(config, device=device)
 
     # Load specific calibrator if path provided
     if calibration_path and Path(calibration_path).exists():

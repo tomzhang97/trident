@@ -159,7 +159,7 @@ def run_condition(
         LLMConfig, RetrievalConfig, EvaluationConfig,
         NLIConfig, CalibrationConfig, TelemetryConfig,
     )
-    from trident.pipeline import TridentPipeline
+    from experiments.rebuttal._pipeline_helpers import create_pipeline
     from trident.facets import FacetType
 
     device = f"cuda:{args.device}" if args.device >= 0 else "cpu"
@@ -179,7 +179,7 @@ def run_condition(
         evaluation=EvaluationConfig(dataset=args.dataset),
         telemetry=TelemetryConfig(enable=True),
     )
-    pipeline = TridentPipeline(config)
+    pipeline = create_pipeline(config, device=device)
 
     # Monkey-patch facet miner to apply perturbation
     original_extract = pipeline.facet_miner.extract_facets

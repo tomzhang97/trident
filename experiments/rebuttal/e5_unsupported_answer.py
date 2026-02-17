@@ -102,7 +102,7 @@ def run_method(args, data, method: str) -> Dict[str, Any]:
         LLMConfig, RetrievalConfig, EvaluationConfig,
         NLIConfig, CalibrationConfig, TelemetryConfig,
     )
-    from trident.pipeline import TridentPipeline
+    from experiments.rebuttal._pipeline_helpers import create_pipeline
 
     device = f"cuda:{args.device}" if args.device >= 0 else "cpu"
 
@@ -119,7 +119,7 @@ def run_method(args, data, method: str) -> Dict[str, Any]:
         evaluation=EvaluationConfig(dataset=args.dataset),
         telemetry=TelemetryConfig(enable=True),
     )
-    pipeline = TridentPipeline(config)
+    pipeline = create_pipeline(config, device=device)
 
     per_query = []
     for i, ex in enumerate(data):

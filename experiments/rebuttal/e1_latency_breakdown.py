@@ -170,10 +170,11 @@ def run_with_instrumentation(
 
 def run_experiment(args, mode: str, data: List[Dict]) -> Dict[str, Any]:
     """Run the full experiment for one mode."""
-    from trident.pipeline import TridentPipeline
+    from experiments.rebuttal._pipeline_helpers import create_pipeline
 
     config = build_config(args, mode)
-    pipeline = TridentPipeline(config)
+    device = f"cuda:{args.device}" if args.device >= 0 else "cpu"
+    pipeline = create_pipeline(config, device=device)
 
     per_query = []
     predictions = []
