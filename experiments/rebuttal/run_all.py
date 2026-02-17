@@ -118,7 +118,7 @@ def build_cmd(
         cmd += [
             "--data_path", args.hotpot_path,
             "--dataset", "hotpotqa",
-            "--budget", str(args.budget),
+            "--config_family", args.config_family,
             "--limit", "200",
             "--model", args.model,
             "--device", str(device),
@@ -133,7 +133,7 @@ def build_cmd(
         cmd += [
             "--data_path", args.hotpot_path,
             "--dataset", "hotpotqa",
-            "--budget", str(args.budget),
+            "--config_family", args.config_family,
             "--limit", limit,
             "--model", args.model,
             "--device", str(device),
@@ -149,7 +149,7 @@ def build_cmd(
         cmd += [
             "--data_path", args.hotpot_path,
             "--dataset", "hotpotqa",
-            "--budgets", str(args.budget),
+            "--config_family", args.config_family,
             "--limit", limit,
             "--model", args.model,
             "--device", str(device),
@@ -164,7 +164,7 @@ def build_cmd(
         cmd += [
             "--data_path", args.hotpot_path,
             "--dataset", "hotpotqa",
-            "--budget", str(args.budget),
+            "--config_family", args.config_family,
             "--limit", "200",
             "--model", args.model,
             "--device", str(device),
@@ -185,7 +185,7 @@ def build_cmd(
         cmd += [
             "--data_path", args.hotpot_path,
             "--dataset", "hotpotqa",
-            "--budget", str(args.budget),
+            "--config_family", args.config_family,
             "--limit", limit,
             "--model", args.model,
             "--device", str(device),
@@ -203,7 +203,7 @@ def build_cmd(
         cmd += [
             "--data_path", data_path,
             "--dataset", dataset,
-            "--budget", str(args.budget),
+            "--config_family", args.config_family,
             "--limit", "200",
             "--model", args.model,
             "--device", str(device),
@@ -219,7 +219,7 @@ def build_cmd(
         cmd += [
             "--data_path", args.hotpot_path,
             "--dataset", "hotpotqa",
-            "--budget", str(args.budget),
+            "--config_family", args.config_family,
             "--limit", limit,
             "--model", args.model,
             "--device", str(device),
@@ -657,7 +657,8 @@ def main():
     parser.add_argument("--load_in_8bit", action="store_true")
     parser.add_argument("--calibration_path", type=str, default="",
                         help="Path to calibration JSON for p-value computation")
-    parser.add_argument("--budget", type=int, default=500)
+    parser.add_argument("--config_family", type=str, required=True,
+                        help="Config family name (e.g. pareto_match_500_alpha06)")
 
     # Calibration for E1.5
     parser.add_argument("--shared_calibration_path", type=str, default="")

@@ -23,7 +23,7 @@ Usage:
         --data_path data/hotpotqa_dev.json \
         --dataset hotpotqa \
         --output_dir runs/rebuttal/e5 \
-        --budget 500 --limit 500 \
+        --config_family pareto_match_500_alpha06 --limit 500 \
         --model meta-llama/Meta-Llama-3-8B-Instruct \
         --device 0
 """
@@ -97,28 +97,11 @@ def is_answer_supported(
 
 def run_method(args, data, method: str) -> Dict[str, Any]:
     """Run TRIDENT-Pareto or top-k and collect support metrics."""
-    from trident.config import (
-        TridentConfig, ParetoConfig, SafeCoverConfig,
-        LLMConfig, RetrievalConfig, EvaluationConfig,
-        NLIConfig, CalibrationConfig, TelemetryConfig,
-    )
-    from experiments.rebuttal._pipeline_helpers import create_pipeline
+    from experiments.rebuttal._pipeline_helpers import build_config, create_pipeline
 
     device = f"cuda:{args.device}" if args.device >= 0 else "cpu"
 
-    config = TridentConfig(
-        mode="pareto",
-        pareto=ParetoConfig(
-            budget=args.budget, max_evidence_tokens=args.budget,
-            max_units=8, stop_on_budget=True, use_vqc=False, use_bwk=False,
-        ),
-        llm=LLMConfig(model_name=args.model, device=device, load_in_8bit=args.load_in_8bit),
-        retrieval=RetrievalConfig(method="dense", encoder_model=args.encoder_model, top_k=100),
-        nli=NLIConfig(batch_size=32),
-        calibration=CalibrationConfig(use_mondrian=True),
-        evaluation=EvaluationConfig(dataset=args.dataset),
-        telemetry=TelemetryConfig(enable=True),
-    )
+    config = build_config(args)
     pipeline = create_pipeline(config, device=device,
                                calibration_path=getattr(args, 'calibration_path', None))
 
@@ -155,7 +138,7 @@ def run_method(args, data, method: str) -> Dict[str, Any]:
                 total_tokens = 0
                 for p in passages:
                     cost = getattr(p, "num_tokens", len(getattr(p, "text", "").split()))
-                    if total_tokens + cost > args.budget:
+                    if total_tokens + cost > config.pareto.budget:
                         break
                     selected.append(p)
                     total_tokens += cost
@@ -281,11 +264,11 @@ def aggregate_and_save(args, all_results: Dict[str, Any]) -> str:
     meta = ExperimentMetadata(
         experiment_id=f"e5_unsupported_{args.dataset}",
         dataset=args.dataset,
-        budget=args.budget,
         mode="pareto",
         backbone=args.model,
         seed=args.seed,
         limit=args.limit,
+        extra={"config_family": args.config_family},
     )
     report = ExperimentReport(
         metadata=meta,
@@ -304,7 +287,8 @@ def main():
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--dataset", type=str, default="hotpotqa")
     parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e5")
-    parser.add_argument("--budget", type=int, default=500)
+    parser.add_argument("--config_family", type=str, required=True,
+                        help="Config family name (e.g. pareto_match_500_alpha06)")
     parser.add_argument("--limit", type=int, default=500)
     parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
     parser.add_argument("--encoder_model", type=str, default="facebook/contriever")

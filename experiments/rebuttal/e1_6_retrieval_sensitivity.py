@@ -21,7 +21,7 @@ Usage:
         --data_path data/hotpotqa_dev.json \
         --dataset hotpotqa \
         --output_dir runs/rebuttal/e1_6 \
-        --budget 500 --limit 500 \
+        --config_family pareto_match_500_alpha06 --limit 500 \
         --model meta-llama/Meta-Llama-3-8B-Instruct \
         --device 0 --top_ns 20 50 100
 """
@@ -66,33 +66,16 @@ def run_retrieval_arm(
     run_topk: bool = True,
 ) -> Dict[str, Any]:
     """Run one arm: (retriever_type, top_n) with TRIDENT-Pareto and top-k baseline."""
-    from trident.config import (
-        TridentConfig, ParetoConfig, SafeCoverConfig,
-        LLMConfig, RetrievalConfig, EvaluationConfig,
-        NLIConfig, CalibrationConfig, TelemetryConfig,
-    )
-    from experiments.rebuttal._pipeline_helpers import create_pipeline
+    from experiments.rebuttal._pipeline_helpers import build_config, create_pipeline
 
     device = f"cuda:{args.device}" if args.device >= 0 else "cpu"
     encoder = args.encoder_model if retriever_type == "dense" else "facebook/contriever"
 
-    config = TridentConfig(
-        mode="pareto",
-        pareto=ParetoConfig(
-            budget=args.budget, max_evidence_tokens=args.budget,
-            max_units=8, stop_on_budget=True, use_vqc=False, use_bwk=False,
-        ),
-        llm=LLMConfig(model_name=args.model, device=device, load_in_8bit=args.load_in_8bit),
-        retrieval=RetrievalConfig(
-            method=retriever_type if retriever_type != "bm25" else "sparse",
-            encoder_model=encoder,
-            top_k=top_n,
-        ),
-        nli=NLIConfig(batch_size=32),
-        calibration=CalibrationConfig(use_mondrian=True),
-        evaluation=EvaluationConfig(dataset=args.dataset),
-        telemetry=TelemetryConfig(enable=True),
-    )
+    config = build_config(args, retrieval_overrides=dict(
+        method=retriever_type if retriever_type != "bm25" else "sparse",
+        encoder_model=encoder,
+        top_k=top_n,
+    ))
     pipeline = create_pipeline(config, device=device,
                                calibration_path=getattr(args, 'calibration_path', None))
 
@@ -135,7 +118,7 @@ def run_retrieval_arm(
                 total_tokens = 0
                 for p in passages:
                     cost = getattr(p, "num_tokens", len(getattr(p, "text", "").split()))
-                    if total_tokens + cost > args.budget:
+                    if total_tokens + cost > config.pareto.budget:
                         break
                     selected.append(p)
                     total_tokens += cost
@@ -237,12 +220,12 @@ def aggregate_and_save(args, all_results: List[Dict[str, Any]]) -> str:
     meta = ExperimentMetadata(
         experiment_id=f"e1_6_retrieval_{args.dataset}",
         dataset=args.dataset,
-        budget=args.budget,
         mode="pareto",
         backbone=args.model,
         seed=args.seed,
         limit=args.limit,
-        extra={"retrievers": args.retrievers, "top_ns": args.top_ns},
+        extra={"config_family": args.config_family,
+               "retrievers": args.retrievers, "top_ns": args.top_ns},
     )
     metrics = {}
     for r in all_results:
@@ -266,7 +249,8 @@ def main():
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--dataset", type=str, default="hotpotqa")
     parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e1_6")
-    parser.add_argument("--budget", type=int, default=500)
+    parser.add_argument("--config_family", type=str, required=True,
+                        help="Config family name (e.g. pareto_match_500_alpha06)")
     parser.add_argument("--limit", type=int, default=500)
     parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
     parser.add_argument("--encoder_model", type=str, default="facebook/contriever")

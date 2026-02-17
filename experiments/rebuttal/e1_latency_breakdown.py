@@ -22,7 +22,9 @@ Usage:
         --data_path data/hotpotqa_dev.json \
         --dataset hotpotqa \
         --output_dir runs/rebuttal/e1 \
-        --budget 500 --limit 200 \
+        --config_family pareto_match_500_alpha06 \
+        --calibration_path data/calibration/calibrator.json \
+        --limit 200 \
         --model meta-llama/Meta-Llama-3-8B-Instruct \
         --device 0
 """
@@ -61,61 +63,11 @@ from experiments.rebuttal.report_utils import (
 )
 
 
-def build_config(args, mode: str):
-    """Build a TridentConfig for the given mode."""
-    from trident.config import (
-        TridentConfig, SafeCoverConfig, ParetoConfig,
-        LLMConfig, RetrievalConfig, EvaluationConfig,
-        NLIConfig, CalibrationConfig, TelemetryConfig,
-    )
-    device = f"cuda:{args.device}" if args.device >= 0 else "cpu"
-
-    llm_cfg = LLMConfig(
-        model_name=args.model,
-        device=device,
-        load_in_8bit=args.load_in_8bit,
-        temperature=0.0,
-    )
-    retrieval_cfg = RetrievalConfig(
-        method="dense",
-        encoder_model=args.encoder_model,
-        top_k=100,
-    )
-    nli_cfg = NLIConfig(batch_size=32)
-    cal_cfg = CalibrationConfig(use_mondrian=True)
-    eval_cfg = EvaluationConfig(dataset=args.dataset)
-    tel_cfg = TelemetryConfig(enable=True, track_latency=True)
-
-    if mode == "safe_cover":
-        sc_cfg = SafeCoverConfig(
-            per_facet_alpha=0.05,
-            token_cap=args.budget,
-            max_evidence_tokens=args.budget,
-            early_abstain=True,
-            fallback_to_pareto=False,
-            use_certificates=True,
-        )
-        p_cfg = ParetoConfig(budget=args.budget)
-        return TridentConfig(
-            mode="safe_cover", safe_cover=sc_cfg, pareto=p_cfg,
-            llm=llm_cfg, retrieval=retrieval_cfg, nli=nli_cfg,
-            calibration=cal_cfg, evaluation=eval_cfg, telemetry=tel_cfg,
-        )
-    else:
-        p_cfg = ParetoConfig(
-            budget=args.budget,
-            max_evidence_tokens=args.budget,
-            max_units=8,
-            stop_on_budget=True,
-            use_vqc=False,
-            use_bwk=False,
-        )
-        sc_cfg = SafeCoverConfig()
-        return TridentConfig(
-            mode="pareto", safe_cover=sc_cfg, pareto=p_cfg,
-            llm=llm_cfg, retrieval=retrieval_cfg, nli=nli_cfg,
-            calibration=cal_cfg, evaluation=eval_cfg, telemetry=tel_cfg,
-        )
+def _build_config(args, mode: str):
+    """Build a TridentConfig for the given mode via config family."""
+    from experiments.rebuttal._pipeline_helpers import build_config
+    return build_config(args, mode=mode,
+                        telemetry_overrides=dict(track_latency=True))
 
 
 def run_with_instrumentation(
@@ -172,7 +124,7 @@ def run_experiment(args, mode: str, data: List[Dict]) -> Dict[str, Any]:
     """Run the full experiment for one mode."""
     from experiments.rebuttal._pipeline_helpers import create_pipeline
 
-    config = build_config(args, mode)
+    config = _build_config(args, mode)
     device = f"cuda:{args.device}" if args.device >= 0 else "cpu"
     pipeline = create_pipeline(config, device=device,
                                calibration_path=getattr(args, 'calibration_path', None))
@@ -275,11 +227,11 @@ def aggregate_and_save(args, results_by_mode: Dict[str, Any]) -> str:
     meta = ExperimentMetadata(
         experiment_id=f"e1_latency_{args.dataset}",
         dataset=args.dataset,
-        budget=args.budget,
         mode=",".join(modes_list),
         backbone=args.model,
         seed=args.seed,
         limit=args.limit,
+        extra={"config_family": args.config_family},
     )
     # Strip per_query from top-level metrics to keep report compact
     metrics = {}
@@ -311,7 +263,8 @@ def main():
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--dataset", type=str, default="hotpotqa")
     parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e1")
-    parser.add_argument("--budget", type=int, default=500)
+    parser.add_argument("--config_family", type=str, required=True,
+                        help="Config family name (e.g. pareto_match_500_alpha06)")
     parser.add_argument("--limit", type=int, default=200)
     parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
     parser.add_argument("--encoder_model", type=str, default="facebook/contriever")

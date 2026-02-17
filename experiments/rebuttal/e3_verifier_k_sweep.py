@@ -16,7 +16,7 @@ Usage:
         --data_path data/hotpotqa_dev.json \
         --dataset hotpotqa \
         --output_dir runs/rebuttal/e3 \
-        --budget 500 --limit 500 \
+        --config_family pareto_match_500_alpha06 --limit 500 \
         --model meta-llama/Meta-Llama-3-8B-Instruct \
         --device 0
 """
@@ -52,33 +52,14 @@ from experiments.rebuttal.report_utils import (
 )
 
 
-def run_k_sweep_arm(args, data, rerank_top_k: int, budget: int) -> Dict[str, Any]:
+def run_k_sweep_arm(args, data, rerank_top_k: int) -> Dict[str, Any]:
     """Run TRIDENT-Pareto with a specific rerank_top_k."""
-    from trident.config import (
-        TridentConfig, ParetoConfig, SafeCoverConfig,
-        LLMConfig, RetrievalConfig, EvaluationConfig,
-        NLIConfig, CalibrationConfig, TelemetryConfig,
-    )
-    from experiments.rebuttal._pipeline_helpers import create_pipeline
+    from experiments.rebuttal._pipeline_helpers import build_config, create_pipeline
 
     device = f"cuda:{args.device}" if args.device >= 0 else "cpu"
 
-    config = TridentConfig(
-        mode="pareto",
-        pareto=ParetoConfig(
-            budget=budget, max_evidence_tokens=budget,
-            max_units=8, stop_on_budget=True, use_vqc=False, use_bwk=False,
-        ),
-        llm=LLMConfig(model_name=args.model, device=device, load_in_8bit=args.load_in_8bit),
-        retrieval=RetrievalConfig(
-            method="dense", encoder_model=args.encoder_model,
-            top_k=100, rerank_top_k=rerank_top_k,
-        ),
-        nli=NLIConfig(batch_size=32),
-        calibration=CalibrationConfig(use_mondrian=True),
-        evaluation=EvaluationConfig(dataset=args.dataset),
-        telemetry=TelemetryConfig(enable=True, track_latency=True),
-    )
+    config = build_config(args, retrieval_overrides=dict(rerank_top_k=rerank_top_k),
+                          telemetry_overrides=dict(track_latency=True))
     pipeline = create_pipeline(config, device=device,
                                calibration_path=getattr(args, 'calibration_path', None))
 
@@ -89,7 +70,7 @@ def run_k_sweep_arm(args, data, rerank_top_k: int, budget: int) -> Dict[str, Any
         context = ex.get("context", None)
 
         if (i + 1) % 50 == 0:
-            print(f"    [K={rerank_top_k}, B={budget}] {i+1}/{len(data)}")
+            print(f"    [K={rerank_top_k}] {i+1}/{len(data)}")
 
         try:
             output = pipeline.process_query(question, context=context)
@@ -124,6 +105,7 @@ def run_k_sweep_arm(args, data, rerank_top_k: int, budget: int) -> Dict[str, Any
     f1_m, f1_lo, f1_hi = bootstrap_ci(f1s)
     lat = latency_percentiles(lats)
 
+    budget = config.pareto.budget
     return {
         "rerank_top_k": rerank_top_k,
         "budget": budget,
@@ -146,17 +128,16 @@ def run_k_sweep_arm(args, data, rerank_top_k: int, budget: int) -> Dict[str, Any
 def aggregate_and_save(args, all_results: List[Dict[str, Any]]) -> str:
     """Aggregate per-arm results and save the final report."""
     # Compute delta_pairs_pct vs Kmax
-    for budget in args.budgets:
-        budget_results = [r for r in all_results if r["budget"] == budget]
-        k_max_pairs = max(
-            (r["total_pairs_scored_mean"] for r in budget_results), default=1
+    k_max_pairs = max(
+        (r["total_pairs_scored_mean"] for r in all_results), default=1
+    )
+    for r in all_results:
+        r["delta_pairs_pct"] = round(
+            (r["total_pairs_scored_mean"] - k_max_pairs) / max(k_max_pairs, 1) * 100, 1
         )
-        for r in budget_results:
-            r["delta_pairs_pct"] = round(
-                (r["total_pairs_scored_mean"] - k_max_pairs) / max(k_max_pairs, 1) * 100, 1
-            )
 
     # Build table
+    budget = all_results[0]["budget"] if all_results else 0
     table_rows = []
     for r in all_results:
         table_rows.append({
@@ -168,7 +149,7 @@ def aggregate_and_save(args, all_results: List[Dict[str, Any]]) -> str:
             "latency_p50": r["latency_p50"],
         })
 
-    table = delta_f1_table(table_rows, baseline_key=f"K={max(args.ks)}_B={args.budgets[0]}")
+    table = delta_f1_table(table_rows, baseline_key=f"K={max(args.ks)}_B={budget}")
     print(f"\n{table}")
 
     # Print sweep summary
@@ -188,12 +169,11 @@ def aggregate_and_save(args, all_results: List[Dict[str, Any]]) -> str:
     meta = ExperimentMetadata(
         experiment_id=f"e3_k_sweep_{args.dataset}",
         dataset=args.dataset,
-        budget=args.budgets[0],
         mode="pareto",
         backbone=args.model,
         seed=args.seed,
         limit=args.limit,
-        extra={"ks": args.ks, "budgets": args.budgets},
+        extra={"config_family": args.config_family, "ks": args.ks},
     )
     metrics = {f"K={r['rerank_top_k']}_B={r['budget']}": {k: v for k, v in r.items() if k != "per_query"}
                for r in all_results}
@@ -215,7 +195,8 @@ def main():
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--dataset", type=str, default="hotpotqa")
     parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e3")
-    parser.add_argument("--budgets", type=int, nargs="+", default=[500])
+    parser.add_argument("--config_family", type=str, required=True,
+                        help="Config family name (e.g. pareto_match_500_alpha06)")
     parser.add_argument("--ks", type=int, nargs="+", default=[8, 16, 32])
     parser.add_argument("--limit", type=int, default=500)
     parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
@@ -228,15 +209,14 @@ def main():
     add_multigpu_args(parser)
     args = parser.parse_args()
 
-    # --- Worker path: run a single (K, budget) arm ------------------------
+    # --- Worker path: run a single K arm ------------------------------------
     if is_worker(args):
         arm = get_arm_spec(args)
         k = arm["k"]
-        budget = arm["budget"]
         from experiments.eval_complete_runnable import load_data
         data = load_data(args.data_path, limit=args.limit)
-        print(f"[E3/worker] K={k}, B={budget} on GPU {args._worker_gpu}")
-        result = run_k_sweep_arm(args, data, k, budget)
+        print(f"[E3/worker] K={k} on GPU {args._worker_gpu}")
+        result = run_k_sweep_arm(args, data, k)
         write_worker_result(args, result)
         return
 
@@ -248,12 +228,11 @@ def main():
     # --- Multi-GPU path ---------------------------------------------------
     if args.num_gpus > 1:
         arm_specs = []
-        for budget in args.budgets:
-            for k in args.ks:
-                arm_specs.append({
-                    "k": k, "budget": budget,
-                    "label": f"K={k}_B={budget}",
-                })
+        for k in args.ks:
+            arm_specs.append({
+                "k": k,
+                "label": f"K={k}",
+            })
         print(f"[E3] Distributing {len(arm_specs)} arms across {args.num_gpus} GPUs")
         all_results = run_arms_parallel(args, arm_specs, __file__)
         # Filter out failed arms
@@ -263,11 +242,10 @@ def main():
 
     # --- Sequential path --------------------------------------------------
     all_results = []
-    for budget in args.budgets:
-        for k in args.ks:
-            print(f"\n[E3] Running K={k}, B={budget}")
-            result = run_k_sweep_arm(args, data, k, budget)
-            all_results.append(result)
+    for k in args.ks:
+        print(f"\n[E3] Running K={k}")
+        result = run_k_sweep_arm(args, data, k)
+        all_results.append(result)
 
     aggregate_and_save(args, all_results)
 

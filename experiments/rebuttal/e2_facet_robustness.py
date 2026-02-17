@@ -21,7 +21,7 @@ Usage:
         --data_path data/hotpotqa_dev.json \
         --dataset hotpotqa \
         --output_dir runs/rebuttal/e2 \
-        --budget 500 --limit 500 \
+        --config_family pareto_match_500_alpha06 --limit 500 \
         --model meta-llama/Meta-Llama-3-8B-Instruct \
         --device 0 --seeds 42 123 456
 """
@@ -154,31 +154,14 @@ def run_condition(
     donor_facets: Optional[List] = None,
 ) -> Dict[str, Any]:
     """Run TRIDENT-Pareto and top-k baseline under one perturbation condition."""
-    from trident.config import (
-        TridentConfig, ParetoConfig, SafeCoverConfig,
-        LLMConfig, RetrievalConfig, EvaluationConfig,
-        NLIConfig, CalibrationConfig, TelemetryConfig,
-    )
-    from experiments.rebuttal._pipeline_helpers import create_pipeline
+    from experiments.rebuttal._pipeline_helpers import build_config, create_pipeline
     from trident.facets import FacetType
 
     device = f"cuda:{args.device}" if args.device >= 0 else "cpu"
     rng = random.Random(seed)
     np.random.seed(seed)
 
-    config = TridentConfig(
-        mode="pareto",
-        pareto=ParetoConfig(
-            budget=args.budget, max_evidence_tokens=args.budget,
-            max_units=8, stop_on_budget=True, use_vqc=False, use_bwk=False,
-        ),
-        llm=LLMConfig(model_name=args.model, device=device, load_in_8bit=args.load_in_8bit),
-        retrieval=RetrievalConfig(method="dense", encoder_model=args.encoder_model, top_k=100),
-        nli=NLIConfig(batch_size=32),
-        calibration=CalibrationConfig(use_mondrian=True),
-        evaluation=EvaluationConfig(dataset=args.dataset),
-        telemetry=TelemetryConfig(enable=True),
-    )
+    config = build_config(args)
     pipeline = create_pipeline(config, device=device,
                                calibration_path=getattr(args, 'calibration_path', None))
 
@@ -234,7 +217,7 @@ def run_condition(
 
         # Top-k baseline
         try:
-            tk = top_k_baseline(pipeline, question, context, args.budget)
+            tk = top_k_baseline(pipeline, question, context, config.pareto.budget)
             topk_results.append({
                 "prediction": tk["answer"],
                 "gold": gold,
@@ -375,12 +358,12 @@ def aggregate_and_save(args, condition_seed_results: Dict[str, List[Dict]]) -> s
     meta = ExperimentMetadata(
         experiment_id=f"e2_facet_robustness_{args.dataset}",
         dataset=args.dataset,
-        budget=args.budget,
         mode="pareto",
         backbone=args.model,
         seed=args.seeds[0],
         limit=args.limit,
-        extra={"conditions": args.conditions, "seeds": args.seeds},
+        extra={"config_family": args.config_family,
+               "conditions": args.conditions, "seeds": args.seeds},
     )
     metrics_compact = {}
     for cond, res in all_results.items():
@@ -404,7 +387,8 @@ def main():
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--dataset", type=str, default="hotpotqa")
     parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e2")
-    parser.add_argument("--budget", type=int, default=500)
+    parser.add_argument("--config_family", type=str, required=True,
+                        help="Config family name (e.g. pareto_match_500_alpha06)")
     parser.add_argument("--limit", type=int, default=500)
     parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
     parser.add_argument("--encoder_model", type=str, default="facebook/contriever")

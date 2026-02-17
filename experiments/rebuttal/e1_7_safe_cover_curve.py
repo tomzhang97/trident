@@ -19,7 +19,7 @@ Usage:
         --data_path data/musique_dev.jsonl \
         --dataset musique \
         --output_dir runs/rebuttal/e1_7 \
-        --budget 500 --limit 200 \
+        --config_family pareto_match_500_alpha06 --limit 200 \
         --model meta-llama/Meta-Llama-3-8B-Instruct \
         --device 0 --alphas 0.1 0.05 0.01
 """
@@ -56,33 +56,12 @@ from experiments.rebuttal.report_utils import (
 
 def run_alpha_arm(args, data: List[Dict], alpha: float) -> Dict[str, Any]:
     """Run Safe-Cover with a specific per_facet_alpha."""
-    from trident.config import (
-        TridentConfig, SafeCoverConfig, ParetoConfig,
-        LLMConfig, RetrievalConfig, EvaluationConfig,
-        NLIConfig, CalibrationConfig, TelemetryConfig,
-    )
-    from experiments.rebuttal._pipeline_helpers import create_pipeline
+    from experiments.rebuttal._pipeline_helpers import build_config, create_pipeline
 
     device = f"cuda:{args.device}" if args.device >= 0 else "cpu"
 
-    config = TridentConfig(
-        mode="safe_cover",
-        safe_cover=SafeCoverConfig(
-            per_facet_alpha=alpha,
-            token_cap=args.budget,
-            max_evidence_tokens=args.budget,
-            early_abstain=True,
-            fallback_to_pareto=False,  # No fallback -- see real Safe-Cover behavior
-            use_certificates=True,
-        ),
-        pareto=ParetoConfig(budget=args.budget),
-        llm=LLMConfig(model_name=args.model, device=device, load_in_8bit=args.load_in_8bit),
-        retrieval=RetrievalConfig(method="dense", encoder_model=args.encoder_model, top_k=100),
-        nli=NLIConfig(batch_size=32),
-        calibration=CalibrationConfig(use_mondrian=True),
-        evaluation=EvaluationConfig(dataset=args.dataset),
-        telemetry=TelemetryConfig(enable=True),
-    )
+    config = build_config(args, mode="safe_cover",
+                          safe_cover_overrides=dict(per_facet_alpha=alpha))
     pipeline = create_pipeline(config, device=device,
                                calibration_path=getattr(args, 'calibration_path', None))
 
@@ -200,12 +179,11 @@ def aggregate_and_save(args, all_results: List[Dict[str, Any]]) -> str:
     meta = ExperimentMetadata(
         experiment_id=f"e1_7_safe_cover_curve_{args.dataset}",
         dataset=args.dataset,
-        budget=args.budget,
         mode="safe_cover",
         backbone=args.model,
         seed=args.seed,
         limit=args.limit,
-        extra={"alphas": args.alphas},
+        extra={"config_family": args.config_family, "alphas": args.alphas},
     )
     metrics = {}
     for r in all_results:
@@ -229,7 +207,8 @@ def main():
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--dataset", type=str, default="musique")
     parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e1_7")
-    parser.add_argument("--budget", type=int, default=500)
+    parser.add_argument("--config_family", type=str, required=True,
+                        help="Config family name (e.g. pareto_match_500_alpha06)")
     parser.add_argument("--limit", type=int, default=200)
     parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
     parser.add_argument("--encoder_model", type=str, default="facebook/contriever")

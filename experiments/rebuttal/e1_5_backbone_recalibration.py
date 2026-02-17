@@ -21,7 +21,7 @@ Usage:
         --data_path data/hotpotqa_dev.json \
         --dataset hotpotqa \
         --output_dir runs/rebuttal/e1_5 \
-        --budget 500 --limit 200 \
+        --config_family pareto_match_500_alpha06 --limit 200 \
         --backbones meta-llama/Meta-Llama-3-8B-Instruct Qwen/Qwen3-8B \
         --shared_calibration_path data/calibration/calibrator_llama.json \
         --per_backbone_calibration_dir data/calibration/per_backbone \
@@ -104,33 +104,14 @@ def run_backbone_condition(
     calibration_path: Optional[str],
 ) -> Dict[str, Any]:
     """Run Safe-Cover with a specific backbone and calibration setting."""
-    from trident.config import (
-        TridentConfig, SafeCoverConfig, ParetoConfig,
-        LLMConfig, RetrievalConfig, EvaluationConfig,
-        NLIConfig, CalibrationConfig, TelemetryConfig,
-    )
-    from experiments.rebuttal._pipeline_helpers import create_pipeline
+    from experiments.rebuttal._pipeline_helpers import build_config, create_pipeline
 
     device = f"cuda:{args.device}" if args.device >= 0 else "cpu"
 
-    config = TridentConfig(
-        mode="safe_cover",
-        safe_cover=SafeCoverConfig(
-            per_facet_alpha=0.05,
-            token_cap=args.budget,
-            max_evidence_tokens=args.budget,
-            early_abstain=True,
-            fallback_to_pareto=False,
-            use_certificates=True,
-        ),
-        pareto=ParetoConfig(budget=args.budget),
-        llm=LLMConfig(model_name=backbone, device=device, load_in_8bit=args.load_in_8bit),
-        retrieval=RetrievalConfig(method="dense", encoder_model=args.encoder_model, top_k=100),
-        nli=NLIConfig(batch_size=32),
-        calibration=CalibrationConfig(use_mondrian=True),
-        evaluation=EvaluationConfig(dataset=args.dataset),
-        telemetry=TelemetryConfig(enable=True),
-    )
+    # Override the model name with this arm's backbone
+    args_copy = argparse.Namespace(**vars(args))
+    args_copy.model = backbone
+    config = build_config(args_copy, mode="safe_cover")
     pipeline = create_pipeline(config, device=device,
                                calibration_path=getattr(args, 'calibration_path', None))
 
@@ -269,11 +250,11 @@ def aggregate_and_save(args, all_results: List[Dict[str, Any]]) -> str:
     meta = ExperimentMetadata(
         experiment_id=f"e1_5_backbone_{args.dataset}",
         dataset=args.dataset,
-        budget=args.budget,
         mode="safe_cover",
         backbone=",".join(args.backbones),
         seed=args.seed,
         limit=args.limit,
+        extra={"config_family": args.config_family},
     )
     metrics = {}
     for r in all_results:
@@ -310,7 +291,8 @@ def main():
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--dataset", type=str, default="hotpotqa")
     parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e1_5")
-    parser.add_argument("--budget", type=int, default=500)
+    parser.add_argument("--config_family", type=str, required=True,
+                        help="Config family name (e.g. pareto_match_500_alpha06)")
     parser.add_argument("--limit", type=int, default=200)
     parser.add_argument("--backbones", nargs="+",
                         default=["meta-llama/Meta-Llama-3-8B-Instruct", "Qwen/Qwen3-8B"])
