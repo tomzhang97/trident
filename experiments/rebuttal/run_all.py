@@ -47,7 +47,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 
 EXPERIMENT_ORDER = [
@@ -264,6 +264,263 @@ def run_experiment(
         return {"exp_id": exp_id, "status": "error", "error": str(e), "elapsed_s": round(elapsed, 1)}
 
 
+# ---------------------------------------------------------------------------
+# Result aggregation
+# ---------------------------------------------------------------------------
+
+def _find_report_json(exp_dir: str) -> Optional[str]:
+    """Find the experiment report JSON inside an experiment output directory."""
+    exp_path = Path(exp_dir)
+    if not exp_path.is_dir():
+        return None
+    jsons = list(exp_path.glob("*.json"))
+    if not jsons:
+        return None
+    # Prefer the one that isn't run_summary.json
+    for j in jsons:
+        if j.name != "run_summary.json":
+            return str(j)
+    return str(jsons[0])
+
+
+def _extract_headline(exp_id: str, report: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract headline metrics from one experiment's report JSON.
+
+    Returns a dict with standardised keys:
+        experiment, description, headline_metric, headline_value,
+        detail (dict of additional key-value pairs for the table).
+    """
+    metrics = report.get("metrics", {})
+    meta = report.get("metadata", {})
+
+    if exp_id == "e0_1":
+        # Sanity check: report anomaly count
+        status = metrics.get("status", "")
+        if status == "no_predictions_found":
+            return {"experiment": "E0.1", "description": "Sanity check",
+                    "headline_metric": "status", "headline_value": "no data",
+                    "detail": {}}
+        # Count configs checked
+        n_configs = len([k for k in metrics if k not in ("status",)])
+        anomalies = report.get("compute", {}).get("anomalies", [])
+        return {"experiment": "E0.1", "description": "Sanity check",
+                "headline_metric": "anomalies",
+                "headline_value": len(anomalies) if isinstance(anomalies, list) else 0,
+                "detail": {"configs_checked": n_configs}}
+
+    elif exp_id == "e0_2":
+        # Calibration protocol: documentation artefact
+        paragraph = metrics.get("paragraph_summary", "")
+        has_artefacts = bool(metrics.get("protocol_artifacts", {}))
+        return {"experiment": "E0.2", "description": "Calibration protocol",
+                "headline_metric": "artefacts_present",
+                "headline_value": has_artefacts,
+                "detail": {}}
+
+    elif exp_id == "e1":
+        # Latency breakdown: safe_cover vs pareto F1 & p50 latency
+        detail = {}
+        for mode in ("safe_cover", "pareto"):
+            m = metrics.get(mode, {})
+            if m:
+                detail[f"{mode}_F1"] = m.get("f1", "")
+                detail[f"{mode}_EM"] = m.get("em", "")
+                lat = m.get("latency", {})
+                detail[f"{mode}_lat_p50"] = lat.get("p50", "")
+                detail[f"{mode}_pairs"] = m.get("verification", {}).get(
+                    "total_pairs_scored_mean", "")
+        sc = metrics.get("safe_cover", {})
+        return {"experiment": "E1", "description": "Latency breakdown",
+                "headline_metric": "safe_cover_F1",
+                "headline_value": sc.get("f1", ""),
+                "detail": detail}
+
+    elif exp_id == "e2":
+        # Facet robustness: delta-F1 vs top-k for baseline condition
+        detail = {}
+        for cond, res in metrics.items():
+            detail[f"{cond}_F1"] = res.get("trident_f1_mean", "")
+            detail[f"{cond}_dF1_vs_topk"] = res.get("delta_f1_vs_topk_mean", "")
+        baseline_f1 = metrics.get("baseline", {}).get("trident_f1_mean", "")
+        return {"experiment": "E2", "description": "Facet robustness",
+                "headline_metric": "baseline_F1",
+                "headline_value": baseline_f1,
+                "detail": detail}
+
+    elif exp_id == "e3":
+        # Verifier K sweep: collect per-K results
+        detail = {}
+        best_f1 = 0
+        for key, res in metrics.items():
+            f1 = res.get("f1", 0)
+            detail[f"{key}_F1"] = f1
+            detail[f"{key}_lat_p50"] = res.get("latency_p50", "")
+            if isinstance(f1, (int, float)) and f1 > best_f1:
+                best_f1 = f1
+        return {"experiment": "E3", "description": "Verifier K sweep",
+                "headline_metric": "best_F1",
+                "headline_value": best_f1,
+                "detail": detail}
+
+    elif exp_id == "e1_5":
+        # Backbone recalibration: per-backbone delta-F1 (per_bb - shared)
+        detail = {}
+        for key, res in metrics.items():
+            if isinstance(res, dict):
+                detail[f"{key}_F1"] = res.get("f1", "")
+                detail[f"{key}_ECE"] = res.get("verifier_ece", "")
+                detail[f"{key}_AUC"] = res.get("verifier_auc", "")
+        return {"experiment": "E1.5", "description": "Backbone recalibration",
+                "headline_metric": "configs_tested",
+                "headline_value": len(metrics),
+                "detail": detail}
+
+    elif exp_id == "e1_6":
+        # Retrieval sensitivity: per-retriever/N results
+        detail = {}
+        for key, res in metrics.items():
+            if isinstance(res, dict):
+                detail[f"{key}_F1"] = res.get("f1", res.get("trident_f1", ""))
+                detail[f"{key}_dF1"] = res.get("delta_f1_vs_topk", "")
+        return {"experiment": "E1.6", "description": "Retrieval sensitivity",
+                "headline_metric": "configs_tested",
+                "headline_value": len(metrics),
+                "detail": detail}
+
+    elif exp_id == "e1_7":
+        # Safe-Cover curve: per-alpha abstention/F1 tradeoff
+        detail = {}
+        for key, res in metrics.items():
+            if isinstance(res, dict):
+                detail[f"{key}_abstain"] = res.get("abstention_rate", "")
+                detail[f"{key}_F1"] = res.get("overall_f1", res.get("answered_f1", ""))
+        return {"experiment": "E1.7", "description": "Safe-Cover curve",
+                "headline_metric": "alphas_tested",
+                "headline_value": len(metrics),
+                "detail": detail}
+
+    elif exp_id == "e5":
+        # Unsupported answer rate
+        trident = metrics.get("trident_pareto", {})
+        topk = metrics.get("top_k", {})
+        delta = (topk.get("unsupported_rate", 0) or 0) - (trident.get("unsupported_rate", 0) or 0)
+        detail = {
+            "trident_unsup": trident.get("unsupported_rate", ""),
+            "topk_unsup": topk.get("unsupported_rate", ""),
+            "trident_F1": trident.get("answered_f1", ""),
+            "topk_F1": topk.get("answered_f1", ""),
+        }
+        return {"experiment": "E5", "description": "Unsupported answer rate",
+                "headline_metric": "delta_unsup (topk-trident)",
+                "headline_value": round(delta, 4) if isinstance(delta, float) else delta,
+                "detail": detail}
+
+    # Fallback
+    return {"experiment": exp_id, "description": "",
+            "headline_metric": "raw_keys",
+            "headline_value": list(metrics.keys())[:5],
+            "detail": {}}
+
+
+def aggregate_results(output_root: str, statuses: List[Dict]) -> str:
+    """Read all per-experiment reports and produce a unified aggregate report.
+
+    Returns the path to the aggregate JSON.
+    """
+    root = Path(output_root)
+    headlines = []
+    all_metrics = {}
+
+    for s in statuses:
+        exp_id = s["exp_id"]
+        exp_dir = root / exp_id
+        report_path = _find_report_json(str(exp_dir))
+
+        if report_path is None:
+            headlines.append({
+                "experiment": exp_id,
+                "description": "",
+                "headline_metric": "status",
+                "headline_value": s.get("status", "unknown"),
+                "detail": {},
+            })
+            continue
+
+        with open(report_path) as f:
+            report = json.load(f)
+
+        headline = _extract_headline(exp_id, report)
+        headline["status"] = s.get("status", "unknown")
+        headline["elapsed_s"] = s.get("elapsed_s", 0)
+        headlines.append(headline)
+        all_metrics[exp_id] = {
+            "report_path": report_path,
+            "metadata": report.get("metadata", {}),
+            "metrics": report.get("metrics", {}),
+            "compute": report.get("compute", {}),
+            "summary_table": report.get("summary_table", ""),
+        }
+
+    # Build unified markdown table
+    table_lines = []
+    table_lines.append("")
+    table_lines.append("=" * 78)
+    table_lines.append("  AGGREGATE REBUTTAL RESULTS")
+    table_lines.append("=" * 78)
+    table_lines.append("")
+    table_lines.append(
+        f"| {'Exp':<6} | {'Description':<25} | {'Status':<7} "
+        f"| {'Headline Metric':<25} | {'Value':<12} | {'Time':>6} |"
+    )
+    table_lines.append(
+        f"|{'-'*8}|{'-'*27}|{'-'*9}"
+        f"|{'-'*27}|{'-'*14}|{'-'*8}|"
+    )
+
+    for h in headlines:
+        val = h["headline_value"]
+        if isinstance(val, float):
+            val_str = f"{val:.4f}"
+        else:
+            val_str = str(val)[:12]
+        elapsed = h.get("elapsed_s", 0)
+        table_lines.append(
+            f"| {h['experiment']:<6} | {h['description']:<25} "
+            f"| {h.get('status', '?'):<7} "
+            f"| {h['headline_metric']:<25} | {val_str:<12} "
+            f"| {elapsed:>5.0f}s |"
+        )
+
+    table_lines.append("")
+
+    # Per-experiment detail sections
+    for h in headlines:
+        if not h.get("detail"):
+            continue
+        table_lines.append(f"  [{h['experiment']}] {h['description']} -- detail:")
+        for k, v in h["detail"].items():
+            if isinstance(v, float):
+                table_lines.append(f"    {k}: {v:.4f}")
+            else:
+                table_lines.append(f"    {k}: {v}")
+        table_lines.append("")
+
+    aggregate_table = "\n".join(table_lines)
+    print(aggregate_table)
+
+    # Save aggregate JSON
+    aggregate_path = root / "aggregate_results.json"
+    with open(aggregate_path, "w") as f:
+        json.dump({
+            "headlines": headlines,
+            "per_experiment": all_metrics,
+            "aggregate_table": aggregate_table,
+        }, f, indent=2, default=str)
+
+    print(f"  Aggregate results saved to {aggregate_path}")
+    return str(aggregate_path)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run all rebuttal experiments in recommended order"
@@ -376,7 +633,7 @@ def main():
         elapsed = s.get("elapsed_s", 0)
         print(f"  [{icon}] {s['exp_id']:8s} ({elapsed:.0f}s)")
 
-    # Save summary
+    # Save run summary
     summary_path = Path(args.output_root) / "run_summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     with open(summary_path, "w") as f:
@@ -385,7 +642,15 @@ def main():
             "total_elapsed_s": round(total_elapsed, 1),
             "args": {k: str(v) for k, v in vars(args).items()},
         }, f, indent=2)
-    print(f"\n  Summary saved to {summary_path}")
+    print(f"\n  Run summary saved to {summary_path}")
+
+    # Aggregate results from all experiment reports
+    passed_or_done = [s for s in statuses if s["status"] != "skipped"]
+    if passed_or_done:
+        print(f"\n{'='*70}")
+        print(f"  AGGREGATING RESULTS")
+        print(f"{'='*70}")
+        aggregate_results(args.output_root, statuses)
 
 
 if __name__ == "__main__":
