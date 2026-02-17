@@ -39,6 +39,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from experiments.rebuttal.multi_gpu import (
+    add_multigpu_args,
+    get_arm_spec,
+    is_worker,
+    run_arms_parallel,
+    write_worker_result,
+)
 from experiments.rebuttal.report_utils import (
     ExperimentMetadata,
     ExperimentReport,
@@ -197,39 +204,14 @@ def run_retrieval_arm(
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description="E1.6: Retrieval sensitivity")
-    parser.add_argument("--data_path", type=str, required=True)
-    parser.add_argument("--dataset", type=str, default="hotpotqa")
-    parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e1_6")
-    parser.add_argument("--budget", type=int, default=500)
-    parser.add_argument("--limit", type=int, default=500)
-    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
-    parser.add_argument("--encoder_model", type=str, default="facebook/contriever")
-    parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--load_in_8bit", action="store_true")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--top_ns", type=int, nargs="+", default=[20, 50, 100])
-    parser.add_argument("--retrievers", nargs="+", default=["dense", "bm25"])
-    args = parser.parse_args()
-
-    from experiments.eval_complete_runnable import load_data
-    data = load_data(args.data_path, limit=args.limit)
-    print(f"[E1.6] Loaded {len(data)} examples")
-
-    all_results = []
-    for retriever in args.retrievers:
-        for top_n in args.top_ns:
-            print(f"\n[E1.6] Running {retriever} N={top_n}")
-            result = run_retrieval_arm(args, data, retriever, top_n)
-            all_results.append(result)
-
+def aggregate_and_save(args, all_results: List[Dict[str, Any]]) -> str:
+    """Aggregate per-arm results and save the final report."""
     # Build table
     table_rows = []
     for r in all_results:
-        if r["trident"]:
+        if r.get("trident"):
             table_rows.append(r["trident"])
-        if r["topk"]:
+        if r.get("topk"):
             table_rows.append(r["topk"])
 
     baseline_label = f"TopK_dense_N{args.top_ns[-1]}" if "dense" in args.retrievers else table_rows[0]["label"]
@@ -275,6 +257,67 @@ def main():
     print(f"\n[E1.6] Report saved to {path}")
     print("[E1.6] Rebuttal: 'Across retriever types and pool sizes, TRIDENT-Pareto "
           "consistently improves dF1 at the same 500-token cap.'")
+    return path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="E1.6: Retrieval sensitivity")
+    parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--dataset", type=str, default="hotpotqa")
+    parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e1_6")
+    parser.add_argument("--budget", type=int, default=500)
+    parser.add_argument("--limit", type=int, default=500)
+    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
+    parser.add_argument("--encoder_model", type=str, default="facebook/contriever")
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--load_in_8bit", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--top_ns", type=int, nargs="+", default=[20, 50, 100])
+    parser.add_argument("--retrievers", nargs="+", default=["dense", "bm25"])
+    add_multigpu_args(parser)
+    args = parser.parse_args()
+
+    # --- Worker path: run a single (retriever, top_n) arm -----------------
+    if is_worker(args):
+        arm = get_arm_spec(args)
+        retriever = arm["retriever"]
+        top_n = arm["top_n"]
+        from experiments.eval_complete_runnable import load_data
+        data = load_data(args.data_path, limit=args.limit)
+        print(f"[E1.6/worker] {retriever}/N={top_n} on GPU {args._worker_gpu}")
+        result = run_retrieval_arm(args, data, retriever, top_n)
+        write_worker_result(args, result)
+        return
+
+    # --- Load data --------------------------------------------------------
+    from experiments.eval_complete_runnable import load_data
+    data = load_data(args.data_path, limit=args.limit)
+    print(f"[E1.6] Loaded {len(data)} examples")
+
+    # --- Multi-GPU path ---------------------------------------------------
+    if args.num_gpus > 1:
+        arm_specs = []
+        for retriever in args.retrievers:
+            for top_n in args.top_ns:
+                arm_specs.append({
+                    "retriever": retriever, "top_n": top_n,
+                    "label": f"{retriever}/N={top_n}",
+                })
+        print(f"[E1.6] Distributing {len(arm_specs)} arms across {args.num_gpus} GPUs")
+        all_results = run_arms_parallel(args, arm_specs, __file__)
+        all_results = [r for r in all_results if r and "retriever_type" in r]
+        aggregate_and_save(args, all_results)
+        return
+
+    # --- Sequential path --------------------------------------------------
+    all_results = []
+    for retriever in args.retrievers:
+        for top_n in args.top_ns:
+            print(f"\n[E1.6] Running {retriever} N={top_n}")
+            result = run_retrieval_arm(args, data, retriever, top_n)
+            all_results.append(result)
+
+    aggregate_and_save(args, all_results)
 
 
 if __name__ == "__main__":

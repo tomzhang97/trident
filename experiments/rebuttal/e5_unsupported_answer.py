@@ -42,6 +42,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from experiments.rebuttal.multi_gpu import (
+    add_multigpu_args,
+    get_arm_spec,
+    is_worker,
+    run_arms_parallel,
+    write_worker_result,
+)
 from experiments.rebuttal.report_utils import (
     ExperimentMetadata,
     ExperimentReport,
@@ -245,31 +252,8 @@ def run_method(args, data, method: str) -> Dict[str, Any]:
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description="E5: Unsupported answer rate")
-    parser.add_argument("--data_path", type=str, required=True)
-    parser.add_argument("--dataset", type=str, default="hotpotqa")
-    parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e5")
-    parser.add_argument("--budget", type=int, default=500)
-    parser.add_argument("--limit", type=int, default=500)
-    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
-    parser.add_argument("--encoder_model", type=str, default="facebook/contriever")
-    parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--load_in_8bit", action="store_true")
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-
-    from experiments.eval_complete_runnable import load_data
-    data = load_data(args.data_path, limit=args.limit)
-    print(f"[E5] Loaded {len(data)} examples")
-
-    methods = ["trident_pareto", "top_k"]
-    all_results = {}
-    for method in methods:
-        print(f"\n[E5] Running {method}")
-        result = run_method(args, data, method)
-        all_results[method] = result
-
+def aggregate_and_save(args, all_results: Dict[str, Any]) -> str:
+    """Aggregate per-method results and save the final report."""
     # Print comparison
     print("\n[E5] Unsupported answer rate comparison:")
     hdr = "| Method | Answered | Valid | Short% | Unsupported | Unsup(strict) | AvgLen | EM | F1 |"
@@ -311,6 +295,65 @@ def main():
     print(f"\n[E5] Report saved to {path}")
     print(f"[E5] Rebuttal: 'TRIDENT reduces unsupported-answer rate vs top-k by "
           f"{delta_unsup:.3f} (conservative lower bound).'")
+    return path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="E5: Unsupported answer rate")
+    parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--dataset", type=str, default="hotpotqa")
+    parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e5")
+    parser.add_argument("--budget", type=int, default=500)
+    parser.add_argument("--limit", type=int, default=500)
+    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
+    parser.add_argument("--encoder_model", type=str, default="facebook/contriever")
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--load_in_8bit", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+    add_multigpu_args(parser)
+    args = parser.parse_args()
+
+    # --- Worker path: run a single method arm -----------------------------
+    if is_worker(args):
+        arm = get_arm_spec(args)
+        method = arm["method"]
+        from experiments.eval_complete_runnable import load_data
+        data = load_data(args.data_path, limit=args.limit)
+        print(f"[E5/worker] method={method} on GPU {args._worker_gpu}")
+        result = run_method(args, data, method)
+        result["_method"] = method
+        write_worker_result(args, result)
+        return
+
+    # --- Load data --------------------------------------------------------
+    from experiments.eval_complete_runnable import load_data
+    data = load_data(args.data_path, limit=args.limit)
+    print(f"[E5] Loaded {len(data)} examples")
+
+    methods = ["trident_pareto", "top_k"]
+
+    # --- Multi-GPU path ---------------------------------------------------
+    if args.num_gpus > 1:
+        arm_specs = [{"method": m, "label": m} for m in methods]
+        print(f"[E5] Distributing {len(arm_specs)} arms across {args.num_gpus} GPUs")
+        arm_results = run_arms_parallel(args, arm_specs, __file__)
+        all_results = {}
+        for r in arm_results:
+            if r and "_method" in r:
+                all_results[r["_method"]] = r
+            elif r and "method" in r:
+                all_results[r["method"]] = r
+        aggregate_and_save(args, all_results)
+        return
+
+    # --- Sequential path --------------------------------------------------
+    all_results = {}
+    for method in methods:
+        print(f"\n[E5] Running {method}")
+        result = run_method(args, data, method)
+        all_results[method] = result
+
+    aggregate_and_save(args, all_results)
 
 
 if __name__ == "__main__":

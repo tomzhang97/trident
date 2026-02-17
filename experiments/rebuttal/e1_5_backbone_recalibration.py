@@ -41,6 +41,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from experiments.rebuttal.multi_gpu import (
+    add_multigpu_args,
+    get_arm_spec,
+    is_worker,
+    run_arms_parallel,
+    write_worker_result,
+)
 from experiments.rebuttal.report_utils import (
     ExperimentMetadata,
     ExperimentReport,
@@ -215,49 +222,8 @@ def run_backbone_condition(
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description="E1.5: Backbone recalibration")
-    parser.add_argument("--data_path", type=str, required=True)
-    parser.add_argument("--dataset", type=str, default="hotpotqa")
-    parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e1_5")
-    parser.add_argument("--budget", type=int, default=500)
-    parser.add_argument("--limit", type=int, default=200)
-    parser.add_argument("--backbones", nargs="+",
-                        default=["meta-llama/Meta-Llama-3-8B-Instruct", "Qwen/Qwen3-8B"])
-    parser.add_argument("--shared_calibration_path", type=str, default="",
-                        help="Path to shared (Llama-fitted) calibrator JSON")
-    parser.add_argument("--per_backbone_calibration_dir", type=str, default="",
-                        help="Directory with per-backbone calibrator JSONs")
-    parser.add_argument("--encoder_model", type=str, default="facebook/contriever")
-    parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--load_in_8bit", action="store_true")
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-
-    from experiments.eval_complete_runnable import load_data
-    data = load_data(args.data_path, limit=args.limit)
-    print(f"[E1.5] Loaded {len(data)} examples")
-
-    all_results = []
-    for backbone in args.backbones:
-        backbone_short = backbone.split("/")[-1]
-
-        # Shared calibration
-        print(f"\n[E1.5] {backbone_short} / shared calibration")
-        shared_path = args.shared_calibration_path if args.shared_calibration_path else None
-        shared_res = run_backbone_condition(args, data, backbone, "shared", shared_path)
-        all_results.append(shared_res)
-
-        # Per-backbone calibration
-        print(f"\n[E1.5] {backbone_short} / per-backbone calibration")
-        per_bb_path = None
-        if args.per_backbone_calibration_dir:
-            candidate = Path(args.per_backbone_calibration_dir) / f"calibrator_{backbone_short}.json"
-            if candidate.exists():
-                per_bb_path = str(candidate)
-        per_bb_res = run_backbone_condition(args, data, backbone, "per_backbone", per_bb_path)
-        all_results.append(per_bb_res)
-
+def aggregate_and_save(args, all_results: List[Dict[str, Any]]) -> str:
+    """Aggregate per-arm results and save the final report."""
     # Compute deltas (per_backbone - shared)
     by_backbone = {}
     for r in all_results:
@@ -322,6 +288,96 @@ def main():
     print(f"\n[E1.5] Report saved to {path}")
     print("[E1.5] Rebuttal: 'Per-backbone calibration reduces cross-architecture "
           "discrepancy: ECE improves [x->y] and EM/F1 improve by [delta] on Qwen3.'")
+    return path
+
+
+def _resolve_calibration_path(args, backbone: str, cal_mode: str) -> Optional[str]:
+    """Resolve calibration file path for a (backbone, cal_mode) pair."""
+    if cal_mode == "shared":
+        return args.shared_calibration_path if args.shared_calibration_path else None
+    else:
+        if args.per_backbone_calibration_dir:
+            backbone_short = backbone.split("/")[-1]
+            candidate = Path(args.per_backbone_calibration_dir) / f"calibrator_{backbone_short}.json"
+            if candidate.exists():
+                return str(candidate)
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description="E1.5: Backbone recalibration")
+    parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--dataset", type=str, default="hotpotqa")
+    parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e1_5")
+    parser.add_argument("--budget", type=int, default=500)
+    parser.add_argument("--limit", type=int, default=200)
+    parser.add_argument("--backbones", nargs="+",
+                        default=["meta-llama/Meta-Llama-3-8B-Instruct", "Qwen/Qwen3-8B"])
+    parser.add_argument("--shared_calibration_path", type=str, default="",
+                        help="Path to shared (Llama-fitted) calibrator JSON")
+    parser.add_argument("--per_backbone_calibration_dir", type=str, default="",
+                        help="Directory with per-backbone calibrator JSONs")
+    parser.add_argument("--encoder_model", type=str, default="facebook/contriever")
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--load_in_8bit", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+    add_multigpu_args(parser)
+    args = parser.parse_args()
+
+    # --- Worker path: run a single (backbone, cal_mode) arm ---------------
+    if is_worker(args):
+        arm = get_arm_spec(args)
+        backbone = arm["backbone"]
+        cal_mode = arm["calibration_mode"]
+        cal_path = _resolve_calibration_path(args, backbone, cal_mode)
+        from experiments.eval_complete_runnable import load_data
+        data = load_data(args.data_path, limit=args.limit)
+        bb_short = backbone.split("/")[-1]
+        print(f"[E1.5/worker] {bb_short}/{cal_mode} on GPU {args._worker_gpu}")
+        result = run_backbone_condition(args, data, backbone, cal_mode, cal_path)
+        write_worker_result(args, result)
+        return
+
+    # --- Load data --------------------------------------------------------
+    from experiments.eval_complete_runnable import load_data
+    data = load_data(args.data_path, limit=args.limit)
+    print(f"[E1.5] Loaded {len(data)} examples")
+
+    # --- Multi-GPU path ---------------------------------------------------
+    if args.num_gpus > 1:
+        arm_specs = []
+        for backbone in args.backbones:
+            bb_short = backbone.split("/")[-1]
+            for cal_mode in ("shared", "per_backbone"):
+                arm_specs.append({
+                    "backbone": backbone,
+                    "calibration_mode": cal_mode,
+                    "label": f"{bb_short}/{cal_mode}",
+                })
+        print(f"[E1.5] Distributing {len(arm_specs)} arms across {args.num_gpus} GPUs")
+        all_results = run_arms_parallel(args, arm_specs, __file__)
+        all_results = [r for r in all_results if r and "backbone" in r]
+        aggregate_and_save(args, all_results)
+        return
+
+    # --- Sequential path --------------------------------------------------
+    all_results = []
+    for backbone in args.backbones:
+        backbone_short = backbone.split("/")[-1]
+
+        # Shared calibration
+        print(f"\n[E1.5] {backbone_short} / shared calibration")
+        shared_path = _resolve_calibration_path(args, backbone, "shared")
+        shared_res = run_backbone_condition(args, data, backbone, "shared", shared_path)
+        all_results.append(shared_res)
+
+        # Per-backbone calibration
+        print(f"\n[E1.5] {backbone_short} / per-backbone calibration")
+        per_bb_path = _resolve_calibration_path(args, backbone, "per_backbone")
+        per_bb_res = run_backbone_condition(args, data, backbone, "per_backbone", per_bb_path)
+        all_results.append(per_bb_res)
+
+    aggregate_and_save(args, all_results)
 
 
 if __name__ == "__main__":

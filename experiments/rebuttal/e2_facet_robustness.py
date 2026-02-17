@@ -41,6 +41,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from experiments.rebuttal.multi_gpu import (
+    add_multigpu_args,
+    get_arm_spec,
+    is_worker,
+    run_arms_parallel,
+    write_worker_result,
+)
 from experiments.rebuttal.report_utils import (
     ExperimentMetadata,
     ExperimentReport,
@@ -307,50 +314,23 @@ def build_donor_pool(data: List[Dict], args) -> List:
     return donor_facets
 
 
-def main():
-    parser = argparse.ArgumentParser(description="E2: Facet robustness ablation")
-    parser.add_argument("--data_path", type=str, required=True)
-    parser.add_argument("--dataset", type=str, default="hotpotqa")
-    parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e2")
-    parser.add_argument("--budget", type=int, default=500)
-    parser.add_argument("--limit", type=int, default=500)
-    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
-    parser.add_argument("--encoder_model", type=str, default="facebook/contriever")
-    parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--load_in_8bit", action="store_true")
-    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 456])
-    parser.add_argument("--conditions", nargs="+",
-                        default=["baseline", "drop_30", "noise_20", "type_drop_relation"],
-                        help="Conditions to run")
-    args = parser.parse_args()
+def aggregate_and_save(args, condition_seed_results: Dict[str, List[Dict]]) -> str:
+    """Aggregate per-condition/seed results and save the final report.
 
-    from experiments.eval_complete_runnable import load_data
-    data = load_data(args.data_path, limit=args.limit)
-    print(f"[E2] Loaded {len(data)} examples")
-
-    # Build donor pool for noise condition
-    donor_facets = build_donor_pool(data, args)
-
+    Args:
+        condition_seed_results: {condition: [per_seed_result_dicts]}
+    """
     all_results = {}
     table_rows = []
 
-    for condition in args.conditions:
-        seeds = args.seeds if condition in ("drop_30", "noise_20") else [args.seeds[0]]
-        condition_results = []
-
-        for seed in seeds:
-            print(f"\n[E2] Condition={condition}, seed={seed}")
-            result = run_condition(args, data, condition, seed, donor_facets)
-            condition_results.append(result)
-
-        # Aggregate across seeds
+    for condition, condition_results in condition_seed_results.items():
         trident_ems = [r["trident"]["em"] for r in condition_results]
         trident_f1s = [r["trident"]["f1"] for r in condition_results]
         topk_f1s = [r["topk"]["f1"] for r in condition_results]
 
         agg = {
             "condition": condition,
-            "n_seeds": len(seeds),
+            "n_seeds": len(condition_results),
             "trident_em_mean": round(float(np.mean(trident_ems)), 4),
             "trident_em_std": round(float(np.std(trident_ems)), 4),
             "trident_f1_mean": round(float(np.mean(trident_f1s)), 4),
@@ -401,7 +381,6 @@ def main():
         limit=args.limit,
         extra={"conditions": args.conditions, "seeds": args.seeds},
     )
-    # Strip per_query from saved metrics
     metrics_compact = {}
     for cond, res in all_results.items():
         m = {k: v for k, v in res.items() if k != "per_seed"}
@@ -416,6 +395,88 @@ def main():
     print(f"\n[E2] Report saved to {path}")
     print("[E2] Rebuttal: 'Even with corrupted facets, Pareto maintains dF1 over top-k; "
           "degradation is graceful and abstention reasons shift predictably.'")
+    return path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="E2: Facet robustness ablation")
+    parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--dataset", type=str, default="hotpotqa")
+    parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e2")
+    parser.add_argument("--budget", type=int, default=500)
+    parser.add_argument("--limit", type=int, default=500)
+    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
+    parser.add_argument("--encoder_model", type=str, default="facebook/contriever")
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--load_in_8bit", action="store_true")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 456])
+    parser.add_argument("--conditions", nargs="+",
+                        default=["baseline", "drop_30", "noise_20", "type_drop_relation"],
+                        help="Conditions to run")
+    add_multigpu_args(parser)
+    args = parser.parse_args()
+
+    # --- Worker path: run a single (condition, seed) arm ------------------
+    if is_worker(args):
+        arm = get_arm_spec(args)
+        condition = arm["condition"]
+        seed = arm["seed"]
+        from experiments.eval_complete_runnable import load_data
+        data = load_data(args.data_path, limit=args.limit)
+        donor_facets = build_donor_pool(data, args) if condition == "noise_20" else []
+        print(f"[E2/worker] condition={condition}, seed={seed}, GPU {args._worker_gpu}")
+        result = run_condition(args, data, condition, seed, donor_facets)
+        result["_condition"] = condition
+        result["_seed"] = seed
+        write_worker_result(args, result)
+        return
+
+    # --- Load data --------------------------------------------------------
+    from experiments.eval_complete_runnable import load_data
+    data = load_data(args.data_path, limit=args.limit)
+    print(f"[E2] Loaded {len(data)} examples")
+
+    # Build donor pool for noise condition
+    donor_facets = build_donor_pool(data, args)
+
+    # --- Multi-GPU path ---------------------------------------------------
+    if args.num_gpus > 1:
+        arm_specs = []
+        for condition in args.conditions:
+            seeds = args.seeds if condition in ("drop_30", "noise_20") else [args.seeds[0]]
+            for seed in seeds:
+                arm_specs.append({
+                    "condition": condition, "seed": seed,
+                    "label": f"{condition}/seed={seed}",
+                })
+        print(f"[E2] Distributing {len(arm_specs)} arms across {args.num_gpus} GPUs")
+        arm_results = run_arms_parallel(args, arm_specs, __file__)
+
+        # Group results by condition
+        condition_seed_results: Dict[str, List[Dict]] = {}
+        for r in arm_results:
+            if r and "_condition" in r:
+                condition_seed_results.setdefault(r["_condition"], []).append(r)
+        # Preserve condition ordering
+        ordered = {}
+        for condition in args.conditions:
+            if condition in condition_seed_results:
+                ordered[condition] = condition_seed_results[condition]
+        aggregate_and_save(args, ordered)
+        return
+
+    # --- Sequential path --------------------------------------------------
+    condition_seed_results: Dict[str, List[Dict]] = {}
+    for condition in args.conditions:
+        seeds = args.seeds if condition in ("drop_30", "noise_20") else [args.seeds[0]]
+        condition_results = []
+        for seed in seeds:
+            print(f"\n[E2] Condition={condition}, seed={seed}")
+            result = run_condition(args, data, condition, seed, donor_facets)
+            condition_results.append(result)
+        condition_seed_results[condition] = condition_results
+
+    aggregate_and_save(args, condition_seed_results)
 
 
 if __name__ == "__main__":

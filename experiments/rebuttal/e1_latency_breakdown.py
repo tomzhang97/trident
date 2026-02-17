@@ -41,6 +41,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from experiments.rebuttal.multi_gpu import (
+    add_multigpu_args,
+    get_arm_spec,
+    is_worker,
+    run_arms_parallel,
+    write_worker_result,
+)
 from experiments.rebuttal.report_utils import (
     ExperimentMetadata,
     ExperimentReport,
@@ -235,33 +242,8 @@ def run_experiment(args, mode: str, data: List[Dict]) -> Dict[str, Any]:
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description="E1: Latency breakdown")
-    parser.add_argument("--data_path", type=str, required=True)
-    parser.add_argument("--dataset", type=str, default="hotpotqa")
-    parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e1")
-    parser.add_argument("--budget", type=int, default=500)
-    parser.add_argument("--limit", type=int, default=200)
-    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
-    parser.add_argument("--encoder_model", type=str, default="facebook/contriever")
-    parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--load_in_8bit", action="store_true")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--modes", nargs="+", default=["safe_cover", "pareto"],
-                        help="Modes to run")
-    args = parser.parse_args()
-
-    # Load data
-    from experiments.eval_complete_runnable import load_data
-    data = load_data(args.data_path, limit=args.limit)
-    print(f"[E1] Loaded {len(data)} examples from {args.data_path}")
-
-    results_by_mode = {}
-    for mode in args.modes:
-        print(f"\n[E1] Running mode: {mode}")
-        result = run_experiment(args, mode, data)
-        results_by_mode[mode] = result
-
+def aggregate_and_save(args, results_by_mode: Dict[str, Any]) -> str:
+    """Aggregate per-mode results and save the final report. Returns report path."""
     # Build comparison table
     rows = []
     for mode, res in results_by_mode.items():
@@ -287,11 +269,12 @@ def main():
               f"{vf['num_batches_mean']:.0f} batches/query")
 
     # Save report
+    modes_list = list(results_by_mode.keys())
     meta = ExperimentMetadata(
         experiment_id=f"e1_latency_{args.dataset}",
         dataset=args.dataset,
         budget=args.budget,
-        mode=",".join(args.modes),
+        mode=",".join(modes_list),
         backbone=args.model,
         seed=args.seed,
         limit=args.limit,
@@ -304,7 +287,7 @@ def main():
 
     all_per_query = []
     for mode, res in results_by_mode.items():
-        for q in res["per_query"]:
+        for q in res.get("per_query", []):
             q["_mode"] = mode
             all_per_query.append(q)
 
@@ -318,6 +301,65 @@ def main():
     print(f"\n[E1] Report saved to {path}")
     print("[E1] Rebuttal sentence: 'Safe-Cover overhead is dominated by verification "
           "(X% time; Y pairs; Z batches) and is batch-parallelizable.'")
+    return path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="E1: Latency breakdown")
+    parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--dataset", type=str, default="hotpotqa")
+    parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e1")
+    parser.add_argument("--budget", type=int, default=500)
+    parser.add_argument("--limit", type=int, default=200)
+    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
+    parser.add_argument("--encoder_model", type=str, default="facebook/contriever")
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--load_in_8bit", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--modes", nargs="+", default=["safe_cover", "pareto"],
+                        help="Modes to run")
+    add_multigpu_args(parser)
+    args = parser.parse_args()
+
+    # --- Worker path: run a single mode and write result ------------------
+    if is_worker(args):
+        arm = get_arm_spec(args)
+        mode = arm["mode"]
+        from experiments.eval_complete_runnable import load_data
+        data = load_data(args.data_path, limit=args.limit)
+        print(f"[E1/worker] Running mode={mode} on GPU {args._worker_gpu}")
+        result = run_experiment(args, mode, data)
+        result["_mode"] = mode
+        write_worker_result(args, result)
+        return
+
+    # --- Load data --------------------------------------------------------
+    from experiments.eval_complete_runnable import load_data
+    data = load_data(args.data_path, limit=args.limit)
+    print(f"[E1] Loaded {len(data)} examples from {args.data_path}")
+
+    # --- Multi-GPU path: distribute modes across GPUs ---------------------
+    if args.num_gpus > 1:
+        arm_specs = [{"mode": m, "label": f"mode={m}"} for m in args.modes]
+        print(f"[E1] Distributing {len(arm_specs)} arms across {args.num_gpus} GPUs")
+        arm_results = run_arms_parallel(args, arm_specs, __file__)
+        results_by_mode = {}
+        for r in arm_results:
+            if r and "_mode" in r:
+                results_by_mode[r["_mode"]] = r
+            elif r and "mode" in r:
+                results_by_mode[r["mode"]] = r
+        aggregate_and_save(args, results_by_mode)
+        return
+
+    # --- Sequential path --------------------------------------------------
+    results_by_mode = {}
+    for mode in args.modes:
+        print(f"\n[E1] Running mode: {mode}")
+        result = run_experiment(args, mode, data)
+        results_by_mode[mode] = result
+
+    aggregate_and_save(args, results_by_mode)
 
 
 if __name__ == "__main__":

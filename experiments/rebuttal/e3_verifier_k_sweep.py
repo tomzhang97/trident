@@ -34,6 +34,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from experiments.rebuttal.multi_gpu import (
+    add_multigpu_args,
+    get_arm_spec,
+    is_worker,
+    run_arms_parallel,
+    write_worker_result,
+)
 from experiments.rebuttal.report_utils import (
     ExperimentMetadata,
     ExperimentReport,
@@ -135,32 +142,8 @@ def run_k_sweep_arm(args, data, rerank_top_k: int, budget: int) -> Dict[str, Any
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description="E3: Verifier K sweep")
-    parser.add_argument("--data_path", type=str, required=True)
-    parser.add_argument("--dataset", type=str, default="hotpotqa")
-    parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e3")
-    parser.add_argument("--budgets", type=int, nargs="+", default=[500])
-    parser.add_argument("--ks", type=int, nargs="+", default=[8, 16, 32])
-    parser.add_argument("--limit", type=int, default=500)
-    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
-    parser.add_argument("--encoder_model", type=str, default="facebook/contriever")
-    parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--load_in_8bit", action="store_true")
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-
-    from experiments.eval_complete_runnable import load_data
-    data = load_data(args.data_path, limit=args.limit)
-    print(f"[E3] Loaded {len(data)} examples")
-
-    all_results = []
-    for budget in args.budgets:
-        for k in args.ks:
-            print(f"\n[E3] Running K={k}, B={budget}")
-            result = run_k_sweep_arm(args, data, k, budget)
-            all_results.append(result)
-
+def aggregate_and_save(args, all_results: List[Dict[str, Any]]) -> str:
+    """Aggregate per-arm results and save the final report."""
     # Compute delta_pairs_pct vs Kmax
     for budget in args.budgets:
         budget_results = [r for r in all_results if r["budget"] == budget]
@@ -223,6 +206,67 @@ def main():
     print(f"\n[E3] Report saved to {path}")
     print("[E3] Rebuttal: 'Reducing K cuts verifier pairs by X% and latency by Y ms "
           "with only dF1 = -Z (smooth knob).'")
+    return path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="E3: Verifier K sweep")
+    parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--dataset", type=str, default="hotpotqa")
+    parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e3")
+    parser.add_argument("--budgets", type=int, nargs="+", default=[500])
+    parser.add_argument("--ks", type=int, nargs="+", default=[8, 16, 32])
+    parser.add_argument("--limit", type=int, default=500)
+    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
+    parser.add_argument("--encoder_model", type=str, default="facebook/contriever")
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--load_in_8bit", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+    add_multigpu_args(parser)
+    args = parser.parse_args()
+
+    # --- Worker path: run a single (K, budget) arm ------------------------
+    if is_worker(args):
+        arm = get_arm_spec(args)
+        k = arm["k"]
+        budget = arm["budget"]
+        from experiments.eval_complete_runnable import load_data
+        data = load_data(args.data_path, limit=args.limit)
+        print(f"[E3/worker] K={k}, B={budget} on GPU {args._worker_gpu}")
+        result = run_k_sweep_arm(args, data, k, budget)
+        write_worker_result(args, result)
+        return
+
+    # --- Load data --------------------------------------------------------
+    from experiments.eval_complete_runnable import load_data
+    data = load_data(args.data_path, limit=args.limit)
+    print(f"[E3] Loaded {len(data)} examples")
+
+    # --- Multi-GPU path ---------------------------------------------------
+    if args.num_gpus > 1:
+        arm_specs = []
+        for budget in args.budgets:
+            for k in args.ks:
+                arm_specs.append({
+                    "k": k, "budget": budget,
+                    "label": f"K={k}_B={budget}",
+                })
+        print(f"[E3] Distributing {len(arm_specs)} arms across {args.num_gpus} GPUs")
+        all_results = run_arms_parallel(args, arm_specs, __file__)
+        # Filter out failed arms
+        all_results = [r for r in all_results if r and "rerank_top_k" in r]
+        aggregate_and_save(args, all_results)
+        return
+
+    # --- Sequential path --------------------------------------------------
+    all_results = []
+    for budget in args.budgets:
+        for k in args.ks:
+            print(f"\n[E3] Running K={k}, B={budget}")
+            result = run_k_sweep_arm(args, data, k, budget)
+            all_results.append(result)
+
+    aggregate_and_save(args, all_results)
 
 
 if __name__ == "__main__":

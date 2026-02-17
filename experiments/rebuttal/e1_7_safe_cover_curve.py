@@ -37,6 +37,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from experiments.rebuttal.multi_gpu import (
+    add_multigpu_args,
+    get_arm_spec,
+    is_worker,
+    run_arms_parallel,
+    write_worker_result,
+)
 from experiments.rebuttal.report_utils import (
     ExperimentMetadata,
     ExperimentReport,
@@ -161,30 +168,10 @@ def run_alpha_arm(args, data: List[Dict], alpha: float) -> Dict[str, Any]:
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description="E1.7: Safe-Cover operating curve")
-    parser.add_argument("--data_path", type=str, required=True)
-    parser.add_argument("--dataset", type=str, default="musique")
-    parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e1_7")
-    parser.add_argument("--budget", type=int, default=500)
-    parser.add_argument("--limit", type=int, default=200)
-    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
-    parser.add_argument("--encoder_model", type=str, default="facebook/contriever")
-    parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--load_in_8bit", action="store_true")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--alphas", type=float, nargs="+", default=[0.1, 0.05, 0.01])
-    args = parser.parse_args()
-
-    from experiments.eval_complete_runnable import load_data
-    data = load_data(args.data_path, limit=args.limit)
-    print(f"[E1.7] Loaded {len(data)} examples")
-
-    all_results = []
-    for alpha in args.alphas:
-        print(f"\n[E1.7] Running alpha={alpha}")
-        result = run_alpha_arm(args, data, alpha)
-        all_results.append(result)
+def aggregate_and_save(args, all_results: List[Dict[str, Any]]) -> str:
+    """Aggregate per-alpha results and save the final report."""
+    # Sort by alpha for consistent display
+    all_results = sorted(all_results, key=lambda r: r["alpha"], reverse=True)
 
     # Print operating curve table
     print("\n[E1.7] Safe-Cover operating curve:")
@@ -206,7 +193,7 @@ def main():
 
     # Print abstention reason breakdown
     for r in all_results:
-        if r["abstention_reasons"]:
+        if r.get("abstention_reasons"):
             print(f"\n  alpha={r['alpha']}: abstention reasons: {r['abstention_reasons']}")
 
     meta = ExperimentMetadata(
@@ -233,6 +220,58 @@ def main():
     print("[E1.7] Rebuttal: 'Safe-Cover behaves as intended: lowering alpha increases "
           "abstention while improving answered-subset accuracy and tightening "
           "certificate coverage.'")
+    return path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="E1.7: Safe-Cover operating curve")
+    parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--dataset", type=str, default="musique")
+    parser.add_argument("--output_dir", type=str, default="runs/rebuttal/e1_7")
+    parser.add_argument("--budget", type=int, default=500)
+    parser.add_argument("--limit", type=int, default=200)
+    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3-8B-Instruct")
+    parser.add_argument("--encoder_model", type=str, default="facebook/contriever")
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--load_in_8bit", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--alphas", type=float, nargs="+", default=[0.1, 0.05, 0.01])
+    add_multigpu_args(parser)
+    args = parser.parse_args()
+
+    # --- Worker path: run a single alpha arm ------------------------------
+    if is_worker(args):
+        arm = get_arm_spec(args)
+        alpha = arm["alpha"]
+        from experiments.eval_complete_runnable import load_data
+        data = load_data(args.data_path, limit=args.limit)
+        print(f"[E1.7/worker] alpha={alpha} on GPU {args._worker_gpu}")
+        result = run_alpha_arm(args, data, alpha)
+        write_worker_result(args, result)
+        return
+
+    # --- Load data --------------------------------------------------------
+    from experiments.eval_complete_runnable import load_data
+    data = load_data(args.data_path, limit=args.limit)
+    print(f"[E1.7] Loaded {len(data)} examples")
+
+    # --- Multi-GPU path ---------------------------------------------------
+    if args.num_gpus > 1:
+        arm_specs = [{"alpha": a, "label": f"alpha={a}"} for a in args.alphas]
+        print(f"[E1.7] Distributing {len(arm_specs)} arms across {args.num_gpus} GPUs")
+        all_results = run_arms_parallel(args, arm_specs, __file__)
+        all_results = [r for r in all_results if r and "alpha" in r]
+        aggregate_and_save(args, all_results)
+        return
+
+    # --- Sequential path --------------------------------------------------
+    all_results = []
+    for alpha in args.alphas:
+        print(f"\n[E1.7] Running alpha={alpha}")
+        result = run_alpha_arm(args, data, alpha)
+        all_results.append(result)
+
+    aggregate_and_save(args, all_results)
 
 
 if __name__ == "__main__":
