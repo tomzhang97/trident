@@ -179,7 +179,8 @@ def run_condition(
         evaluation=EvaluationConfig(dataset=args.dataset),
         telemetry=TelemetryConfig(enable=True),
     )
-    pipeline = create_pipeline(config, device=device)
+    pipeline = create_pipeline(config, device=device,
+                               calibration_path=getattr(args, 'calibration_path', None))
 
     # Monkey-patch facet miner to apply perturbation
     original_extract = pipeline.facet_miner.extract_facets
@@ -409,6 +410,8 @@ def main():
     parser.add_argument("--encoder_model", type=str, default="facebook/contriever")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--load_in_8bit", action="store_true")
+    parser.add_argument("--calibration_path", type=str, default=None,
+                        help="Path to calibration JSON for p-value computation")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 456])
     parser.add_argument("--conditions", nargs="+",
                         default=["baseline", "drop_30", "noise_20", "type_drop_relation"],

@@ -83,7 +83,8 @@ def run_alpha_arm(args, data: List[Dict], alpha: float) -> Dict[str, Any]:
         evaluation=EvaluationConfig(dataset=args.dataset),
         telemetry=TelemetryConfig(enable=True),
     )
-    pipeline = create_pipeline(config, device=device)
+    pipeline = create_pipeline(config, device=device,
+                               calibration_path=getattr(args, 'calibration_path', None))
 
     per_query = []
     for i, ex in enumerate(data):
@@ -234,6 +235,8 @@ def main():
     parser.add_argument("--encoder_model", type=str, default="facebook/contriever")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--load_in_8bit", action="store_true")
+    parser.add_argument("--calibration_path", type=str, default=None,
+                        help="Path to calibration JSON for p-value computation")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--alphas", type=float, nargs="+", default=[0.1, 0.05, 0.01])
     add_multigpu_args(parser)

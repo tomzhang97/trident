@@ -93,7 +93,8 @@ def run_retrieval_arm(
         evaluation=EvaluationConfig(dataset=args.dataset),
         telemetry=TelemetryConfig(enable=True),
     )
-    pipeline = create_pipeline(config, device=device)
+    pipeline = create_pipeline(config, device=device,
+                               calibration_path=getattr(args, 'calibration_path', None))
 
     trident_results = []
     topk_results = []
@@ -271,6 +272,8 @@ def main():
     parser.add_argument("--encoder_model", type=str, default="facebook/contriever")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--load_in_8bit", action="store_true")
+    parser.add_argument("--calibration_path", type=str, default=None,
+                        help="Path to calibration JSON for p-value computation")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--top_ns", type=int, nargs="+", default=[20, 50, 100])
     parser.add_argument("--retrievers", nargs="+", default=["dense", "bm25"])

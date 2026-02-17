@@ -227,6 +227,10 @@ def build_cmd(
         if args.load_in_8bit:
             cmd.append("--load_in_8bit")
 
+    # Shared: calibration path for all GPU experiments
+    if args.calibration_path and exp_id not in ("e0_1", "e0_2"):
+        cmd += ["--calibration_path", args.calibration_path]
+
     return cmd
 
 
@@ -651,6 +655,8 @@ def main():
                         help="Comma-separated GPU ids for concurrent execution "
                              "(e.g. '2,3,4,5,6'). Enables experiment-level parallelism.")
     parser.add_argument("--load_in_8bit", action="store_true")
+    parser.add_argument("--calibration_path", type=str, default="",
+                        help="Path to calibration JSON for p-value computation")
     parser.add_argument("--budget", type=int, default=500)
 
     # Calibration for E1.5
