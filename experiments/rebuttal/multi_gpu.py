@@ -70,9 +70,21 @@ def get_arm_spec(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def get_gpu_ids(args: argparse.Namespace) -> List[int]:
-    """Return list of GPU ids to use."""
+    """Return list of GPU ids to use.
+
+    Resolution order:
+    1. Explicit ``--gpu_ids 2,3,4`` flag  (highest priority)
+    2. ``CUDA_VISIBLE_DEVICES`` env-var   (matches eval_complete_runnable.py)
+    3. Fall back to ``range(num_gpus)``   (0-indexed default)
+    """
     if args.gpu_ids:
         return [int(x) for x in args.gpu_ids.split(",")]
+    # Respect CUDA_VISIBLE_DEVICES when --gpu_ids is not explicitly set,
+    # consistent with eval_complete_runnable.py._resolve_gpu_ids.
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible:
+        vis_list = [int(x.strip()) for x in visible.split(",") if x.strip()]
+        return vis_list[:args.num_gpus]
     return list(range(args.num_gpus))
 
 
@@ -118,6 +130,7 @@ def run_arms_parallel(
                 "--_worker_gpu", str(gpu_id),
                 "--_arm_json", arm_json,
                 "--_result_path", result_paths[arm_idx],
+                "--device", "0",  # Always 0; CUDA_VISIBLE_DEVICES pins the physical GPU
             ]
 
             env = os.environ.copy()
@@ -181,7 +194,8 @@ def _build_base_cmd(args: argparse.Namespace, script_path: str) -> List[str]:
 
     # Replay all the original CLI args EXCEPT the internal/multigpu ones
     skip_keys = {"num_gpus", "gpu_ids", "_worker", "_worker_gpu",
-                 "_arm_json", "_result_path"}
+                 "_arm_json", "_result_path",
+                 "device"}  # Workers always use device 0 (single visible GPU)
     # Also skip keys that will be overridden by arm_spec
     # (handled by individual scripts via arm_spec merging)
 

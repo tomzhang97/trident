@@ -93,10 +93,13 @@ def build_cmd(
     """Build the command line for one experiment.
 
     Args:
-        gpu_id: If provided, override --device with this GPU id.
+        gpu_id: If provided, the experiment is pinned via CUDA_VISIBLE_DEVICES
+                in _launch_experiment, so --device is always 0.
     """
     output_dir = os.path.join(args.output_root, exp_id)
-    device = gpu_id if gpu_id is not None else args.device
+    # When gpu_id is set, _launch_experiment pins CUDA_VISIBLE_DEVICES to that
+    # single physical GPU, so the script must use cuda:0.
+    device = 0 if gpu_id is not None else args.device
     cmd = [sys.executable, "-u", "-m", module, "--output_dir", output_dir]
 
     if exp_id == "e0_1":
@@ -676,8 +679,12 @@ def main():
 
     args = parser.parse_args()
 
-    # Parse GPU ids
-    gpu_ids = [int(x) for x in args.gpu_ids.split(",") if x.strip()] if args.gpu_ids else []
+    # Parse GPU ids: --gpu_ids flag > CUDA_VISIBLE_DEVICES env > empty (sequential)
+    if args.gpu_ids:
+        gpu_ids = [int(x) for x in args.gpu_ids.split(",") if x.strip()]
+    else:
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        gpu_ids = [int(x.strip()) for x in visible.split(",") if x.strip()] if visible else []
     concurrent = len(gpu_ids) > 0
 
     # Filter experiments
